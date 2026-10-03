@@ -21,6 +21,7 @@ from ai4sts2.environment import Sts2Env, evaluate, fingerprint, write_json
 from ai4sts2.execution import Execution
 from ai4sts2.game import ROOT, WorkerFailure, prepare_game
 from ai4sts2.metrics import compare_evaluations, summarise
+from ai4sts2.policy import SharedActionPolicy
 from ai4sts2.resources import TRIAL_MEMORY, budget
 from ai4sts2.signals import TrainingSignals
 
@@ -74,9 +75,18 @@ def mutation_space():
     }
 
 
-def ablation_space(seed, repeats=1):
+def ablation_space(seed, repeats=1, study="signals"):
     if repeats < 1:
         raise ValueError("Use at least one model initialisation.")
+    if study not in {"signals", "policies"}:
+        raise ValueError("Unknown ablation study.")
+    if study == "policies":
+        return ablation_space(seed, repeats) | {
+            "variant": tune.grid_search(["flat", "shared"]),
+            "policy": tune.sample_from(lambda spec: spec["config"]["variant"]),
+            "rnd_scale": 0.0,
+            "curriculum_mix": 0.0,
+        }
     return {
         "variant": tune.grid_search(["control", "exploration", "curriculum"]),
         "seed": tune.grid_search(list(range(seed, seed + repeats))),
@@ -121,6 +131,7 @@ def pilot_report(results, scope, build, baseline, iterations, interrupted=False)
         "trials": [
             {
                 "path": result.path,
+                "checkpoint": str(result.checkpoint.path),
                 "config": result.config,
                 "win_rate": result.metrics.get("validation_win_rate"),
                 "mean_floor": result.metrics.get("validation_mean_floor"),
@@ -129,6 +140,7 @@ def pilot_report(results, scope, build, baseline, iterations, interrupted=False)
                 "iterations": result.metrics.get("training_iteration"),
                 "training_signals": result.metrics.get("training_signals"),
                 "environment_steps": result.metrics.get("environment_steps"),
+                "policy_parameters": result.metrics.get("policy_parameters"),
             }
             for result in successful
         ],
@@ -138,6 +150,9 @@ def pilot_report(results, scope, build, baseline, iterations, interrupted=False)
 class PopulationMember(tune.Trainable):
     def setup(self, config):
         torch.set_num_threads(1)
+        policy = config.get("policy", "flat")
+        if policy not in {"flat", "shared"}:
+            raise ValueError("Unknown policy architecture.")
         self.scope = config.get("scope", "run")
         self.build = fingerprint(self.scope)
         self.recoveries = []
@@ -153,7 +168,7 @@ class PopulationMember(tune.Trainable):
         self.evaluation = None
         self.sample_count = config.get("steps_per_iteration", 128)
         self.model = TimedPPO(
-            "MultiInputPolicy",
+            SharedActionPolicy if policy == "shared" else "MultiInputPolicy",
             DummyVecEnv([lambda: self.environment]),
             learning_rate=config["learning_rate"],
             ent_coef=config["entropy"],
@@ -163,7 +178,11 @@ class PopulationMember(tune.Trainable):
             gamma=config.get("gamma", 0.99),
             gae_lambda=config.get("gae_lambda", 0.95),
             clip_range=config.get("clip_range", 0.2),
-            policy_kwargs={"net_arch": {"pi": [64], "vf": [64]}},
+            policy_kwargs=(
+                {"width": config.get("width", 64)}
+                if policy == "shared"
+                else {"net_arch": {"pi": [64], "vf": [64]}}
+            ),
             device="cpu",
             seed=config["seed"],
         )
@@ -247,6 +266,9 @@ class PopulationMember(tune.Trainable):
                 else None
             ),
             "environment_steps": self.model.num_timesteps,
+            "policy_parameters": sum(
+                parameter.numel() for parameter in self.model.policy.parameters()
+            ),
             "training_seconds": training_seconds,
             "optimisation_seconds": self.model.optimisation_seconds,
             "evaluation_seconds": evaluation_seconds,
@@ -322,6 +344,12 @@ class PopulationMember(tune.Trainable):
         self.apply_parameters(self.config)
 
     def apply_parameters(self, config):
+        expected = config.get("policy", "flat")
+        actual = "shared" if isinstance(self.model.policy, SharedActionPolicy) else "flat"
+        if expected != actual or (
+            actual == "shared" and self.model.policy.width != config.get("width", 64)
+        ):
+            raise ValueError("Checkpoint policy architecture does not match the configuration.")
         self.signals.configure(config)
         self.model.learning_rate = config["learning_rate"]
         self.model.lr_schedule = FloatSchedule(config["learning_rate"])
@@ -360,6 +388,8 @@ def run(
     seed=0,
     workers=0,
     repeats=1,
+    policy="flat",
+    width=64,
 ):
     if not 0 < minutes <= 30:
         raise ValueError("This pilot supports a budget of at most 30 minutes.")
@@ -367,16 +397,19 @@ def run(
         raise ValueError("Use at least two iterations and a multiple of 64 steps.")
     if scope not in {"run", "first_combat"}:
         raise ValueError("Unknown episode scope.")
+    if policy not in {"flat", "shared"} or not isinstance(width, int) or width < 1:
+        raise ValueError("Invalid policy architecture or width.")
     if resume and checkpoint:
         raise ValueError("Choose either interrupted-experiment recovery or a starting checkpoint.")
-    if experiment not in {"pbt", "ablation"}:
+    if experiment not in {"pbt", "ablation", "policy_ablation"}:
         raise ValueError("Unknown experiment.")
-    if experiment == "ablation" and checkpoint:
+    if experiment != "pbt" and checkpoint:
         raise ValueError("The ablation requires identical fresh model initialisations.")
     resources = budget().report(workers)
-    report_path = (
-        ROOT / f"artifacts/validation/{'pilot' if experiment == 'pbt' else 'ablation'}.json"
-    )
+    report_name = {"pbt": "pilot", "ablation": "ablation", "policy_ablation": "policies"}[
+        experiment
+    ]
+    report_path = ROOT / f"artifacts/validation/{report_name}.json"
     report = {
         "scope": scope,
         "certifying": False,
@@ -437,7 +470,9 @@ def run(
             tuner = tune.Tuner.restore(str(Path(resume).resolve()), trainable=trainable)
         else:
             scheduler = None
-            parameters = ablation_space(seed, repeats)
+            parameters = ablation_space(
+                seed, repeats, "policies" if experiment == "policy_ablation" else "signals"
+            )
             if experiment == "pbt":
                 scheduler = PopulationBasedTraining(
                     time_attr="training_iteration",
@@ -449,7 +484,11 @@ def run(
                     custom_explore_fn=bound_mutations,
                     synch=False,
                 )
-                parameters = search_space() | {"seed": tune.randint(1, 2**30)}
+                parameters = search_space() | {
+                    "seed": tune.randint(1, 2**30),
+                    "policy": policy,
+                    "width": width,
+                }
             tuner = tune.Tuner(
                 trainable,
                 tune_config=tune.TuneConfig(

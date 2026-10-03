@@ -7,7 +7,7 @@ from ai4sts2.train import PopulationMember
 from test_environment import FakeWorker
 
 
-def member(monkeypatch, learning_rate=0.0003, entropy=0.01):
+def member(monkeypatch, learning_rate=0.0003, entropy=0.01, policy="flat"):
     import ai4sts2.train as training
 
     monkeypatch.setattr(training, "fingerprint", lambda *_: {"game": "test", "schema": 1})
@@ -23,6 +23,7 @@ def member(monkeypatch, learning_rate=0.0003, entropy=0.01):
         "learning_rate": learning_rate,
         "entropy": entropy,
         "seed": 5,
+        "policy": policy,
     }
     instance.setup(instance.config)
     return instance
@@ -62,6 +63,19 @@ def test_checkpoint_rejects_incompatible_game(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="do not match"):
         instance.load_checkpoint(str(tmp_path))
     instance.cleanup()
+
+
+def test_checkpoint_rejects_cross_architecture_population_transfer(monkeypatch, tmp_path):
+    donor = member(monkeypatch, policy="shared")
+    receiver = member(monkeypatch)
+    try:
+        donor.model.learn(total_timesteps=64)
+        donor.save_checkpoint(tmp_path)
+        with pytest.raises(ValueError, match="policy architecture"):
+            receiver.load_checkpoint(tmp_path)
+    finally:
+        donor.cleanup()
+        receiver.cleanup()
 
 
 def test_reused_actor_starts_an_independent_candidate(monkeypatch):
