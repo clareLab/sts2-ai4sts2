@@ -273,7 +273,7 @@ def fit_population(experiment, plan, resources, deadline):
                 trainable,
                 name=experiment.name,
                 storage_path=str(experiment.parent),
-                config=parameters,
+                config={} if analysis is not None else parameters,
                 scheduler=scheduler,
                 reuse_actors=True,
                 max_concurrent_trials=resources["concurrent_trials"],

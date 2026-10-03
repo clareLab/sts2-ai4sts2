@@ -178,6 +178,7 @@ def test_resumed_population_synchronises_after_the_last_saved_round(study, tmp_p
         tmp_path / "population", frozen, {"concurrent_trials": 2}, time.monotonic() + 60
     )
     assert len(calls) == 1 and calls[0]["resume"]
+    assert calls[0]["config"] == {}
     assert calls[0]["scheduler"]["burn_in_period"] == 4
     assert calls[0]["max_failures"] == 0
     assert calls[0]["stop"] == {"training_iteration": 4}
