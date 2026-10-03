@@ -9,6 +9,14 @@ namespace ai4sts2;
 
 internal static class Observation
 {
+    internal static object? Upgrade(CardModel card)
+    {
+        if (!card.IsUpgradable) return null;
+        var preview = (CardModel)card.MutableClone();
+        preview.UpgradeInternal();
+        return Card(preview);
+    }
+
     internal static object Card(CardModel card, Creature? target = null)
     {
         var variables = card.DynamicVars.Clone(card);
@@ -59,6 +67,7 @@ internal static class Observation
             floor = run.TotalFloor,
             act = run.CurrentActIndex,
             screen = Decisions.ScreenName,
+            selection = CardSelection.Visible,
             player = Creature(player.Creature),
             gold = player.Gold,
             deck = player.Deck.Cards.OrderBy(c => c.Id.Entry).ThenBy(c => c.CurrentUpgradeLevel).Select(c => Card(c)).ToArray(),

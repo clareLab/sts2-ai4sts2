@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/common.sh
-ai4sts2_dotnet format whitespace . --folder --include src/*.cs --verify-no-changes
+ai4sts2_dotnet format whitespace . --folder --include src/*.cs tests/*.cs --verify-no-changes
 ./scripts/python.sh ruff check training tests/test_*.py
 ./scripts/python.sh ruff format --check training tests/test_*.py
 if command -v shellcheck >/dev/null; then shellcheck -x scripts/*.sh

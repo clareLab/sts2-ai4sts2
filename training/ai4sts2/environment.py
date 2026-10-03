@@ -14,12 +14,13 @@ CHARACTERS = ("IRONCLAD", "SILENT", "REGENT", "NECROBINDER", "DEFECT")
 MAX_ACTIONS = 128
 STATE_FEATURES = 512
 ACTION_FEATURES = 64
-SCHEMA = 2
+SCHEMA = 3
 VISIBLE_FIELDS = frozenset(
     "character ascension floor act screen player gold deck relics potions energy stars orbs turn "
     "hand draw discard exhaust creatures model type cost upgrades enchantment side hp max_hp "
     "block powers amount intents damage repeats passive evoke kind card target row column room "
-    "control label selected keywords variables".split()
+    "control label selected keywords variables selection prompt minimum maximum "
+    "skippable upgrade preview random options".split()
 )
 
 

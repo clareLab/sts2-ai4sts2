@@ -124,6 +124,7 @@ internal static class Worker
         SaveManager.Instance.Progress.GetOrCreateCharacterStats(model.Id).TotalLosses = 100;
         _combatEnded = false;
         _combatWon = false;
+        CardSelection.Reset();
         _decisions = [];
         _revision++;
         _run = await NGame.Instance!.StartNewSingleplayerRun(model, false, ActModel.GetDefaultList(), [], seed, GameMode.Standard, 10);
@@ -137,7 +138,7 @@ internal static class Worker
         if (index < 0 || index >= _decisions.Length) throw new ArgumentOutOfRangeException(nameof(parameters));
         var decision = _decisions[index];
         _decisions = [];
-        decision.Execute();
+        await decision.Execute();
         for (int i = 0; i < Execution.StepFrames; i++) await Frame();
         return await Observe();
     }
@@ -187,7 +188,7 @@ internal static class Worker
         return new { revision = _revision, observation, actions, terminated, victory, scope = _scope, audit };
     }
 
-    private static async Task Frame()
+    internal static async Task Frame()
     {
         var timer = Stopwatch.StartNew();
         await Tree.ToSignal(Tree, SceneTree.SignalName.ProcessFrame);

@@ -22,7 +22,15 @@ using MegaCrit.Sts2.Core.Runs;
 
 namespace ai4sts2;
 
-internal sealed record Decision(string Key, object Visible, Action Execute);
+internal sealed record Decision(string Key, object Visible, Func<Task> Execute)
+{
+    internal Decision(string key, object visible, Action execute) : this(key, visible, () =>
+    {
+        execute();
+        return Task.CompletedTask;
+    })
+    { }
+}
 
 internal static class Decisions
 {
@@ -36,6 +44,8 @@ internal static class Decisions
         var screen = ActiveScreenContext.Instance.GetCurrentScreen() as Node;
         if (screen == null) return [];
         if (screen is NInspectCardScreen && !screen.IsProcessingInput()) return [];
+        var selection = CardSelection.Capture(screen, run);
+        if (selection != null) return selection;
         var player = run.Players.Single();
         if (screen is NCombatRoom && CombatManager.Instance.IsInProgress)
         {

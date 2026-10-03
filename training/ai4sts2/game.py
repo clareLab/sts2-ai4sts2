@@ -46,7 +46,9 @@ def prepare_game():
 
 
 class OfficialGame:
-    def __init__(self, executable=None, timeout=75, execution=REFERENCE, audit=False):
+    def __init__(
+        self, executable=None, timeout=75, execution=REFERENCE, audit=False, raw_selection=False
+    ):
         executable = Path(executable or prepare_game())
         directory = ROOT / "artifacts/workers"
         directory.mkdir(parents=True, exist_ok=True)
@@ -77,6 +79,7 @@ class OfficialGame:
             "DOTNET_PROCESSOR_COUNT": "2",
             "AI4STS2_EXECUTION": json.dumps(execution.to_dict()),
             "AI4STS2_AUDIT": "1" if audit else "0",
+            "AI4STS2_RAW_SELECTION": "1" if raw_selection else "0",
         }
         command = [
             str(executable),
