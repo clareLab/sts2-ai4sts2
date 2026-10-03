@@ -1,0 +1,183 @@
+import json
+import os
+import queue
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def game_path():
+    return Path(
+        os.environ.get(
+            "STS2_DIR", Path.home() / ".local/share/Steam/steamapps/common/Slay the Spire 2"
+        )
+    ).resolve()
+
+
+def prepare_game():
+    source = game_path()
+    binary = source / "SlayTheSpire2"
+    package = ROOT / "artifacts/dist/ai4sts2"
+    if not binary.is_file() or not (package / "ai4sts2.dll").is_file():
+        raise FileNotFoundError("Install STS2 and run scripts/build.sh first.")
+    target = ROOT / "artifacts/engine"
+    target.mkdir(parents=True, exist_ok=True)
+    for item in source.iterdir():
+        if item.name in {"mods", "steam_appid.txt"}:
+            continue
+        destination = target / item.name
+        if item.name == binary.name:
+            if (
+                not destination.exists()
+                or destination.stat().st_mtime_ns != item.stat().st_mtime_ns
+            ):
+                shutil.copy2(item, destination)
+        elif not destination.exists():
+            destination.symlink_to(item.resolve())
+    shutil.copytree(package, target / "mods/ai4sts2", dirs_exist_ok=True)
+    return target / binary.name
+
+
+class OfficialGame:
+    def __init__(self, executable=None, timeout=75):
+        executable = Path(executable or prepare_game())
+        directory = ROOT / "artifacts/workers"
+        directory.mkdir(parents=True, exist_ok=True)
+        self.directory = Path(tempfile.mkdtemp(prefix="worker-", dir=directory))
+        userdata = self.directory / "userdata"
+        profile = userdata / "SlayTheSpire2"
+        settings = profile / "default/1/settings.save"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(
+            json.dumps(
+                {
+                    "schema_version": 8,
+                    "mod_settings": {"mods_enabled": True, "mod_list": []},
+                    "volume_master": 0,
+                    "skip_intro_logo": True,
+                    "seen_ea_disclaimer": True,
+                    "fullscreen": False,
+                    "fps_limit": 60,
+                    "language": "eng",
+                }
+            )
+        )
+        (profile / ".ai4sts2-worker").touch()
+        environment = os.environ | {
+            "XDG_DATA_HOME": str(userdata),
+            "XDG_CONFIG_HOME": str(self.directory / "config"),
+            "LP_NUM_THREADS": "1",
+            "DOTNET_PROCESSOR_COUNT": "2",
+        }
+        command = [
+            str(executable),
+            "--headless",
+            "--audio-driver",
+            "Dummy",
+            "--force-steam=off",
+            "--ai4sts2-worker",
+        ]
+        if shutil.which("steam-run"):
+            command.insert(0, "steam-run")
+        self.timeout = timeout
+        self.sequence = 0
+        self.responses = queue.Queue()
+        self.log_path = self.directory / "game.log"
+        self.log = self.log_path.open("w")
+        self.process = subprocess.Popen(
+            command,
+            cwd=executable.parent,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+        try:
+            self.hello = self.request("hello")
+            if self.hello["engine"] != "official" or self.hello["test_mode"]:
+                raise RuntimeError("The worker is not running normal official game rules.")
+        except BaseException:
+            self.close()
+            raise
+
+    def _read(self):
+        try:
+            for line in self.process.stdout:
+                if line.startswith("AI4STS2 "):
+                    try:
+                        self.responses.put(json.loads(line[8:]))
+                    except json.JSONDecodeError:
+                        self.responses.put(None)
+                else:
+                    self.log.write(line)
+                    self.log.flush()
+        finally:
+            self.responses.put(None)
+
+    def request(self, method, parameters=None):
+        if self.process.poll() is not None:
+            raise RuntimeError(f"Official worker exited. See {self.log_path}")
+        self.sequence += 1
+        identifier = str(self.sequence)
+        self.process.stdin.write(
+            json.dumps({"id": identifier, "method": method, "params": parameters or {}}) + "\n"
+        )
+        self.process.stdin.flush()
+        try:
+            response = self.responses.get(timeout=self.timeout)
+        except queue.Empty as error:
+            self.close()
+            raise TimeoutError(
+                f"Official worker timed out during {method}: {self.log_path}"
+            ) from error
+        if response is None or response["id"] != identifier:
+            self.close()
+            raise RuntimeError(f"Official worker protocol failed: {self.log_path}")
+        if not response["ok"]:
+            self.close()
+            raise RuntimeError(response["error"])
+        return response["result"]
+
+    def close(self):
+        import signal
+
+        if self.process.poll() is None:
+            os.killpg(self.process.pid, signal.SIGTERM)
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.process.pid, signal.SIGKILL)
+                self.process.wait(timeout=5)
+        self.reader.join(timeout=2)
+        for stream in (self.process.stdin, self.process.stdout, self.log):
+            stream.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+def probe(character="IRONCLAD", steps=40):
+    started = time.monotonic()
+    with OfficialGame() as game:
+        state = game.request(
+            "reset", {"character": character, "seed": "AI4STS2-PROBE-1", "scope": "first_combat"}
+        )
+        print(json.dumps({"hello": game.hello, "startup_seconds": time.monotonic() - started}))
+        for index in range(steps):
+            print(json.dumps({"step": index, "state": state}), flush=True)
+            if state["terminated"]:
+                break
+            state = game.request("step", {"revision": state["revision"], "action": 0})

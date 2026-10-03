@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai4sts2"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+authors = [{ name = "clareLab", email = "yaho@clarelab.moe" }]
+dependencies = [
+    "ray[tune]>=2.49,<3",
+    "sb3-contrib>=2.7,<3",
+    "torch>=2.8,<3",
+]
+
+[project.scripts]
+ai4sts2 = "ai4sts2.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.13,<1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["training/ai4sts2"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+include = ["training/**/*.py", "tests/test_*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

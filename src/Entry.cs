@@ -9,5 +9,6 @@ public static class Entry
     public static void Initialize()
     {
         GD.Print($"[ai4sts2] Loaded {typeof(Entry).Assembly.GetName().Version?.ToString(3)}");
+        if (OS.GetCmdlineArgs().Contains("--ai4sts2-worker")) Worker.Initialize();
     }
 }
