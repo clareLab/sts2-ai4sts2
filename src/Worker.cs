@@ -21,7 +21,8 @@ internal static class Worker
     private static RunState? _run;
     private static long _revision;
     private static bool _poisoned;
-    private static bool _sawCombat;
+    private static bool _combatEnded;
+    private static bool _combatWon;
     private static string _scope = "run";
     private static Decision[] _decisions = [];
     private static SceneTree Tree => (SceneTree)Engine.GetMainLoop();
@@ -31,6 +32,8 @@ internal static class Worker
         if (!File.Exists(ProjectSettings.GlobalizePath("user://.ai4sts2-worker")))
             throw new InvalidOperationException("An isolated AI4STS2 worker directory is required.");
         if (TestMode.IsOn) throw new InvalidOperationException("The worker requires normal game rules.");
+        CombatManager.Instance.CombatWon += _ => _combatWon = true;
+        CombatManager.Instance.CombatEnded += _ => _combatEnded = true;
         Tree.ProcessFrame += Tick;
         _ = Task.Run(async () =>
         {
@@ -112,7 +115,8 @@ internal static class Worker
         foreach (var encounter in ModelDb.AllEncounters) SaveManager.Instance.Progress.GetOrCreateEncounterStats(encounter.Id);
         var model = ModelDb.AllCharacters.Single(c => c.Id.Entry == character);
         SaveManager.Instance.Progress.GetOrCreateCharacterStats(model.Id).TotalLosses = 100;
-        _sawCombat = false;
+        _combatEnded = false;
+        _combatWon = false;
         _decisions = [];
         _revision++;
         _run = await NGame.Instance!.StartNewSingleplayerRun(model, false, ActModel.GetDefaultList(), [], seed, GameMode.Standard, 10);
@@ -141,15 +145,14 @@ internal static class Worker
         while (true)
         {
             bool inCombat = CombatManager.Instance.IsInProgress;
-            _sawCombat |= inCombat;
-            bool dead = _run.IsGameOver;
+            bool dead = _run.IsGameOver && !inCombat && !RunManager.Instance.ActionExecutor.IsRunning;
             bool victory = RunManager.Instance.WinTime > 0;
-            bool combatComplete = _scope == "first_combat" && _sawCombat && !inCombat;
+            bool combatComplete = _scope == "first_combat" && _combatEnded;
             if (dead || victory || combatComplete)
             {
                 _revision++;
                 _decisions = [];
-                return new { revision = _revision, observation = Observation.Capture(_run), actions = Array.Empty<object>(), terminated = true, victory = !dead && (victory || combatComplete), scope = _scope };
+                return new { revision = _revision, observation = Observation.Capture(_run), actions = Array.Empty<object>(), terminated = true, victory = !dead && (victory || (combatComplete && _combatWon)), scope = _scope };
             }
             var available = Decisions.Capture(_run);
             string signature = string.Join('|', available.Select(a => a.Key));

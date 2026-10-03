@@ -42,6 +42,7 @@ class PopulationMember(tune.Trainable):
         )
         training_seconds = time.monotonic() - started
         result = evaluate(self.model, self.environment)
+        self.evaluation = result
         write_json(Path(self.logdir) / "evaluation.json", result)
         return {
             "validation_win_rate": result["win_rate"],
@@ -49,6 +50,7 @@ class PopulationMember(tune.Trainable):
             "training_seconds": training_seconds,
             "scope": "first_combat",
             "certifying": False,
+            "validation_episodes": result["episodes"],
         }
 
     def save_checkpoint(self, checkpoint_dir):
@@ -64,6 +66,8 @@ class PopulationMember(tune.Trainable):
             directory / "random.pt",
         )
         write_json(directory / "build.json", self.build)
+        if hasattr(self, "evaluation"):
+            write_json(directory / "evaluation.json", self.evaluation)
         return checkpoint_dir
 
     def load_checkpoint(self, checkpoint_dir):

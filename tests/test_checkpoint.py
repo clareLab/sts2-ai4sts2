@@ -30,7 +30,9 @@ def member(monkeypatch, learning_rate=0.0003, entropy=0.01):
 def test_pbt_restores_weights_and_optimizer_then_applies_mutations(monkeypatch, tmp_path):
     donor = member(monkeypatch)
     donor.model.learn(total_timesteps=64)
+    donor.evaluation = {"scope": "first_combat", "episodes": [{"victory": True}]}
     donor.save_checkpoint(str(tmp_path))
+    assert json.loads((tmp_path / "evaluation.json").read_text()) == donor.evaluation
     receiver = member(monkeypatch, learning_rate=0.001, entropy=0.03)
     receiver.load_checkpoint(str(tmp_path))
     for key, weight in donor.model.policy.state_dict().items():
