@@ -9,6 +9,7 @@ def main():
     commands.add_parser("check")
     calibration = commands.add_parser("calibrate")
     calibration.add_argument("--minutes", type=float, default=5)
+    calibration.add_argument("--scope", choices=("run", "first_combat"), default="first_combat")
     selection = commands.add_parser("check-selection")
     selection.add_argument("--minutes", type=float, default=5)
     runs = commands.add_parser("check-run")
@@ -25,6 +26,7 @@ def main():
     pilot.add_argument("--minutes", type=float, default=30)
     pilot.add_argument("--iterations", type=int, default=4)
     pilot.add_argument("--steps", type=int, default=128)
+    pilot.add_argument("--scope", choices=("run", "first_combat"), default="run")
     pilot.add_argument("--resume", help="Recover an interrupted Ray experiment.")
     pilot.add_argument("--checkpoint", help="Start another bounded pilot from a saved model.")
     args = parser.parse_args()
@@ -49,13 +51,20 @@ def main():
     elif args.command == "calibrate":
         from ai4sts2.calibration import calibrate
 
-        print(json.dumps(calibrate(args.minutes), indent=2))
+        print(json.dumps(calibrate(args.minutes, args.scope), indent=2))
     elif args.command == "pilot":
         from ai4sts2.train import run
 
         print(
             json.dumps(
-                run(args.minutes, args.iterations, args.steps, args.resume, args.checkpoint),
+                run(
+                    args.minutes,
+                    args.iterations,
+                    args.steps,
+                    args.resume,
+                    args.checkpoint,
+                    args.scope,
+                ),
                 indent=2,
             )
         )

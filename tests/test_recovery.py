@@ -6,6 +6,7 @@ from ai4sts2.calibration import quarantine_execution, selected_execution
 from ai4sts2.environment import Sts2Env, write_json
 from ai4sts2.execution import REFERENCE, Execution
 from ai4sts2.game import WorkerFailure
+from stable_baselines3.common.vec_env import DummyVecEnv
 from test_checkpoint import member
 from test_environment import FakeWorker
 
@@ -17,7 +18,7 @@ def test_failed_execution_is_persistently_excluded_and_retries_are_bounded(
     import ai4sts2.calibration as calibration
 
     monkeypatch.setattr(calibration, "ROOT", tmp_path)
-    monkeypatch.setattr(calibration, "fingerprint", lambda: {"game": "test"})
+    monkeypatch.setattr(calibration, "fingerprint", lambda *_: {"game": "test"})
     monkeypatch.setattr(calibration, "hardware", lambda: {"cpu": "test"})
     fast = Execution(fps=0, fixed_fps=60, settle_frames=1, step_frames=1)
     write_json(
@@ -74,12 +75,12 @@ def test_worker_recovery_restores_the_whole_training_iteration(monkeypatch, tmp_
     (tmp_path / "recovered").mkdir()
     recovered.sample_count = 128
     recovered.environment.close()
-    recovered.environment = Sts2Env(seed=5, worker_factory=FaultWorker)
-    recovered.model.set_env(recovered.environment)
+    recovered.environment = Sts2Env(seed=5, worker_factory=FaultWorker, scope="run", max_steps=4096)
+    recovered.model.set_env(DummyVecEnv([lambda: recovered.environment]))
     monkeypatch.setattr(
         training,
         "Sts2Env",
-        lambda executable, seed, **_: Sts2Env(seed=seed, worker_factory=FaultWorker),
+        lambda executable, seed, **kwargs: Sts2Env(seed=seed, worker_factory=FaultWorker, **kwargs),
     )
     monkeypatch.setattr(training, "quarantine_execution", lambda *_: REFERENCE)
     result = recovered.step()

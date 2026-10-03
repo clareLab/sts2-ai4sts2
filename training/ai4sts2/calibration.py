@@ -1,3 +1,4 @@
+import collections
 import json
 import os
 import platform
@@ -64,15 +65,17 @@ def compare(expected, actual, step, diagnostic=None):
             raise ValueError(f"Divergence at step {step}: {key}")
 
 
-def trace(game, character, seed, policy, deadline, expected=None):
+def trace(game, character, seed, policy, deadline, expected=None, scope="first_combat"):
     game.timeout = min(75, max(0.01, deadline - time.monotonic()))
     state = game.request(
         "reset",
-        {"character": character, "seed": seed_string("calibration", seed), "scope": "first_combat"},
+        {"character": character, "seed": seed_string("calibration", seed), "scope": scope},
     )
     rng = random.Random(seed)
     frames = []
-    for index in range(129):
+    coverage = collections.Counter()
+    limit = 1024 if scope == "run" else 128
+    for index in range(limit + 1):
         if time.monotonic() >= deadline:
             raise TimeoutError("Calibration budget exhausted.")
         current = signature(state)
@@ -85,7 +88,7 @@ def trace(game, character, seed, policy, deadline, expected=None):
                 index,
                 ROOT / "artifacts/validation/divergence.json",
             )
-        if state["terminated"] or index == 128:
+        if state["terminated"] or index == limit:
             frames.append({"state": current, "action": None})
             break
         actions = state["actions"]
@@ -97,8 +100,17 @@ def trace(game, character, seed, policy, deadline, expected=None):
             action = next(
                 (i for i, a in enumerate(actions) if a["kind"] == "end_turn"), probe_action(actions)
             )
+        elif scope == "run":
+            from ai4sts2.runcheck import probe_decision
+
+            action = probe_decision(state, rng, coverage)
         else:
             action = probe_action(actions)
+        chosen = actions[action]
+        if chosen["kind"] == "map":
+            coverage["room:" + chosen["room"]] += 1
+        if chosen["kind"] == "buy":
+            coverage["buy:" + chosen["type"]] += 1
         frames.append({"state": current, "action": action})
         game.timeout = min(75, max(0.01, deadline - time.monotonic()))
         state = game.request("step", {"revision": state["revision"], "action": action})
@@ -107,7 +119,7 @@ def trace(game, character, seed, policy, deadline, expected=None):
     return frames
 
 
-def measure(executable, execution, cases, deadline, references=None):
+def measure(executable, execution, cases, deadline, references=None, scope="first_combat"):
     started = time.monotonic()
     traces = []
     remaining = deadline - started
@@ -128,6 +140,7 @@ def measure(executable, execution, cases, deadline, references=None):
                     policy,
                     deadline,
                     None if references is None else references[index],
+                    scope,
                 )
             )
         elapsed = time.monotonic() - measured
@@ -152,15 +165,18 @@ def select_result(results):
     return min(valid, key=lambda result: result["seconds"])
 
 
-def calibrate(minutes=5):
+def calibrate(minutes=5, scope="first_combat"):
     if not 0 < minutes <= 30:
         raise ValueError("Use a budget between zero and 30 minutes.")
+    if scope not in {"run", "first_combat"}:
+        raise ValueError("Unknown episode scope.")
     deadline = time.monotonic() + minutes * 60
-    build = fingerprint()
+    build = fingerprint(scope)
     executable = prepare_game()
     cases = [(hero, index, "probe") for index, hero in enumerate(CHARACTERS)]
-    cases += [("IRONCLAD", 11, "loss"), ("REGENT", 21, "random"), ("SILENT", 22, "random")]
-    baseline, references = measure(executable, REFERENCE, cases, deadline)
+    if scope == "first_combat":
+        cases += [("IRONCLAD", 11, "loss"), ("REGENT", 21, "random"), ("SILENT", 22, "random")]
+    baseline, references = measure(executable, REFERENCE, cases, deadline, scope=scope)
     results = [baseline]
     write_json(
         ROOT / "artifacts/validation/reference-traces.json", {"cases": cases, "traces": references}
@@ -170,7 +186,7 @@ def calibrate(minutes=5):
         if deadline - time.monotonic() < 10:
             break
         try:
-            result, _ = measure(executable, execution, cases, deadline, references)
+            result, _ = measure(executable, execution, cases, deadline, references, scope)
         except (RuntimeError, ValueError, TimeoutError) as error:
             result = {"execution": execution.to_dict(), "valid": False, "error": str(error)}
         results.append(result)
@@ -179,11 +195,16 @@ def calibrate(minutes=5):
     report = {
         "build": build,
         "hardware": hardware(),
-        "scope": "first_combat",
+        "scope": scope,
         "selected": selected["execution"],
         "results": results,
         "speedup": baseline["seconds"] / selected["seconds"],
-        "coverage": {"episodes": len(cases), "steps": baseline["steps"], "full_run": False},
+        "coverage": {
+            "episodes": len(cases),
+            "steps": baseline["steps"],
+            "completed": baseline["completed"],
+            "full_run": scope == "run" and baseline["completed"] == len(cases),
+        },
     }
     write_json(ROOT / "artifacts/runtime.json", report)
     return report
@@ -195,7 +216,7 @@ def cached_report(scope="first_combat"):
         return None
     report = json.loads(path.read_text())
     if (
-        report.get("build") != fingerprint()
+        report.get("build") != fingerprint(scope)
         or report.get("hardware") != hardware()
         or report.get("scope") != scope
     ):

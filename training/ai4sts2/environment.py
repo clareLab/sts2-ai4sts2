@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import math
@@ -89,6 +90,11 @@ def seed_string(split, seed):
     return hashlib.sha256(f"ai4sts2:{split}:{seed}".encode()).hexdigest()[:16].upper()
 
 
+def state_digest(state):
+    visible = {key: state[key] for key in ("observation", "actions", "terminated", "victory")}
+    return hashlib.sha256(json.dumps(visible, sort_keys=True).encode()).hexdigest()
+
+
 class Sts2Env(gym.Env):
     metadata = {"render_modes": []}
 
@@ -116,6 +122,8 @@ class Sts2Env(gym.Env):
         self.state = None
         self.steps = 0
         self.character = None
+        self.journal = None
+        self.completed = []
         self.action_space = spaces.Discrete(MAX_ACTIONS)
         self.observation_space = spaces.Dict(
             {
@@ -132,14 +140,17 @@ class Sts2Env(gym.Env):
             raise ValueError("Unknown character.")
         split = options.get("split", "train")
         episode_seed = int(self.rng.integers(2**63)) if seed is None else seed
-        self.state = self.game.request(
-            "reset",
-            {
-                "character": self.character,
-                "seed": seed_string(split, episode_seed),
-                "scope": self.scope,
-            },
-        )
+        parameters = {
+            "character": self.character,
+            "seed": seed_string(split, episode_seed),
+            "scope": self.scope,
+        }
+        self.state = self.game.request("reset", parameters)
+        self.journal = {
+            "parameters": parameters,
+            "initial": state_digest(self.state),
+            "actions": [],
+        }
         self.steps = 0
         return self.encode(), {"scope": self.scope, "character": self.character}
 
@@ -159,6 +170,7 @@ class Sts2Env(gym.Env):
         if (
             self.state is None
             or self.state["terminated"]
+            or self.steps >= self.max_steps
             or not 0 <= action < len(self.state["actions"])
         ):
             raise ValueError("Illegal action.")
@@ -166,6 +178,7 @@ class Sts2Env(gym.Env):
             "step", {"revision": self.state["revision"], "action": action}
         )
         self.steps += 1
+        self.journal["actions"].append({"action": action, "digest": state_digest(self.state)})
         terminated = self.state["terminated"]
         truncated = not terminated and self.steps >= self.max_steps
         victory = bool(terminated and self.state["victory"])
@@ -180,8 +193,52 @@ class Sts2Env(gym.Env):
             "screen": self.state["observation"].get("screen"),
             "floor": self.state["observation"].get("floor"),
             "act": self.state["observation"].get("act"),
+            "seed": self.journal["parameters"]["seed"],
         }
+        if terminated or truncated:
+            self.completed.append(info.copy())
+            info["episode"] = {"r": reward, "l": self.steps}
         return self.encode(), reward, terminated, truncated, info
+
+    def snapshot(self):
+        return copy.deepcopy(
+            {
+                "scope": self.scope,
+                "max_steps": self.max_steps,
+                "journal": self.journal,
+                "completed": self.completed,
+                "rng": self.rng.bit_generator.state,
+            }
+        )
+
+    def restore(self, snapshot):
+        if snapshot["scope"] != self.scope or snapshot["max_steps"] != self.max_steps:
+            raise ValueError("Checkpoint episode scope or step limit does not match.")
+        journal = snapshot["journal"]
+        if journal is None:
+            self.state = None
+            self.character = None
+            self.steps = 0
+        else:
+            state = self.game.request("reset", journal["parameters"])
+            if state_digest(state) != journal["initial"]:
+                raise ValueError("Checkpoint replay diverged at reset.")
+            for index, entry in enumerate(journal["actions"]):
+                state = self.game.request(
+                    "step", {"revision": state["revision"], "action": entry["action"]}
+                )
+                if state_digest(state) != entry["digest"]:
+                    raise ValueError(f"Checkpoint replay diverged at step {index + 1}.")
+            self.state = state
+            self.character = journal["parameters"]["character"]
+            self.steps = len(journal["actions"])
+        self.journal = copy.deepcopy(journal)
+        self.completed = copy.deepcopy(snapshot["completed"])
+        self.rng.bit_generator.state = snapshot["rng"]
+
+    def drain_episodes(self):
+        episodes, self.completed = self.completed, []
+        return episodes
 
     def drain_measurements(self):
         result = self.game.drain_measurements()
@@ -223,9 +280,8 @@ def evaluate(model, environment, seed=0, split="validation", max_steps=256):
                 observation, _, terminated, truncated, info = environment.step(action)
             results.append(info | {"truncated": truncated})
     finally:
-        if model is not None:
-            model._last_obs = None
         environment.max_steps = previous_limit
+        environment.drain_episodes()
     return {
         "scope": environment.scope,
         "certifying": False,

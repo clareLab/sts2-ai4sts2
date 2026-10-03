@@ -10,12 +10,12 @@ from test_environment import FakeWorker
 def member(monkeypatch, learning_rate=0.0003, entropy=0.01):
     import ai4sts2.train as training
 
-    monkeypatch.setattr(training, "fingerprint", lambda: {"game": "test", "schema": 1})
-    monkeypatch.setattr(training, "selected_execution", lambda: None)
+    monkeypatch.setattr(training, "fingerprint", lambda *_: {"game": "test", "schema": 1})
+    monkeypatch.setattr(training, "selected_execution", lambda *_: None)
     monkeypatch.setattr(
         training,
         "Sts2Env",
-        lambda executable, seed, **_: Sts2Env(seed=seed, worker_factory=FakeWorker),
+        lambda executable, seed, **kwargs: Sts2Env(seed=seed, worker_factory=FakeWorker, **kwargs),
     )
     instance = object.__new__(PopulationMember)
     instance.config = {

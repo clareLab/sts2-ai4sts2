@@ -12,6 +12,7 @@ from ray import tune
 from ray.tune.schedulers import PopulationBasedTraining
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.utils import FloatSchedule
+from stable_baselines3.common.vec_env import DummyVecEnv
 
 from ai4sts2.calibration import calibrate, quarantine_execution, selected_execution
 from ai4sts2.environment import Sts2Env, evaluate, fingerprint, write_json
@@ -59,15 +60,22 @@ def bound_mutations(config):
 class PopulationMember(tune.Trainable):
     def setup(self, config):
         torch.set_num_threads(1)
-        self.build = fingerprint()
+        self.scope = config.get("scope", "run")
+        self.build = fingerprint(self.scope)
         self.recoveries = []
-        self.execution = selected_execution() or Execution(**config.get("execution", {}))
-        self.environment = self.open_environment()
+        self.execution = selected_execution(self.scope) or Execution(**config.get("execution", {}))
+        self.validation_environment = None
+        self.environment = None
+        while self.environment is None:
+            try:
+                self.environment = self.open_environment()
+            except WorkerFailure as error:
+                self.avoid_failed_execution(error)
         self.evaluation = None
         self.sample_count = config.get("steps_per_iteration", 128)
         self.model = TimedPPO(
             "MultiInputPolicy",
-            self.environment,
+            DummyVecEnv([lambda: self.environment]),
             learning_rate=config["learning_rate"],
             ent_coef=config["entropy"],
             n_steps=64,
@@ -84,11 +92,14 @@ class PopulationMember(tune.Trainable):
             self.load_checkpoint(config["initial_checkpoint"])
 
     def step(self):
-        self.model._last_obs = None
         with tempfile.TemporaryDirectory(prefix="recovery-", dir=self.logdir) as checkpoint:
             self.save_checkpoint(checkpoint)
+            recovering = False
             while True:
                 try:
+                    if recovering:
+                        self.environment = self.open_environment()
+                        self.load_checkpoint(checkpoint)
                     result = self.train_iteration()
                     result |= {
                         "execution": self.execution.to_dict(),
@@ -99,21 +110,20 @@ class PopulationMember(tune.Trainable):
                 except WorkerFailure as error:
                     self.cleanup()
                     self.avoid_failed_execution(error)
-                    self.environment = self.open_environment()
-                    self.load_checkpoint(checkpoint)
+                    recovering = True
 
     def avoid_failed_execution(self, error):
         self.recoveries.append({"execution": self.execution.to_dict(), "error": str(error)[:2048]})
-        self.execution = quarantine_execution(self.execution, error)
+        self.execution = quarantine_execution(self.execution, error, self.scope)
 
     def open_environment(self):
-        while True:
-            try:
-                return Sts2Env(
-                    self.config["executable"], seed=self.config["seed"], execution=self.execution
-                )
-            except WorkerFailure as error:
-                self.avoid_failed_execution(error)
+        return Sts2Env(
+            self.config["executable"],
+            seed=self.config["seed"],
+            execution=self.execution,
+            scope=self.scope,
+            max_steps=4096 if self.scope == "run" else 256,
+        )
 
     def train_iteration(self):
         self.environment.drain_measurements()
@@ -123,9 +133,16 @@ class PopulationMember(tune.Trainable):
         training_seconds = time.monotonic() - started
         training_profile = self.environment.drain_measurements()
         started = time.monotonic()
-        result = evaluate(self.model, self.environment)
+        if self.validation_environment is None:
+            self.validation_environment = self.open_environment()
+        self.validation_environment.drain_measurements()
+        result = evaluate(
+            self.model,
+            self.validation_environment,
+            max_steps=self.validation_environment.max_steps,
+        )
         evaluation_seconds = time.monotonic() - started
-        evaluation_profile = self.environment.drain_measurements()
+        evaluation_profile = self.validation_environment.drain_measurements()
         measured_steps = self.sample_count
         self.sample_count = next_sample_count(
             training_seconds, evaluation_seconds, measured_steps, self.model.n_steps
@@ -142,9 +159,11 @@ class PopulationMember(tune.Trainable):
             "evaluation_profile": evaluation_profile,
             "sample_count": measured_steps,
             "next_sample_count": self.sample_count,
-            "scope": "first_combat",
+            "scope": self.scope,
             "certifying": False,
             "validation_episodes": result["episodes"],
+            "training_episodes": self.environment.drain_episodes(),
+            "ongoing_episode_steps": self.environment.steps,
         }
 
     def save_checkpoint(self, checkpoint_dir):
@@ -160,16 +179,39 @@ class PopulationMember(tune.Trainable):
             directory / "random.pt",
         )
         write_json(directory / "build.json", self.build)
+        write_json(directory / "environment.json", self.environment.snapshot())
         write_json(directory / "schedule.json", {"sample_count": self.sample_count})
         if self.evaluation is not None:
             write_json(directory / "evaluation.json", self.evaluation)
         return checkpoint_dir
 
     def load_checkpoint(self, checkpoint_dir):
+        while True:
+            try:
+                if self.environment is None:
+                    self.environment = self.open_environment()
+                return self.restore_checkpoint(checkpoint_dir)
+            except WorkerFailure as error:
+                self.cleanup()
+                self.avoid_failed_execution(error)
+
+    def restore_checkpoint(self, checkpoint_dir):
         directory = Path(checkpoint_dir)
         if json.loads((directory / "build.json").read_text()) != self.build:
             raise ValueError("Checkpoint game, bridge, dependencies or schema do not match.")
-        self.model = TimedPPO.load(directory / "policy.zip", env=self.environment, device="cpu")
+        self.environment.restore(json.loads((directory / "environment.json").read_text()))
+        self.model = TimedPPO.load(
+            directory / "policy.zip",
+            env=DummyVecEnv([lambda: self.environment]),
+            device="cpu",
+            force_reset=False,
+        )
+        if self.model._last_obs is not None:
+            if self.environment.state is None:
+                raise ValueError("Checkpoint observation has no matching episode.")
+            for key, value in self.environment.encode().items():
+                if not np.array_equal(self.model._last_obs[key][0], value):
+                    raise ValueError("Checkpoint observation does not match the restored episode.")
         self.sample_count = json.loads((directory / "schedule.json").read_text())["sample_count"]
         evaluation = directory / "evaluation.json"
         self.evaluation = json.loads(evaluation.read_text()) if evaluation.is_file() else None
@@ -200,28 +242,43 @@ class PopulationMember(tune.Trainable):
         return True
 
     def cleanup(self):
-        if hasattr(self, "environment"):
-            self.environment.close()
+        for name in ("environment", "validation_environment"):
+            environment = getattr(self, name, None)
+            if environment is not None:
+                environment.close()
+                setattr(self, name, None)
 
 
-def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None):
+def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope="run"):
     if not 0 < minutes <= 30:
         raise ValueError("This pilot supports a budget of at most 30 minutes.")
     if iterations < 2 or steps < 64 or steps % 64:
         raise ValueError("Use at least two iterations and a multiple of 64 steps.")
+    if scope not in {"run", "first_combat"}:
+        raise ValueError("Unknown episode scope.")
+    if resume and checkpoint:
+        raise ValueError("Choose either interrupted-experiment recovery or a starting checkpoint.")
+    report = {
+        "scope": scope,
+        "certifying": False,
+        "promoted": False,
+        "complete": False,
+        "build": fingerprint(scope),
+        "errors": [],
+        "trials": [],
+    }
+    write_json(ROOT / "artifacts/validation/pilot.json", report)
     executable = prepare_game()
     started = time.monotonic()
-    execution = selected_execution()
+    execution = selected_execution(scope)
     if execution is None:
-        calibrate(min(5, minutes / 3))
-        execution = selected_execution()
+        calibrate(min(5, minutes / 3), scope)
+        execution = selected_execution(scope)
     if execution is None:
         raise RuntimeError("Execution calibration did not produce a compatible configuration.")
     remaining_seconds = minutes * 60 - (time.monotonic() - started)
     if remaining_seconds <= 0:
         raise TimeoutError("The pilot budget was used by execution calibration.")
-    if resume and checkpoint:
-        raise ValueError("Choose either interrupted-experiment recovery or a starting checkpoint.")
     if checkpoint:
         checkpoint = str(Path(checkpoint).resolve())
     ray.init(
@@ -271,15 +328,20 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None):
                     "steps_per_iteration": steps,
                     "initial_checkpoint": checkpoint,
                     "execution": execution.to_dict(),
+                    "scope": scope,
                 },
             )
         results = tuner.fit()
         successful = [result for result in results if not result.error and result.checkpoint]
         report = {
-            "scope": "first_combat",
+            "scope": scope,
             "certifying": False,
             "promoted": False,
-            "build": fingerprint(),
+            "complete": len(successful) == len(results)
+            and all(
+                result.metrics.get("training_iteration", 0) >= iterations for result in results
+            ),
+            "build": fingerprint(scope),
             "errors": [str(result.error) for result in results if result.error],
             "trials": [
                 {
