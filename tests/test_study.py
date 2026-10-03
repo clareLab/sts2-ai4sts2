@@ -9,6 +9,7 @@ import pytest
 from ai4sts2.execution import Execution
 from ai4sts2.resources import GIB, Budget
 from test_checkpoint import member
+from test_curriculum import environment as curriculum_environment
 
 
 @pytest.fixture
@@ -100,6 +101,9 @@ def test_optimiser_mutations_leave_reward_and_curriculum_unchanged(study):
         "rnd_scale": 0.0,
         "curriculum_mix": 0.0,
         "progress_scale": 0.0,
+        "floor_goals": [2, 4, 8, 16, 32, 64],
+        "goal_min_episodes": 10,
+        "goal_success_rate": 0.8,
     }
     fixed = {key: value for key, value in config.items() if key not in study.optimiser_space()}
     result = study.bound_optimiser(config.copy())
@@ -122,6 +126,58 @@ def test_population_uses_frozen_iteration_size_after_loading_source(study, tmp_p
     try:
         receiver.setup(receiver.config)
         assert receiver.sample_count == 64
+    finally:
+        donor.cleanup()
+        receiver.cleanup()
+
+
+def test_population_transfer_preserves_curriculum_and_unfinished_goal(study, tmp_path, monkeypatch):
+    import torch
+    from ai4sts2 import train as training
+
+    donor = member(monkeypatch, policy="shared")
+    donor.cleanup()
+    monkeypatch.setattr(
+        training,
+        "Sts2Env",
+        lambda *args, signals=None, **kwargs: curriculum_environment(
+            signals, tuple(index // 20 for index in range(101)), terminal=True
+        ),
+    )
+    donor.config |= {"floor_goals": [2, 4], "goal_min_episodes": 2}
+    donor.setup(donor.config)
+    donor.model.learn(total_timesteps=128)
+    donor.sample_count = 256
+    checkpoint = tmp_path / "curriculum"
+    checkpoint.mkdir()
+    donor.save_checkpoint(checkpoint)
+    receiver = object.__new__(study.StudyMember)
+    receiver.config = donor.config | {
+        "initial_checkpoint": str(checkpoint),
+        "steps_per_iteration": 64,
+        "learning_rate": 0.0001,
+        "entropy": 0.0002,
+        "epochs": 8,
+    }
+    try:
+        receiver.setup(receiver.config)
+        assert receiver.sample_count == 64
+        assert receiver.signals.goal() == 4
+        assert receiver.environment.goal_floor == 4
+        assert receiver.environment.steps == 48
+        assert receiver.environment.snapshot() == donor.environment.snapshot()
+        assert receiver.signals.report() == donor.signals.report()
+        for key, value in donor.model.policy.state_dict().items():
+            torch.testing.assert_close(
+                receiver.model.policy.state_dict()[key], value, rtol=0, atol=0
+            )
+        assert receiver.model.lr_schedule(0.5) == 0.0001
+        assert receiver.model.ent_coef == 0.0002 and receiver.model.n_epochs == 8
+        assert receiver.model.policy.optimizer.state_dict()["state"]
+        receiver.model.learn(total_timesteps=64, reset_num_timesteps=False)
+        assert receiver.signals.floor_curriculum.total_episodes == 3
+        assert receiver.environment.goal_floor == 4 and receiver.environment.steps == 32
+        assert not any(episode["victory"] for episode in receiver.environment.completed)
     finally:
         donor.cleanup()
         receiver.cleanup()
