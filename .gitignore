@@ -1,0 +1,9 @@
+artifacts/
+bin/
+obj/
+.vs/
+.idea/
+TestResults/
+*.user
+*.suo
+__pycache__/
