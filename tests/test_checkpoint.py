@@ -11,6 +11,7 @@ def member(monkeypatch, learning_rate=0.0003, entropy=0.01):
     import ai4sts2.train as training
 
     monkeypatch.setattr(training, "fingerprint", lambda: {"game": "test", "schema": 1})
+    monkeypatch.setattr(training, "selected_execution", lambda: None)
     monkeypatch.setattr(
         training,
         "Sts2Env",

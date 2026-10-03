@@ -146,7 +146,7 @@ def measure(executable, execution, cases, deadline, references=None):
 
 
 def select_result(results):
-    valid = [r for r in results if r.get("valid")]
+    valid = [r for r in results if r.get("valid") and "runtime_failure" not in r]
     if not valid:
         raise ValueError("No validated execution configuration.")
     return min(valid, key=lambda result: result["seconds"])
@@ -189,7 +189,7 @@ def calibrate(minutes=5):
     return report
 
 
-def selected_execution(scope="first_combat"):
+def cached_report(scope="first_combat"):
     path = ROOT / "artifacts/runtime.json"
     if not path.is_file():
         return None
@@ -200,7 +200,35 @@ def selected_execution(scope="first_combat"):
         or report.get("scope") != scope
     ):
         return None
-    selected = report["selected"]
-    if not any(r.get("valid") and r["execution"] == selected for r in report["results"]):
-        raise ValueError("Cached execution configuration was not validated.")
+    return report
+
+
+def selected_execution(scope="first_combat"):
+    report = cached_report(scope)
+    if report is None:
+        return None
+    return Execution(**select_result(report["results"])["execution"])
+
+
+def quarantine_execution(execution, error, scope="first_combat"):
+    report = cached_report(scope)
+    if report is None:
+        raise RuntimeError(
+            "No compatible execution calibration is available for recovery."
+        ) from error
+    matches = [r for r in report["results"] if r["execution"] == execution.to_dict()]
+    if not matches:
+        raise RuntimeError("The failed execution configuration was not calibrated.") from error
+    for result in matches:
+        result["runtime_failure"] = str(error)[:2048]
+    try:
+        selected = select_result(report["results"])["execution"]
+    except ValueError:
+        selected = None
+    report["selected"] = selected
+    write_json(ROOT / "artifacts/runtime.json", report)
+    if selected is None:
+        raise RuntimeError(
+            "All calibrated execution configurations failed; training stopped."
+        ) from error
     return Execution(**selected)

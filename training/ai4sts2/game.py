@@ -13,6 +13,10 @@ from ai4sts2.execution import REFERENCE
 ROOT = Path(__file__).resolve().parents[2]
 
 
+class WorkerFailure(RuntimeError):
+    pass
+
+
 def game_path():
     return Path(
         os.environ.get(
@@ -139,24 +143,32 @@ class OfficialGame:
     def request(self, method, parameters=None):
         started = time.perf_counter()
         if self.process.poll() is not None:
-            raise RuntimeError(f"Official worker exited. See {self.log_path}")
+            raise WorkerFailure(
+                f"Official worker exited ({self.process.returncode}). See {self.log_path}"
+            )
         self.sequence += 1
         identifier = str(self.sequence)
-        self.process.stdin.write(
-            json.dumps({"id": identifier, "method": method, "params": parameters or {}}) + "\n"
-        )
-        self.process.stdin.flush()
+        try:
+            self.process.stdin.write(
+                json.dumps({"id": identifier, "method": method, "params": parameters or {}}) + "\n"
+            )
+            self.process.stdin.flush()
+        except OSError as error:
+            self.close()
+            raise WorkerFailure(
+                f"Official worker connection failed. See {self.log_path}"
+            ) from error
         try:
             response = self.responses.get(timeout=self.timeout)
         except queue.Empty as error:
             self.close()
-            raise TimeoutError(
+            raise WorkerFailure(
                 f"Official worker timed out during {method}: {self.log_path}"
             ) from error
-        if response is None or response["id"] != identifier:
+        if not isinstance(response, dict) or response.get("id") != identifier:
             detail = {"expected_id": identifier, "response": response, "exit": self.process.poll()}
             self.close()
-            raise RuntimeError(f"Official worker protocol failed: {detail}. See {self.log_path}")
+            raise WorkerFailure(f"Official worker protocol failed: {detail}. See {self.log_path}")
         if not response["ok"]:
             self.close()
             raise RuntimeError(response["error"])

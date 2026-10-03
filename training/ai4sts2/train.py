@@ -1,6 +1,7 @@
 import json
 import math
 import random
+import tempfile
 import time
 from pathlib import Path
 
@@ -12,10 +13,10 @@ from ray.tune.schedulers import PopulationBasedTraining
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.utils import FloatSchedule
 
-from ai4sts2.calibration import calibrate, selected_execution
+from ai4sts2.calibration import calibrate, quarantine_execution, selected_execution
 from ai4sts2.environment import Sts2Env, evaluate, fingerprint, write_json
 from ai4sts2.execution import Execution
-from ai4sts2.game import ROOT, prepare_game
+from ai4sts2.game import ROOT, WorkerFailure, prepare_game
 
 
 class TimedPPO(MaskablePPO):
@@ -59,11 +60,9 @@ class PopulationMember(tune.Trainable):
     def setup(self, config):
         torch.set_num_threads(1)
         self.build = fingerprint()
-        self.environment = Sts2Env(
-            config["executable"],
-            seed=config["seed"],
-            execution=Execution(**config.get("execution", {})),
-        )
+        self.recoveries = []
+        self.execution = selected_execution() or Execution(**config.get("execution", {}))
+        self.environment = self.open_environment()
         self.evaluation = None
         self.sample_count = config.get("steps_per_iteration", 128)
         self.model = TimedPPO(
@@ -85,6 +84,38 @@ class PopulationMember(tune.Trainable):
             self.load_checkpoint(config["initial_checkpoint"])
 
     def step(self):
+        self.model._last_obs = None
+        with tempfile.TemporaryDirectory(prefix="recovery-", dir=self.logdir) as checkpoint:
+            self.save_checkpoint(checkpoint)
+            while True:
+                try:
+                    result = self.train_iteration()
+                    result |= {
+                        "execution": self.execution.to_dict(),
+                        "recovery_events": self.recoveries.copy(),
+                    }
+                    self.recoveries.clear()
+                    return result
+                except WorkerFailure as error:
+                    self.cleanup()
+                    self.avoid_failed_execution(error)
+                    self.environment = self.open_environment()
+                    self.load_checkpoint(checkpoint)
+
+    def avoid_failed_execution(self, error):
+        self.recoveries.append({"execution": self.execution.to_dict(), "error": str(error)[:2048]})
+        self.execution = quarantine_execution(self.execution, error)
+
+    def open_environment(self):
+        while True:
+            try:
+                return Sts2Env(
+                    self.config["executable"], seed=self.config["seed"], execution=self.execution
+                )
+            except WorkerFailure as error:
+                self.avoid_failed_execution(error)
+
+    def train_iteration(self):
         self.environment.drain_measurements()
         self.model.optimisation_seconds = 0.0
         started = time.monotonic()

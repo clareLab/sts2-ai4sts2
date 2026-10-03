@@ -39,6 +39,9 @@ class FakeWorker:
     def close(self):
         self.closed = True
 
+    def drain_measurements(self):
+        return {}
+
 
 def test_hidden_state_and_draw_order_do_not_change_policy_input():
     original = state()
