@@ -65,17 +65,21 @@ def sources(study, variant, build):
 
 
 def forecast_seconds(steps, metrics, parallelism=1):
+    measured_parallelism = metrics.get("concurrent_trials", 1)
     if (
         metrics["sample_count"] <= 0
         or metrics["training_seconds"] < 0
         or metrics["evaluation_seconds"] < 0
+        or not isinstance(measured_parallelism, int)
+        or measured_parallelism < 1
+        or parallelism < 1
     ):
         raise ValueError("Invalid training timing.")
     estimate = (
         steps * metrics["training_seconds"] / metrics["sample_count"]
         + metrics["evaluation_seconds"]
     )
-    return estimate * parallelism * 1.1 + 30
+    return estimate * max(1, parallelism / measured_parallelism) * 1.1 + 30
 
 
 def saved_stage(directory, target, identity):
@@ -106,8 +110,6 @@ def run_candidate(job):
             pending.append(target)
     if not pending:
         return {"seed": source["seed"], "status": "cached"}
-    if current is not source:
-        parallelism = 1
     estimate = forecast_seconds(
         pending[0] - current["environment_steps"], current["metrics"], parallelism
     )
@@ -130,6 +132,7 @@ def run_candidate(job):
                 return {"seed": source["seed"], "status": "budget"}
             member.sample_count = steps
             metrics = member.step()
+            metrics["concurrent_trials"] = parallelism
             if member.model.num_timesteps != target or not metrics["validation_eligible"]:
                 raise ValueError("The training stage did not finish cleanly.")
             checkpoint = directory / f"checkpoint_{target:06}"
@@ -146,7 +149,6 @@ def run_candidate(job):
                 "files": checkpoint_files(checkpoint),
             }
             write_json(checkpoint / "result.json", current)
-            parallelism = 1
             print(
                 json.dumps(
                     {

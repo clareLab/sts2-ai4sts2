@@ -117,5 +117,11 @@ def test_source_checks_build_unique_seeds_and_timing(source):
 def test_forecast_accounts_for_contention_and_evaluation():
     metrics = {"sample_count": 64, "training_seconds": 100, "evaluation_seconds": 20}
     assert curve.forecast_seconds(128, metrics, 2) == pytest.approx(514)
+    paired = metrics | {"concurrent_trials": 2}
+    assert curve.forecast_seconds(128, paired, 2) == pytest.approx(272)
+    assert curve.forecast_seconds(128, paired, 1) == pytest.approx(272)
+    assert curve.forecast_seconds(128, paired, 4) == pytest.approx(514)
+    with pytest.raises(ValueError, match="Invalid training timing"):
+        curve.forecast_seconds(128, metrics | {"concurrent_trials": 0})
     with pytest.raises(ValueError, match="Invalid training timing"):
         curve.forecast_seconds(128, metrics | {"sample_count": 0})
