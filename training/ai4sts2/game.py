@@ -63,6 +63,20 @@ class OfficialGame:
         if diagnostic_event and not diagnostic:
             raise ValueError("A diagnostic event requires diagnostic mode.")
         executable = Path(executable or prepare_game())
+        self.timeout = timeout
+        self.measurements = {}
+        self._has_episode = False
+        self._launch = {
+            "executable": executable,
+            "execution": execution,
+            "audit": audit,
+            "raw_selection": raw_selection,
+            "diagnostic": diagnostic,
+            "diagnostic_event": diagnostic_event,
+        }
+        self._open(**self._launch)
+
+    def _open(self, executable, execution, audit, raw_selection, diagnostic, diagnostic_event):
         directory = ROOT / "artifacts/workers"
         directory.mkdir(parents=True, exist_ok=True)
         self.directory = Path(tempfile.mkdtemp(prefix="worker-", dir=directory))
@@ -108,10 +122,8 @@ class OfficialGame:
             command += ["--fixed-fps", str(execution.fixed_fps)]
         if shutil.which("steam-run"):
             command.insert(0, "steam-run")
-        self.timeout = timeout
         self.sequence = 0
         self.responses = queue.Queue()
-        self.measurements = {}
         self.log_path = self.directory / "game.log"
         self.log = self.log_path.open("w")
         self.journal = (self.directory / "requests.jsonl").open("w", buffering=1)
@@ -156,6 +168,13 @@ class OfficialGame:
 
     def request(self, method, parameters=None):
         started = time.perf_counter()
+        restart_ms = 0.0
+        if method == "reset":
+            if getattr(self, "_has_episode", False):
+                self.close()
+                self._open(**self._launch)
+                restart_ms = (time.perf_counter() - started) * 1000
+            self._has_episode = True
         if self.process.poll() is not None:
             raise WorkerFailure(
                 f"Official worker exited ({self.process.returncode}). See {self.log_path}"
@@ -187,12 +206,12 @@ class OfficialGame:
             self.close()
             raise RuntimeError(response["error"])
         measurement = self.measurements.setdefault(method, {})
-        timing = response.get("timing", {})
+        timing = response.get("timing", {}) | {"restart_ms": restart_ms}
         wall_ms = (time.perf_counter() - started) * 1000
         for key, value in (timing | {"wall_ms": wall_ms, "calls": 1}).items():
             measurement[key] = measurement.get(key, 0) + value
         measurement["transport_ms"] = measurement.get("transport_ms", 0) + max(
-            0, wall_ms - timing.get("engine_ms", wall_ms)
+            0, wall_ms - timing.get("engine_ms", wall_ms) - restart_ms
         )
         return response["result"]
 
