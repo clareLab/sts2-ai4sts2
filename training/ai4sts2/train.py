@@ -29,10 +29,63 @@ from ai4sts2.signals import TrainingSignals
 class TimedPPO(MaskablePPO):
     optimisation_seconds = 0.0
 
+    def _excluded_save_params(self):
+        return super()._excluded_save_params() + ["learning_diagnostics", "optimisation_seconds"]
+
+    def drain_diagnostics(self):
+        rows = getattr(self, "learning_diagnostics", [])
+        self.learning_diagnostics = []
+        return rows
+
     def train(self):
         started = time.perf_counter()
+        buffer = self.rollout_buffer
+        counts = buffer.action_masks.sum(axis=-1)
+        row = {
+            "environment_steps": self.num_timesteps,
+            "samples": int(buffer.rewards.size),
+            "positive_rewards": int((buffer.rewards > 0).sum()),
+            "negative_rewards": int((buffer.rewards < 0).sum()),
+            "choice_fraction": float((counts > 1).mean()),
+            "entropy_ceiling": float(np.log(counts.clip(min=1)).mean()),
+        }
+        for name in ("rewards", "values", "returns", "advantages"):
+            values = getattr(buffer, name)
+            finite = values[np.isfinite(values)]
+            row[name] = {
+                "nonfinite": int(values.size - finite.size),
+                **{
+                    statistic: float(getattr(finite, statistic)()) if finite.size else None
+                    for statistic in ("mean", "std", "min", "max")
+                },
+            }
+        heads = {
+            name: torch.nn.utils.parameters_to_vector(getattr(self.policy, name).parameters())
+            .detach()
+            .clone()
+            for name in ("action_net", "value_net")
+        }
         try:
-            return super().train()
+            super().train()
+            row["optimiser"] = {
+                key.removeprefix("train/"): float(value) if np.isfinite(value) else None
+                for key, value in self.logger.name_to_value.items()
+                if key.startswith("train/")
+            }
+            row["head_update_l2"] = {
+                name: float(
+                    torch.linalg.vector_norm(
+                        torch.nn.utils.parameters_to_vector(
+                            getattr(self.policy, name).parameters()
+                        ).detach()
+                        - before
+                    )
+                )
+                for name, before in heads.items()
+            }
+            if not hasattr(self, "learning_diagnostics"):
+                self.learning_diagnostics = []
+            self.learning_diagnostics.append(row)
         finally:
             self.optimisation_seconds += time.perf_counter() - started
 
@@ -239,6 +292,7 @@ class PopulationMember(tune.Trainable):
     def train_iteration(self):
         self.environment.drain_measurements()
         self.model.optimisation_seconds = 0.0
+        self.model.drain_diagnostics()
         started = time.monotonic()
         self.model.learn(total_timesteps=self.sample_count, reset_num_timesteps=False)
         training_seconds = time.monotonic() - started
@@ -283,6 +337,7 @@ class PopulationMember(tune.Trainable):
             ),
             "training_seconds": training_seconds,
             "optimisation_seconds": self.model.optimisation_seconds,
+            "learning_diagnostics": self.model.drain_diagnostics(),
             "evaluation_seconds": evaluation_seconds,
             "training_profile": training_profile,
             "evaluation_profile": evaluation_profile,
