@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import json
 import time
@@ -176,3 +177,103 @@ def test_evaluation_switches_encoding_without_restarting_game(suite, monkeypatch
     assert len(observed) == 20
     assert len(environments) == 1
     assert environments[0].game.closed
+
+
+def test_interrupted_random_episode_resumes_identical_actions_and_result():
+    case = evaluation_plan("run", split="test")["cases"][0]
+    direct = Sts2Env(worker_factory=FakeWorker, scope="run")
+    expected = holdout.episode(None, direct, case, time.monotonic() + 10)
+    interrupted = Sts2Env(worker_factory=FakeWorker, scope="run")
+    snapshots = []
+
+    def checkpoint(snapshot):
+        snapshots.append(copy.deepcopy(snapshot))
+        if len(snapshot["environment"]["journal"]["actions"]) == 2:
+            raise holdout.EvaluationPaused()
+
+    with pytest.raises(holdout.EvaluationPaused):
+        holdout.episode(None, interrupted, case, time.monotonic() + 10, checkpoint=checkpoint)
+    resumed = Sts2Env(worker_factory=FakeWorker, scope="run")
+    assert holdout.episode(None, resumed, case, time.monotonic() + 10, snapshots[-1]) == expected
+    assert resumed.game.calls == direct.game.calls
+    assert interrupted.game.calls == direct.game.calls[:3]
+
+
+def test_paused_cases_are_resumed_but_completed_cases_are_not_repeated(suite, monkeypatch):
+    study, output, environments = suite
+    original = holdout.episode
+    paused = []
+
+    def pause_once(model, environment, case, deadline, resume, checkpoint, cancelled):
+        if paused:
+            return original(model, environment, case, deadline, resume, checkpoint, cancelled)
+
+        def stop(snapshot):
+            checkpoint(snapshot)
+            if len(snapshot["environment"]["journal"]["actions"]) == 2:
+                paused.append(case)
+                raise holdout.EvaluationPaused()
+
+        return original(model, environment, case, deadline, resume, stop, cancelled)
+
+    monkeypatch.setattr(holdout, "episode", pause_once)
+    first = holdout.run(study, output, per_character=1, workers=1)
+    assert not first["complete"]
+    assert sum(len(trial["episodes"]) for trial in first["trials"]) == 9
+    assert all(not trial["errors"] for trial in first["trials"])
+    saved = json.loads((output / "episodes/0000-random.json").read_text())
+    assert len(saved["resume"]["environment"]["journal"]["actions"]) == 2
+    files = {path: path.read_bytes() for path in (output / "episodes").glob("*.json")}
+    second = holdout.run(study, output, per_character=1, workers=1)
+    assert second["eligible"] and len(environments) == 2
+    assert all(environment.game.closed for environment in environments)
+    assert len(environments[-1].game.calls) == 5
+    assert sum(path.read_bytes() != data for path, data in files.items()) == 1
+    final = json.loads((output / "episodes/0000-random.json").read_text())
+    assert "resume" not in final and "pending" not in final
+
+
+def test_cached_evaluation_does_not_calibrate_or_prepare_game(suite, monkeypatch):
+    study, output, _ = suite
+    expected = holdout.run(study, output, per_character=1)
+    for name in ("selected_execution", "calibrate", "prepare_game", "Sts2Env"):
+        monkeypatch.setattr(holdout, name, lambda *_: pytest.fail("Cached work was repeated"))
+    actual = holdout.run(study, output, per_character=1, auto_calibrate=True)
+    assert actual["trials"] == expected["trials"]
+
+
+def test_resume_rejects_changed_case_or_divergent_history_before_new_actions():
+    case = evaluation_plan("run", split="test")["cases"][0]
+    source = Sts2Env(worker_factory=FakeWorker, scope="run")
+    source.reset(seed=case["seed_index"], options={"character": case["character"], "split": "test"})
+    source.step(0)
+    snapshot = {"environment": source.snapshot(), "action_rng": {}}
+    target = Sts2Env(worker_factory=FakeWorker, scope="run")
+    with pytest.raises(ValueError, match="different evaluation case"):
+        holdout.episode(None, target, case | {"seed": "changed"}, time.monotonic() + 10, snapshot)
+    assert target.game.calls == []
+    snapshot["environment"]["journal"]["actions"][0]["digest"] = "changed"
+    with pytest.raises(ValueError, match="replay diverged"):
+        holdout.episode(None, target, case, time.monotonic() + 10, snapshot)
+    assert len(target.game.calls) == 2
+
+
+def test_cancellation_interrupts_replay_and_restores_request_handler():
+    case = evaluation_plan("run", split="test")["cases"][0]
+    source = Sts2Env(worker_factory=FakeWorker, scope="run")
+    source.reset(seed=case["seed_index"], options={"character": case["character"], "split": "test"})
+    for _ in range(3):
+        source.step(0)
+    target = Sts2Env(worker_factory=FakeWorker, scope="run")
+    original = target.game.request
+    with pytest.raises(holdout.EvaluationPaused):
+        holdout.episode(
+            None,
+            target,
+            case,
+            time.monotonic() + 10,
+            {"environment": source.snapshot()},
+            cancelled=lambda: len(target.game.calls) == 2,
+        )
+    assert len(target.game.calls) == 2
+    assert target.game.request == original

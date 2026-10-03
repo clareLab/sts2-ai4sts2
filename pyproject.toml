@@ -38,7 +38,7 @@ explicit = true
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-include = ["training/**/*.py", "tests/test_*.py", "scripts/evaluate.py", "scripts/curve.py"]
+include = ["training/**/*.py", "tests/test_*.py", "scripts/*.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

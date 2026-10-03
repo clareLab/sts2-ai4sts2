@@ -6,13 +6,14 @@ import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
 import torch
-from ai4sts2.calibration import selected_execution
+from ai4sts2.calibration import calibrate, selected_execution
 from ai4sts2.environment import Sts2Env, evaluation_plan, fingerprint, write_json
-from ai4sts2.game import ROOT, prepare_game
+from ai4sts2.game import ROOT, WorkerFailure, prepare_game
 from ai4sts2.metrics import compare_evaluations, summarise
 from ai4sts2.resources import budget
 from sb3_contrib import MaskablePPO
@@ -44,35 +45,64 @@ def candidates(study, build):
     return result
 
 
-def episode(model, environment, case, deadline):
-    def check_budget():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("Evaluation budget exhausted.")
-        environment.game.timeout = min(75, remaining)
+class EvaluationPaused(TimeoutError):
+    pass
 
-    check_budget()
-    observation, _ = environment.reset(
-        seed=case["seed_index"], options={"character": case["character"], "split": "test"}
-    )
-    rng = np.random.default_rng(case["action_seed"])
-    terminated = truncated = False
-    while not (terminated or truncated):
-        check_budget()
-        if model is None:
-            action = int(rng.choice(np.flatnonzero(environment.action_masks())))
-        else:
-            action, _ = model.predict(
-                observation, deterministic=True, action_masks=environment.action_masks()
+
+@contextmanager
+def evaluation_requests(game, deadline, cancelled):
+    original = game.request
+    timeout = getattr(game, "timeout", 75)
+
+    def request(*args, **kwargs):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or (cancelled is not None and cancelled()):
+            raise EvaluationPaused("Evaluation paused.")
+        game.timeout = min(timeout, remaining)
+        return original(*args, **kwargs)
+
+    game.request = request
+    try:
+        yield
+    finally:
+        game.request = original
+        game.timeout = timeout
+
+
+def episode(model, environment, case, deadline, resume=None, checkpoint=None, cancelled=None):
+    with evaluation_requests(environment.game, deadline, cancelled):
+        rng = np.random.default_rng(case["action_seed"])
+        if resume is None:
+            observation, _ = environment.reset(
+                seed=case["seed_index"], options={"character": case["character"], "split": "test"}
             )
-        observation, _, terminated, truncated, info = environment.step(action)
-    environment.drain_episodes()
-    return info | {
-        "truncated": truncated,
-        "trajectory_digest": hashlib.sha256(
-            json.dumps(environment.journal, sort_keys=True).encode()
-        ).hexdigest(),
-    }
+        else:
+            parameters = resume["environment"]["journal"]["parameters"]
+            if parameters["seed"] != case["seed"] or parameters["character"] != case["character"]:
+                raise ValueError("The saved continuation belongs to a different evaluation case.")
+            environment.restore(resume["environment"])
+            rng.bit_generator.state = resume["action_rng"]
+            observation = environment.encode()
+        terminated = truncated = False
+        while not (terminated or truncated):
+            if checkpoint is not None:
+                checkpoint(
+                    {"environment": environment.snapshot(), "action_rng": rng.bit_generator.state}
+                )
+            if model is None:
+                action = int(rng.choice(np.flatnonzero(environment.action_masks())))
+            else:
+                action, _ = model.predict(
+                    observation, deterministic=True, action_masks=environment.action_masks()
+                )
+            observation, _, terminated, truncated, info = environment.step(action)
+        environment.drain_episodes()
+        return info | {
+            "truncated": truncated,
+            "trajectory_digest": hashlib.sha256(
+                json.dumps(environment.journal, sort_keys=True).encode()
+            ).hexdigest(),
+        }
 
 
 def aggregate(plan, records):
@@ -112,7 +142,7 @@ def aggregate(plan, records):
     }
 
 
-def run(study_path, output, minutes=25, per_character=4, workers=0):
+def run(study_path, output, minutes=25, per_character=4, workers=0, auto_calibrate=False):
     if not 0 < minutes <= 30:
         raise ValueError("Use a budget between zero and 30 minutes.")
     started = time.monotonic()
@@ -134,10 +164,6 @@ def run(study_path, output, minutes=25, per_character=4, workers=0):
         raise ValueError("The saved evaluation plan does not match this request.")
     write_json(manifest, plan)
     identity = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
-    execution = selected_execution("run")
-    if execution is None:
-        raise ValueError("A matching execution calibration is required.")
-    executable = prepare_game()
     records = {}
     pending = []
     for index, case in enumerate(plan["cases"]):
@@ -153,19 +179,44 @@ def run(study_path, output, minutes=25, per_character=4, workers=0):
                 ):
                     raise ValueError("Cached episode does not match the evaluation plan.")
                 records[key] = record
+                if "episode" not in record and "error" not in record:
+                    if "resume" not in record and not record.get("pending"):
+                        raise ValueError("Cached episode has no result or continuation.")
+                    pending.append((key, case, candidate, path))
             else:
                 pending.append((key, case, candidate, path))
+    execution = executable = None
+    if pending and time.monotonic() < deadline:
+        execution = selected_execution("run")
+        if execution is None and auto_calibrate:
+            if deadline - time.monotonic() < 30:
+                deadline = time.monotonic()
+            else:
+                calibrate(min(5, (deadline - time.monotonic()) / 60), "run")
+                execution = selected_execution("run")
+        if execution is None and time.monotonic() < deadline:
+            raise ValueError("A matching execution calibration is required.")
+        if execution is not None:
+            executable = prepare_game()
     local = threading.local()
     environments = []
     lock = threading.Lock()
+    stopped = threading.Event()
     torch.set_num_threads(1)
 
     def perform(job):
         key, case, candidate, path = job
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= deadline or stopped.is_set():
             return None
-        record = {"plan": identity, "case": case, "candidate": candidate["name"]}
-        write_json(path, record | {"error": "Interrupted before a result was saved."})
+        record = records.get(
+            key, {"plan": identity, "case": case, "candidate": candidate["name"]}
+        ) | {"pending": True}
+        write_json(path, record)
+
+        def checkpoint(snapshot):
+            record["resume"] = snapshot
+            write_json(path, record)
+
         try:
             if not hasattr(local, "models"):
                 local.models = {}
@@ -185,17 +236,34 @@ def run(study_path, output, minutes=25, per_character=4, workers=0):
             local.environment.set_encoding(
                 getattr(model.policy, "encoding", "hash") if model is not None else "hash"
             )
-            record["episode"] = episode(model, local.environment, case, deadline)
+            record["episode"] = episode(
+                model,
+                local.environment,
+                case,
+                deadline,
+                record.get("resume"),
+                checkpoint,
+                stopped.is_set,
+            )
+            record.pop("resume", None)
+            record.pop("pending", None)
+        except EvaluationPaused:
+            pass
         except Exception as error:
             if getattr(local, "environment", None) is not None:
                 local.environment.close()
                 local.environment = None
-            record["error"] = f"{type(error).__name__}: {error}"
+            if not isinstance(error, WorkerFailure) or time.monotonic() < deadline:
+                record["error"] = f"{type(error).__name__}: {error}"
         write_json(path, record)
+        with lock:
+            records[key] = record
         return key, record
 
     def save():
-        report = aggregate(plan, records) | {
+        with lock:
+            snapshot = records.copy()
+        report = aggregate(plan, snapshot) | {
             "build": build,
             "plan": str(manifest.resolve()),
             "resources": resources,
@@ -206,24 +274,28 @@ def run(study_path, output, minutes=25, per_character=4, workers=0):
 
     try:
         with ThreadPoolExecutor(max_workers=resources["concurrent_trials"]) as pool:
-            for result in pool.map(perform, pending):
-                if result is None:
-                    continue
-                key, record = result
-                records[key] = record
-                save()
-                print(
-                    json.dumps(
-                        {
-                            "completed": len(records),
-                            "total": len(plan["cases"]) * len(models),
-                            "candidate": record["candidate"],
-                            "floor": record.get("episode", {}).get("floor"),
-                            "error": record.get("error"),
-                        }
-                    ),
-                    flush=True,
-                )
+            try:
+                for result in pool.map(perform, pending):
+                    if result is None:
+                        continue
+                    key, record = result
+                    save()
+                    with lock:
+                        completed = sum("episode" in value for value in records.values())
+                    print(
+                        json.dumps(
+                            {
+                                "completed": completed,
+                                "total": len(plan["cases"]) * len(models),
+                                "candidate": record["candidate"],
+                                "floor": record.get("episode", {}).get("floor"),
+                                "error": record.get("error"),
+                            }
+                        ),
+                        flush=True,
+                    )
+            except KeyboardInterrupt:
+                stopped.set()
     finally:
         for environment in environments:
             environment.close()

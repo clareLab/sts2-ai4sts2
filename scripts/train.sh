@@ -31,6 +31,9 @@ if [[ "$1" == evaluate ]]; then
 elif [[ "$1" == curve ]]; then
   shift
   ai4sts2_command=(python scripts/curve.py "$@")
+elif [[ "$1" == study ]]; then
+  shift
+  ai4sts2_command=(python scripts/study.py "$@")
 fi
 if command -v systemd-run >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
   exec systemd-run --user --scope --quiet --unit="ai4sts2-pilot-$$" \
