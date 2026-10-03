@@ -6,7 +6,7 @@ import cloudpickle
 import numpy as np
 import torch
 from stable_baselines3.common.running_mean_std import RunningMeanStd
-from syllabus.curricula import LearningProgress
+from syllabus.curricula import LearningProgress, SequentialCurriculum
 from syllabus.task_space import DiscreteTaskSpace
 from tensordict import TensorDict
 from torch import nn
@@ -62,6 +62,8 @@ class TrainingSignals:
         self.seen = set()
         self.pending = []
         self.metrics = {"bonus_sum": 0.0, "bonus_steps": 0, "predictor_updates": 0}
+        self.floor_curriculum = None
+        self.goal_settings = None
         self.configure(config)
 
     def configure(self, config):
@@ -73,6 +75,35 @@ class TrainingSignals:
         if not 0 <= self.curriculum_mix <= 0.95 or not 0 < alpha <= 1:
             raise ValueError("Invalid curriculum parameters.")
         self.curriculum.ema_alpha = alpha
+        goals = tuple(config.get("floor_goals", ()))
+        minimum = config.get("goal_min_episodes", 10)
+        success_rate = config.get("goal_success_rate", 0.8)
+        if (
+            any(type(goal) is not int or goal < 2 for goal in goals)
+            or list(goals) != sorted(set(goals))
+            or type(minimum) is not int
+            or minimum < 1
+            or not 0 < success_rate <= 1
+        ):
+            raise ValueError("Invalid floor curriculum settings.")
+        settings = (goals, minimum, success_rate) if goals else None
+        if self.floor_curriculum is not None and settings != self.goal_settings:
+            raise ValueError("Cannot change an active floor curriculum.")
+        if goals and self.floor_curriculum is None:
+            tasks = [*goals, 0]
+            self.floor_curriculum = SequentialCurriculum(
+                tasks,
+                [f"episodes>={minimum}&episode_return>={success_rate}"] * len(goals),
+                DiscreteTaskSpace(len(tasks), tasks),
+                return_buffer_size=100,
+            )
+            self.goal_settings = settings
+
+    def goal(self):
+        if self.floor_curriculum is None:
+            return None
+        current = self.floor_curriculum.current_curriculum
+        return current.task_space.decode(current.sample()[0])
 
     def probabilities(self):
         weights = np.asarray(self.curriculum._sample_distribution(), dtype=np.float64)
@@ -86,7 +117,16 @@ class TrainingSignals:
         self.seen = {hashlib.sha256(novelty_features(state).tobytes()).digest()}
 
     def observe(self, state, episode, done):
-        if done and not episode["truncated"]:
+        if done and "goal_floor" in episode and not episode["truncated"]:
+            if self.floor_curriculum is None or episode["goal_floor"] != self.goal():
+                raise ValueError("Episode goal does not match the floor curriculum.")
+            self.floor_curriculum.update_on_episode(
+                float(episode["goal_success"]),
+                episode["steps"],
+                self.floor_curriculum.task_space.encode(episode["goal_floor"]),
+                float(episode["goal_success"]),
+            )
+        elif done and not episode["truncated"]:
             self.curriculum.evaluator.update(episode)
             self.curriculum.update_on_episode(
                 float(episode["victory"]),
@@ -138,6 +178,8 @@ class TrainingSignals:
                 "seen": self.seen,
                 "pending": self.pending,
                 "metrics": self.metrics,
+                "floor_curriculum": cloudpickle.dumps(self.floor_curriculum),
+                "goal_settings": self.goal_settings,
             }
         )
 
@@ -150,6 +192,10 @@ class TrainingSignals:
         self.seen = state["seen"]
         self.pending = state["pending"]
         self.metrics = state["metrics"]
+        self.floor_curriculum = cloudpickle.loads(
+            state.get("floor_curriculum", cloudpickle.dumps(None))
+        )
+        self.goal_settings = state.get("goal_settings")
 
     def report(self):
         return self.metrics.copy() | {
@@ -157,5 +203,19 @@ class TrainingSignals:
             "curriculum_mix": self.curriculum_mix,
             "character_probabilities": dict(
                 zip(CHARACTERS, self.probabilities().tolist(), strict=True)
+            ),
+            "floor_curriculum": (
+                {
+                    "goal_floor": self.goal(),
+                    "stage_episodes": self.floor_curriculum.n_episodes,
+                    "total_episodes": self.floor_curriculum.total_episodes,
+                    "recent_success_rate": (
+                        float(np.mean(self.floor_curriculum.episode_returns))
+                        if self.floor_curriculum.episode_returns
+                        else None
+                    ),
+                }
+                if self.floor_curriculum is not None
+                else None
             ),
         }

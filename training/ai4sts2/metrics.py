@@ -13,13 +13,19 @@ def progress(episodes):
         if episode["victory"] and episode["truncated"]:
             raise ValueError("A truncated episode cannot be a victory.")
     floors = [episode["floor"] for episode in episodes]
-    deaths = [e["floor"] for e in episodes if not e["victory"] and not e["truncated"]]
+    deaths = [
+        e["floor"]
+        for e in episodes
+        if not e["victory"] and not e["truncated"] and not e.get("goal_success", False)
+    ]
     wins = sum(episode["victory"] for episode in episodes)
     return {
         "episodes": len(episodes),
         "wins": wins,
         "win_rate": wins / len(episodes),
         "truncated_episodes": sum(episode["truncated"] for episode in episodes),
+        "curriculum_episodes": sum("goal_floor" in episode for episode in episodes),
+        "curriculum_successes": sum(episode.get("goal_success", False) for episode in episodes),
         "mean_floor": statistics.mean(floors),
         "median_floor": statistics.median(floors),
         "min_floor": min(floors),
@@ -34,7 +40,7 @@ def progress(episodes):
 
 def summarise(episodes):
     summary = progress(episodes)
-    eligible = summary["truncated_episodes"] == 0
+    eligible = summary["truncated_episodes"] == summary["curriculum_episodes"] == 0
     wins, floor = summary["wins"], summary["mean_floor"]
     return summary | {
         "eligible": eligible,

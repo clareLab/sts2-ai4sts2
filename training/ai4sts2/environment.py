@@ -140,6 +140,8 @@ class Sts2Env(gym.Env):
         super().__init__()
         if scope not in {"run", "first_combat"}:
             raise ValueError("Unknown episode scope.")
+        if signals is not None and signals.goal() is not None and scope != "run":
+            raise ValueError("Floor curricula require full-run scope.")
         self.configure_reward(discount, progress_scale)
         self.set_encoding(encoding)
         self.game = (
@@ -156,6 +158,7 @@ class Sts2Env(gym.Env):
         self.state = None
         self.steps = 0
         self.character = None
+        self.goal_floor = None
         self.journal = None
         self.completed = []
         self.action_space = spaces.Discrete(MAX_ACTIONS)
@@ -204,6 +207,9 @@ class Sts2Env(gym.Env):
         if self.character not in CHARACTERS:
             raise ValueError("Unknown character.")
         split = options.get("split", "train")
+        if split != "train" and self.signals is not None and self.signals.goal() is not None:
+            raise ValueError("Floor curricula cannot be used for evaluation.")
+        self.goal_floor = self.signals.goal() if self.signals is not None else None
         episode_seed = int(self.rng.integers(2**63)) if seed is None else seed
         parameters = {
             "character": self.character,
@@ -230,6 +236,13 @@ class Sts2Env(gym.Env):
     def action_masks(self):
         return np.arange(MAX_ACTIONS) < len(self.state["actions"])
 
+    def goal_reached(self):
+        return bool(
+            self.goal_floor
+            and not self.state["terminated"]
+            and self.state["observation"]["floor"] >= self.goal_floor
+        )
+
     def step(self, action):
         if not self.action_space.contains(action):
             raise ValueError("Illegal action index.")
@@ -237,6 +250,7 @@ class Sts2Env(gym.Env):
         if (
             self.state is None
             or self.state["terminated"]
+            or self.goal_reached()
             or self.steps >= self.max_steps
             or not 0 <= action < len(self.state["actions"])
         ):
@@ -247,10 +261,11 @@ class Sts2Env(gym.Env):
         )
         self.steps += 1
         self.journal["actions"].append({"action": action, "digest": state_digest(self.state)})
-        terminated = self.state["terminated"]
+        goal_success = self.goal_reached()
+        terminated = self.state["terminated"] or goal_success
         truncated = not terminated and self.steps >= self.max_steps
-        victory = bool(terminated and self.state["victory"])
-        reward = float(1 if victory else -1) if terminated else 0.0
+        victory = bool(self.state["terminated"] and self.state["victory"])
+        reward = float(1 if victory or goal_success else -1) if terminated else 0.0
         info = {
             "scope": self.scope,
             "character": self.character,
@@ -263,12 +278,14 @@ class Sts2Env(gym.Env):
             "act": self.state["observation"].get("act"),
             "seed": self.journal["parameters"]["seed"],
         }
+        if self.goal_floor is not None:
+            info |= {"goal_floor": self.goal_floor, "goal_success": goal_success or victory}
         if terminated or truncated:
             self.completed.append(info.copy())
             info["episode"] = {"r": reward, "l": self.steps}
         if self.progress_scale:
             progress_reward = self.progress_scale * (
-                self.discount * floor_potential(self.state) - potential
+                self.discount * (0.0 if terminated else floor_potential(self.state)) - potential
             )
             info["progress_reward"] = progress_reward
             reward += progress_reward
@@ -289,6 +306,7 @@ class Sts2Env(gym.Env):
                 "completed": self.completed,
                 "rng": self.rng.bit_generator.state,
                 "task_rng": self.task_rng.bit_generator.state,
+                "goal_floor": self.goal_floor,
             }
         )
 
@@ -298,6 +316,7 @@ class Sts2Env(gym.Env):
         if snapshot.get("encoding", "hash") != self.encoding:
             raise ValueError("Checkpoint observation encoding does not match.")
         self.configure_reward(**snapshot["reward"])
+        self.goal_floor = snapshot.get("goal_floor")
         journal = snapshot["journal"]
         if journal is None:
             self.state = None
