@@ -55,7 +55,7 @@ internal static class CardSelection
                 options = PileType.Hand.GetPile(run.Players.Single()).Cards.Where(c => filter?.Invoke(c) ?? true);
             }
             else options = Read<IReadOnlyList<CardModel>>(Read<NCardGrid>(owner, "_grid"), "_cards");
-            var draft = new SelectionDraft<CardModel>(options, prefs.MinSelect, prefs.MaxSelect, prefs.Cancelable);
+            var draft = new SelectionDraft<CardModel>(options, prefs.MinSelect, prefs.MaxSelect, prefs.Cancelable && !RoomDecisions.CommittedSelection);
             var choices = draft.Options.ToDictionary(c => c, c => (object)new
             {
                 kind = "choose_card",

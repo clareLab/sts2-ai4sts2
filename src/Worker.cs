@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
 using Godot;
+using HarmonyLib;
 using MegaCrit.Sts2.Core.Assets;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Models;
@@ -36,7 +37,7 @@ internal static class Worker
         if (!File.Exists(ProjectSettings.GlobalizePath("user://.ai4sts2-worker")))
             throw new InvalidOperationException("An isolated AI4STS2 worker directory is required.");
         if (TestMode.IsOn) throw new InvalidOperationException("The worker requires normal game rules.");
-        PreloadManager.Enabled = false;
+        new Harmony("clareLab.ai4sts2.worker").PatchAll(typeof(Worker).Assembly);
         CombatManager.Instance.CombatWon += _ => _combatWon = true;
         CombatManager.Instance.CombatEnded += _ => _combatEnded = true;
         Tree.ProcessFrame += Tick;
@@ -74,7 +75,7 @@ internal static class Worker
             await Ready();
             object result;
             if (method == "hello")
-                result = new { protocol = 2, engine = "official", test_mode = TestMode.IsOn, background_loading = PreloadManager.Enabled, execution = Execution, characters = ModelDb.AllCharacters.Select(c => c.Id.Entry).ToArray() };
+                result = new { protocol = 2, engine = "official", test_mode = TestMode.IsOn, diagnostic = RunFixture.Enabled, background_loading = false, execution = Execution, characters = ModelDb.AllCharacters.Select(c => c.Id.Entry).ToArray() };
             else if (method == "reset") result = await Reset(request.GetProperty("params"));
             else if (method == "observe") result = await Observe();
             else if (method == "step") result = await Step(request.GetProperty("params"));
@@ -127,9 +128,12 @@ internal static class Worker
         _combatEnded = false;
         _combatWon = false;
         CardSelection.Reset();
+        RoomDecisions.Reset();
+        ScreenDecisions.Reset();
         _decisions = [];
         _revision++;
         _run = await NGame.Instance!.StartNewSingleplayerRun(model, false, ActModel.GetDefaultList(), [], seed, GameMode.Standard, 10);
+        await RunFixture.Apply(_run);
         return await Observe();
     }
 
@@ -140,6 +144,7 @@ internal static class Worker
         if (index < 0 || index >= _decisions.Length) throw new ArgumentOutOfRangeException(nameof(parameters));
         var decision = _decisions[index];
         _decisions = [];
+        RoomDecisions.CommittedSelection = false;
         await decision.Execute();
         for (int i = 0; i < Execution.StepFrames; i++) await Frame();
         return await Observe();

@@ -4,11 +4,26 @@ using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.MonsterMoves.Intents;
 using MegaCrit.Sts2.Core.Runs;
+using MegaCrit.Sts2.Core.Map;
+using MegaCrit.Sts2.Core.Nodes.Rooms;
+using MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext;
 
 namespace ai4sts2;
 
 internal static class Observation
 {
+    internal static object Relic(RelicModel relic) => new { model = relic.Id.Entry, description = relic.DynamicDescription.GetFormattedText(), amount = relic.DisplayAmount };
+
+    internal static object Potion(PotionModel potion) => new { model = potion.Id.Entry, description = potion.DynamicDescription.GetFormattedText(), usage = potion.Usage.ToString() };
+
+    private static object Point(MapPoint point) => new
+    {
+        row = point.coord.row,
+        column = point.coord.col,
+        room = point.PointType.ToString(),
+        children = point.Children.OrderBy(p => p.coord.row).ThenBy(p => p.coord.col).Select(p => new { row = p.coord.row, column = p.coord.col }).ToArray()
+    };
+
     internal static object? Upgrade(CardModel card)
     {
         if (!card.IsUpgradable) return null;
@@ -24,6 +39,7 @@ internal static class Observation
         return new
         {
             model = card.Id.Entry,
+            description = card.GetDescriptionForPile(card.Pile?.Type ?? PileType.None, target),
             type = card.Type.ToString(),
             cost = card.EnergyCost.GetResolved(),
             stars = card.GetStarCostWithModifiers(),
@@ -66,13 +82,18 @@ internal static class Observation
             ascension = run.AscensionLevel,
             floor = run.TotalFloor,
             act = run.CurrentActIndex,
+            room = run.CurrentRoom?.RoomType.ToString(),
+            description = ActiveScreenContext.Instance.GetCurrentScreen() is NEventRoom events ? RoomDecisions.Text(events) : null,
+            position = run.CurrentMapCoord is { } coord ? new { row = coord.row, column = coord.col } : null,
+            map = run.Map.GetAllMapPoints().Append(run.Map.StartingMapPoint).Append(run.Map.BossMapPoint).Concat(run.Map.SecondBossMapPoint == null ? [] : new[] { run.Map.SecondBossMapPoint }).Distinct().OrderBy(p => p.coord.row).ThenBy(p => p.coord.col).Select(Point).ToArray(),
             screen = Decisions.ScreenName,
             selection = CardSelection.Visible,
+            puzzle = ScreenDecisions.Visible,
             player = Creature(player.Creature),
             gold = player.Gold,
             deck = player.Deck.Cards.OrderBy(c => c.Id.Entry).ThenBy(c => c.CurrentUpgradeLevel).Select(c => Card(c)).ToArray(),
-            relics = player.Relics.Select(r => r.Id.Entry).Order().ToArray(),
-            potions = player.Potions.Select(p => p.Id.Entry).ToArray(),
+            relics = player.Relics.OrderBy(r => r.Id.Entry).Select(Relic).ToArray(),
+            potions = player.PotionSlots.Select(p => p == null ? null : Potion(p)).ToArray(),
             energy = combat?.Energy ?? 0,
             stars = combat?.Stars ?? 0,
             orbs = combat?.OrbQueue.Orbs.Select(o => new { model = o.Id.Entry, passive = o.PassiveVal, evoke = o.EvokeVal }).ToArray(),

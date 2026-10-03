@@ -51,8 +51,17 @@ def prepare_game():
 
 class OfficialGame:
     def __init__(
-        self, executable=None, timeout=75, execution=REFERENCE, audit=False, raw_selection=False
+        self,
+        executable=None,
+        timeout=75,
+        execution=REFERENCE,
+        audit=False,
+        raw_selection=False,
+        diagnostic=False,
+        diagnostic_event=None,
     ):
+        if diagnostic_event and not diagnostic:
+            raise ValueError("A diagnostic event requires diagnostic mode.")
         executable = Path(executable or prepare_game())
         directory = ROOT / "artifacts/workers"
         directory.mkdir(parents=True, exist_ok=True)
@@ -84,6 +93,8 @@ class OfficialGame:
             "AI4STS2_EXECUTION": json.dumps(execution.to_dict()),
             "AI4STS2_AUDIT": "1" if audit else "0",
             "AI4STS2_RAW_SELECTION": "1" if raw_selection else "0",
+            "AI4STS2_DIAGNOSTIC": "1" if diagnostic else "0",
+            "AI4STS2_DIAGNOSTIC_EVENT": diagnostic_event or "",
         }
         command = [
             str(executable),
@@ -120,6 +131,8 @@ class OfficialGame:
             self.hello = self.request("hello")
             if self.hello["engine"] != "official" or self.hello["test_mode"]:
                 raise RuntimeError("The worker is not running normal official game rules.")
+            if self.hello.get("diagnostic", False) != diagnostic:
+                raise RuntimeError("The worker diagnostic mode does not match the requested mode.")
         except BaseException:
             self.close()
             raise

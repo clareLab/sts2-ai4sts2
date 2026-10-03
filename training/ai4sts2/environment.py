@@ -14,18 +14,21 @@ CHARACTERS = ("IRONCLAD", "SILENT", "REGENT", "NECROBINDER", "DEFECT")
 MAX_ACTIONS = 128
 STATE_FEATURES = 512
 ACTION_FEATURES = 64
-SCHEMA = 3
+SCHEMA = 4
 VISIBLE_FIELDS = frozenset(
     "character ascension floor act screen player gold deck relics potions energy stars orbs turn "
     "hand draw discard exhaust creatures model type cost upgrades enchantment side hp max_hp "
     "block powers amount intents damage repeats passive evoke kind card target row column room "
     "control label selected keywords variables selection prompt minimum maximum "
-    "skippable upgrade preview random options".split()
+    "skippable upgrade preview random options description relic potion usage "
+    "position map children puzzle tool cells hidden cards".split()
 )
 
 
 def public_fields(value):
     if isinstance(value, dict):
+        if value.get("hidden") is True:
+            return {key: value[key] for key in ("row", "column", "hidden") if key in value}
         return {key: public_fields(item) for key, item in value.items() if key in VISIBLE_FIELDS}
     if isinstance(value, list):
         return [public_fields(item) for item in value]
@@ -99,6 +102,8 @@ class Sts2Env(gym.Env):
         scope="first_combat",
     ):
         super().__init__()
+        if scope not in {"run", "first_combat"}:
+            raise ValueError("Unknown episode scope.")
         self.game = (
             worker_factory(executable, execution=execution)
             if worker_factory is OfficialGame
@@ -173,6 +178,8 @@ class Sts2Env(gym.Env):
             "steps": self.steps,
             "truncated": truncated,
             "screen": self.state["observation"].get("screen"),
+            "floor": self.state["observation"].get("floor"),
+            "act": self.state["observation"].get("act"),
         }
         return self.encode(), reward, terminated, truncated, info
 
@@ -228,7 +235,7 @@ def evaluate(model, environment, seed=0, split="validation", max_steps=256):
     }
 
 
-def fingerprint():
+def fingerprint(scope="first_combat"):
     from ai4sts2.game import ROOT, game_path
 
     hashes = {}
@@ -244,7 +251,7 @@ def fingerprint():
         source_hash.update(path.name.encode())
         source_hash.update(path.read_bytes())
     hashes["trainer"] = source_hash.hexdigest()
-    return hashes | {"schema": SCHEMA, "scope": "first_combat", "ascension": 10}
+    return hashes | {"schema": SCHEMA, "scope": scope, "ascension": 10}
 
 
 def write_json(path, value):

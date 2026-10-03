@@ -11,6 +11,13 @@ def main():
     calibration.add_argument("--minutes", type=float, default=5)
     selection = commands.add_parser("check-selection")
     selection.add_argument("--minutes", type=float, default=5)
+    runs = commands.add_parser("check-run")
+    runs.add_argument("--minutes", type=float, default=5)
+    runs.add_argument("--episodes", type=int, default=5)
+    runs.add_argument("--steps", type=int, default=2048)
+    runs.add_argument("--seed", type=int, default=0)
+    runs.add_argument("--diagnostic", action="store_true")
+    runs.add_argument("--diagnostic-event")
     probe = commands.add_parser("probe")
     probe.add_argument("--character", default="IRONCLAD")
     probe.add_argument("--steps", type=int, default=80)
@@ -21,7 +28,21 @@ def main():
     pilot.add_argument("--resume", help="Recover an interrupted Ray experiment.")
     pilot.add_argument("--checkpoint", help="Start another bounded pilot from a saved model.")
     args = parser.parse_args()
-    if args.command == "check-selection":
+    if args.command == "check-run":
+        from ai4sts2.runcheck import check
+
+        result = check(
+            args.minutes,
+            args.episodes,
+            args.steps,
+            args.seed,
+            args.diagnostic,
+            args.diagnostic_event,
+        )
+        print(json.dumps(result, indent=2))
+        if not result["valid"]:
+            raise SystemExit(1)
+    elif args.command == "check-selection":
         from ai4sts2.selection import validate
 
         print(json.dumps(validate(args.minutes), indent=2))

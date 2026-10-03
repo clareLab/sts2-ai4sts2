@@ -7,6 +7,7 @@
     <LangVersion>13</LangVersion>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="RunFixture.cs" />
     <Compile Include="../src/SelectionDraft.cs" Link="SelectionDraft.cs" />
   </ItemGroup>
 </Project>

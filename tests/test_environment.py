@@ -65,6 +65,46 @@ def test_public_state_changes_are_retained():
     assert not np.array_equal(encode(original)["state"], encode(changed)["state"])
 
 
+def test_visible_route_and_purchase_information_reaches_the_policy():
+    original = state()
+    original["observation"]["map"] = [
+        {"row": 1, "column": 0, "room": "Shop", "children": [{"row": 2, "column": 1}]}
+    ]
+    original["actions"] = [
+        {"kind": "buy", "cost": 75, "relic": {"model": "ANCHOR", "description": "Gain Block."}}
+    ]
+    changed = copy.deepcopy(original)
+    changed["observation"]["map"][0]["children"][0]["column"] = 2
+    changed["actions"][0]["cost"] = 100
+    assert not np.array_equal(encode(original)["state"], encode(changed)["state"])
+    assert not np.array_equal(encode(original)["actions"], encode(changed)["actions"])
+    changed = copy.deepcopy(original)
+    changed["observation"]["map"][0]["hidden_encounter"] = "secret"
+    np.testing.assert_array_equal(encode(original)["state"], encode(changed)["state"])
+
+
+def test_unrevealed_puzzle_contents_never_enter_policy_features():
+    original = state()
+    original["observation"]["puzzle"] = {
+        "cells": [{"row": 1, "column": 2, "hidden": True, "model": "GOLD"}]
+    }
+    changed = copy.deepcopy(original)
+    changed["observation"]["puzzle"]["cells"][0]["model"] = "CURSE"
+    changed["observation"]["puzzle"]["cells"][0]["description"] = "Secret item"
+    np.testing.assert_array_equal(encode(original)["state"], encode(changed)["state"])
+    changed["observation"]["puzzle"]["cells"][0]["hidden"] = False
+    assert not np.array_equal(encode(original)["state"], encode(changed)["state"])
+
+
+def test_full_run_scope_is_explicit_and_invalid_scope_does_not_launch_a_worker():
+    environment = Sts2Env(scope="run", worker_factory=FakeWorker)
+    environment.reset(seed=0, options={"character": "IRONCLAD"})
+    assert environment.game.calls[0][1]["scope"] == "run"
+    environment.close()
+    with pytest.raises(ValueError, match="scope"):
+        Sts2Env(scope="invalid", worker_factory=lambda *_: pytest.fail("Worker launched"))
+
+
 def test_probe_confirms_selection_and_preserves_visible_selected_state():
     original = state()
     original["actions"] = [{"kind": "select_card", "selected": False}]

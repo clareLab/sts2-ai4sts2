@@ -18,6 +18,7 @@ using MegaCrit.Sts2.Core.Nodes.Rooms;
 using MegaCrit.Sts2.Core.Nodes.Screens;
 using MegaCrit.Sts2.Core.Nodes.Screens.Map;
 using MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext;
+using MegaCrit.Sts2.Core.Nodes.Screens.Shops;
 using MegaCrit.Sts2.Core.Runs;
 
 namespace ai4sts2;
@@ -43,9 +44,12 @@ internal static class Decisions
         if (NGame.Instance!.Transition.InTransition || NMapScreen.Instance?.IsTraveling == true) return [];
         var screen = ActiveScreenContext.Instance.GetCurrentScreen() as Node;
         if (screen == null) return [];
+        if (!RoomDecisions.Prepare(screen)) return [];
         if (screen is NInspectCardScreen && !screen.IsProcessingInput()) return [];
         var selection = CardSelection.Capture(screen, run);
         if (selection != null) return selection;
+        var specialised = ScreenDecisions.Capture(screen);
+        if (specialised != null) return specialised;
         var player = run.Players.Single();
         if (screen is NCombatRoom && CombatManager.Instance.IsInProgress)
         {
@@ -53,10 +57,13 @@ internal static class Decisions
             if (player.PlayerCombatState?.Phase != PlayerTurnPhase.Play || RunManager.Instance.ActionExecutor.IsRunning || CombatManager.Instance.PlayerActionsDisabled) return [];
             return Combat(player).ToArray();
         }
+        if (RunManager.Instance.ActionExecutor.IsRunning) return [];
+        if (screen is NMerchantInventory shop)
+            return RoomDecisions.Shop(shop, player).Concat(Potions(player, false)).ToArray();
         if (screen is NMapScreen map)
             return Descendants(map).OfType<NMapPoint>().Where(p => p.IsEnabled && p.IsVisibleInTree())
-                .Select(p => new Decision(p.GetInstanceId().ToString(), new { kind = "map", row = p.Point.coord.row, column = p.Point.coord.col, room = p.Point.PointType.ToString() }, p.ForceClick)).ToArray();
-        return Controls(screen, player).ToArray();
+                .Select(p => new Decision(p.GetInstanceId().ToString(), new { kind = "map", row = p.Point.coord.row, column = p.Point.coord.col, room = p.Point.PointType.ToString() }, p.ForceClick)).Concat(Potions(player, false)).ToArray();
+        return Controls(screen, player).Concat(Potions(player, false)).ToArray();
     }
 
     private static IEnumerable<Decision> Combat(Player player)
@@ -76,24 +83,32 @@ internal static class Decisions
                     () => RunManager.Instance.ActionQueueSynchronizer.RequestEnqueue(new PlayCardAction(card, captured)));
             }
         }
+        foreach (var action in Potions(player, true)) yield return action;
+        yield return new Decision($"end:{player.PlayerCombatState!.TurnNumber}", new { kind = "end_turn" },
+            () => RunManager.Instance.ActionQueueSynchronizer.RequestEnqueue(new EndPlayerTurnAction(player, player.PlayerCombatState.TurnNumber)));
+    }
+
+    private static IEnumerable<Decision> Potions(Player player, bool inCombat)
+    {
         foreach (var potion in player.Potions)
         {
             if (potion.IsQueued || !player.CanUseOrRemovePotions) continue;
-            yield return new Decision($"discard:{potion.GetHashCode()}", new { kind = "discard_potion", model = potion.Id.Entry }, potion.Discard);
-            if (potion.Usage is not (PotionUsage.CombatOnly or PotionUsage.AnyTime) || !potion.PassesCustomUsabilityCheck) continue;
+            uint slot = (uint)player.PotionSlots.ToList().IndexOf(potion);
+            yield return new Decision($"discard:{potion.GetHashCode()}", new { kind = "discard_potion", potion = Observation.Potion(potion) },
+                () => RunManager.Instance.ActionQueueSynchronizer.RequestEnqueue(new DiscardPotionGameAction(player, slot, inCombat)));
+            if (!(potion.Usage == PotionUsage.AnyTime || inCombat && potion.Usage == PotionUsage.CombatOnly) || !potion.PassesCustomUsabilityCheck) continue;
+            IEnumerable<Creature> creatures = inCombat ? player.Creature.CombatState!.Creatures : [player.Creature];
             IEnumerable<Creature?> targets = potion.TargetType is TargetType.AnyEnemy or TargetType.AnyAlly or TargetType.AnyPlayer or TargetType.Self
-                ? state.Creatures.Where(potion.IsValidTarget).Cast<Creature?>() : [null];
+                ? creatures.Where(potion.IsValidTarget).Cast<Creature?>() : [null];
             foreach (var target in targets)
             {
                 if (!potion.IsValidTarget(target)) continue;
                 var captured = target;
                 yield return new Decision($"potion:{potion.GetHashCode()}:{target?.CombatId}",
-                    new { kind = "use_potion", model = potion.Id.Entry, target = target == null ? null : Observation.Creature(target) },
+                    new { kind = "use_potion", potion = Observation.Potion(potion), target = target == null ? null : Observation.Creature(target) },
                     () => potion.EnqueueManualUse(captured));
             }
         }
-        yield return new Decision($"end:{player.PlayerCombatState!.TurnNumber}", new { kind = "end_turn" },
-            () => RunManager.Instance.ActionQueueSynchronizer.RequestEnqueue(new EndPlayerTurnAction(player, player.PlayerCombatState.TurnNumber)));
     }
 
     private static IEnumerable<Decision> Controls(Node screen, Player player)
@@ -117,14 +132,13 @@ internal static class Decisions
         {
             if (!button.IsEnabled || !button.IsVisibleInTree() || holders.Any(h => h.IsAncestorOf(button))) continue;
             if (button is NPeekButton or NCardHolderHitbox) continue;
+            if (button is NBackButton && System.Environment.GetEnvironmentVariable("AI4STS2_RAW_SELECTION") != "1") continue;
+            if (!RoomDecisions.Available(button, player)) continue;
             if (blockedGrids.Any(g => g.IsAncestorOf(button))) continue;
             if (hasEventOptions && button is NAncientDialogueHitbox) continue;
             if (screen is NEventRoom && button is not (NEventOptionButton or NAncientDialogueHitbox or NProceedButton)) continue;
             if (button is NEventOptionButton { Option.IsLocked: true }) continue;
-            var labels = Descendants(button).OfType<RichTextLabel>().Where(l => l.IsVisibleInTree()).Select(l => l.GetParsedText());
-            string label = string.Join(' ', labels);
-            if (button is NEventOptionButton option) label = option.Option.Title.GetFormattedText();
-            yield return new Decision(button.GetInstanceId().ToString(), new { kind = "select", control = button.GetType().Name, label }, button.ForceClick);
+            yield return new Decision(button.GetInstanceId().ToString(), RoomDecisions.Describe(button), () => RoomDecisions.Select(button));
         }
     }
 
