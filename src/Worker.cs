@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
 using Godot;
+using MegaCrit.Sts2.Core.Assets;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Nodes;
@@ -35,6 +36,7 @@ internal static class Worker
         if (!File.Exists(ProjectSettings.GlobalizePath("user://.ai4sts2-worker")))
             throw new InvalidOperationException("An isolated AI4STS2 worker directory is required.");
         if (TestMode.IsOn) throw new InvalidOperationException("The worker requires normal game rules.");
+        PreloadManager.Enabled = false;
         CombatManager.Instance.CombatWon += _ => _combatWon = true;
         CombatManager.Instance.CombatEnded += _ => _combatEnded = true;
         Tree.ProcessFrame += Tick;
@@ -72,7 +74,7 @@ internal static class Worker
             await Ready();
             object result;
             if (method == "hello")
-                result = new { protocol = 2, engine = "official", test_mode = TestMode.IsOn, execution = Execution, characters = ModelDb.AllCharacters.Select(c => c.Id.Entry).ToArray() };
+                result = new { protocol = 2, engine = "official", test_mode = TestMode.IsOn, background_loading = PreloadManager.Enabled, execution = Execution, characters = ModelDb.AllCharacters.Select(c => c.Id.Entry).ToArray() };
             else if (method == "reset") result = await Reset(request.GetProperty("params"));
             else if (method == "observe") result = await Observe();
             else if (method == "step") result = await Step(request.GetProperty("params"));

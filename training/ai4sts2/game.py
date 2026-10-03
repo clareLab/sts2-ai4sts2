@@ -127,6 +127,8 @@ class OfficialGame:
                     try:
                         self.responses.put(json.loads(line[8:]))
                     except json.JSONDecodeError:
+                        self.log.write(f"Invalid worker response: {line!r}\n")
+                        self.log.flush()
                         self.responses.put(None)
                 else:
                     self.log.write(line)
@@ -152,8 +154,9 @@ class OfficialGame:
                 f"Official worker timed out during {method}: {self.log_path}"
             ) from error
         if response is None or response["id"] != identifier:
+            detail = {"expected_id": identifier, "response": response, "exit": self.process.poll()}
             self.close()
-            raise RuntimeError(f"Official worker protocol failed: {self.log_path}")
+            raise RuntimeError(f"Official worker protocol failed: {detail}. See {self.log_path}")
         if not response["ok"]:
             self.close()
             raise RuntimeError(response["error"])
