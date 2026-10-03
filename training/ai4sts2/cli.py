@@ -36,6 +36,12 @@ def main():
     pilot.add_argument("--scope", choices=("run", "first_combat"), default="run")
     pilot.add_argument("--resume", help="Recover an interrupted Ray experiment.")
     pilot.add_argument("--checkpoint", help="Start another bounded pilot from a saved model.")
+    ablation = commands.add_parser("ablate")
+    ablation.add_argument("--minutes", type=float, default=20)
+    ablation.add_argument("--iterations", type=int, default=2)
+    ablation.add_argument("--steps", type=int, default=256)
+    ablation.add_argument("--seed", type=int, default=0)
+    ablation.add_argument("--scope", choices=("run", "first_combat"), default="run")
     args = parser.parse_args()
     if args.command == "baseline":
         from ai4sts2.baseline import run
@@ -68,7 +74,7 @@ def main():
         from ai4sts2.calibration import calibrate
 
         print(json.dumps(calibrate(args.minutes, args.scope), indent=2))
-    elif args.command == "pilot":
+    elif args.command in {"pilot", "ablate"}:
         from ai4sts2.train import run
 
         print(
@@ -77,9 +83,11 @@ def main():
                     args.minutes,
                     args.iterations,
                     args.steps,
-                    args.resume,
-                    args.checkpoint,
+                    getattr(args, "resume", None),
+                    getattr(args, "checkpoint", None),
                     args.scope,
+                    "pbt" if args.command == "pilot" else "ablation",
+                    getattr(args, "seed", 0),
                 ),
                 indent=2,
             )

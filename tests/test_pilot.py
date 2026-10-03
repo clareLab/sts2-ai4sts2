@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
-from ai4sts2.train import fit_or_recover, pilot_report
+from ai4sts2.train import ablation_space, fit_or_recover, pilot_report
 
 
 def test_cleanup_interrupt_recovers_saved_results_without_resuming_training(monkeypatch, tmp_path):
@@ -52,3 +52,22 @@ def test_interrupted_report_keeps_candidate_metrics_without_claiming_completion(
     assert pilot_report([result], "run", {}, {}, 2)["complete"]
     assert not pilot_report([result], "run", {}, {}, 3)["complete"]
     assert not pilot_report([], "run", {}, {}, 2)["complete"]
+
+
+def test_ablation_changes_one_factor_and_uses_identical_initialisation():
+    from ray.tune.search.variant_generator import generate_variants
+
+    variants = [spec["config"] for _, spec in generate_variants({"config": ablation_space(17)})]
+    assert [variant["variant"] for variant in variants] == ["control", "exploration", "curriculum"]
+    controls = {"variant", "rnd_scale", "curriculum_mix"}
+    common = [
+        {key: value for key, value in variant.items() if key not in controls}
+        for variant in variants
+    ]
+    assert common[0] == common[1] == common[2]
+    assert common[0]["seed"] == 17 and common[0]["fixed_steps"]
+    assert [(v["rnd_scale"], v["curriculum_mix"]) for v in variants] == [
+        (0, 0),
+        (0.001, 0),
+        (0, 0.75),
+    ]

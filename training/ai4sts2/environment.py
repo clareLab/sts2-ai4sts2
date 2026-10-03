@@ -67,18 +67,23 @@ def features(value, size):
     return np.tanh(output)
 
 
-def encode(state):
-    actions = state["actions"]
-    if len(actions) > MAX_ACTIONS:
-        raise ValueError(f"Action capacity exceeded: {len(actions)} > {MAX_ACTIONS}")
-    if not actions and not state["terminated"]:
-        raise ValueError("Non-terminal state has no legal action.")
+def visible_observation(state):
     observation = public_fields(state["observation"])
     for pile in ("draw", "discard", "exhaust", "deck"):
         if pile in observation:
             observation[pile] = sorted(
                 observation[pile], key=lambda card: json.dumps(card, sort_keys=True)
             )
+    return observation
+
+
+def encode(state):
+    actions = state["actions"]
+    if len(actions) > MAX_ACTIONS:
+        raise ValueError(f"Action capacity exceeded: {len(actions)} > {MAX_ACTIONS}")
+    if not actions and not state["terminated"]:
+        raise ValueError("Non-terminal state has no legal action.")
+    observation = visible_observation(state)
     matrix = np.zeros((MAX_ACTIONS, ACTION_FEATURES), dtype=np.float32)
     for index, action in enumerate(actions):
         matrix[index] = features(public_fields(action), ACTION_FEATURES)
@@ -107,6 +112,7 @@ class Sts2Env(gym.Env):
         worker_factory=OfficialGame,
         execution=REFERENCE,
         scope="first_combat",
+        signals=None,
     ):
         super().__init__()
         if scope not in {"run", "first_combat"}:
@@ -119,6 +125,8 @@ class Sts2Env(gym.Env):
         self.scope = scope
         self.encoding_seconds = 0.0
         self.rng = np.random.default_rng(seed)
+        self.task_rng = np.random.default_rng(np.random.SeedSequence([seed, 1]))
+        self.signals = signals
         self.max_steps = max_steps
         self.state = None
         self.steps = 0
@@ -136,7 +144,17 @@ class Sts2Env(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         options = options or {}
-        self.character = options.get("character") or CHARACTERS[int(self.rng.integers(5))]
+        self.character = options.get("character") or (
+            self.signals.character(self.task_rng)
+            if self.signals is not None
+            else CHARACTERS[
+                int(
+                    self.task_rng.choice(
+                        len(CHARACTERS), p=np.full(len(CHARACTERS), 1 / len(CHARACTERS))
+                    )
+                )
+            ]
+        )
         if self.character not in CHARACTERS:
             raise ValueError("Unknown character.")
         split = options.get("split", "train")
@@ -153,6 +171,8 @@ class Sts2Env(gym.Env):
             "actions": [],
         }
         self.steps = 0
+        if self.signals is not None:
+            self.signals.reset(self.state)
         return self.encode(), {"scope": self.scope, "character": self.character}
 
     def encode(self):
@@ -199,6 +219,10 @@ class Sts2Env(gym.Env):
         if terminated or truncated:
             self.completed.append(info.copy())
             info["episode"] = {"r": reward, "l": self.steps}
+        if self.signals is not None:
+            bonus = self.signals.observe(self.state, info, terminated or truncated)
+            info["intrinsic_reward"] = bonus
+            reward += bonus
         return self.encode(), reward, terminated, truncated, info
 
     def snapshot(self):
@@ -209,6 +233,7 @@ class Sts2Env(gym.Env):
                 "journal": self.journal,
                 "completed": self.completed,
                 "rng": self.rng.bit_generator.state,
+                "task_rng": self.task_rng.bit_generator.state,
             }
         )
 
@@ -236,6 +261,7 @@ class Sts2Env(gym.Env):
         self.journal = copy.deepcopy(journal)
         self.completed = copy.deepcopy(snapshot["completed"])
         self.rng.bit_generator.state = snapshot["rng"]
+        self.task_rng.bit_generator.state = snapshot["task_rng"]
 
     def drain_episodes(self):
         episodes, self.completed = self.completed, []

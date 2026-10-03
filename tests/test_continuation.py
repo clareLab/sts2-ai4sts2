@@ -85,6 +85,38 @@ def test_checkpoint_continues_identical_actions_weights_and_seed_stream(monkeypa
     receiver.cleanup()
 
 
+def test_auxiliary_training_resumes_exactly_and_validation_never_updates_it(monkeypatch, tmp_path):
+    config = {"rnd_scale": 0.001, "curriculum_mix": 0.75}
+    donor = long_member(monkeypatch, tmp_path / "donor")
+    donor.config |= config
+    donor.signals.configure(donor.config)
+    donor.model.learn(total_timesteps=64)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    donor.save_checkpoint(checkpoint)
+    donor.model.learn(total_timesteps=128, reset_num_timesteps=False)
+    expected_weights = copy.deepcopy(donor.model.policy.state_dict())
+    expected_signals = donor.signals.snapshot()
+    expected_environment = donor.environment.snapshot()
+    donor.cleanup()
+    receiver = long_member(monkeypatch, tmp_path / "receiver")
+    receiver.config |= config
+    receiver.load_checkpoint(checkpoint)
+    receiver.model.learn(total_timesteps=128, reset_num_timesteps=False)
+    assert receiver.environment.snapshot() == expected_environment
+    assert receiver.signals.metrics == expected_signals["metrics"]
+    for key, weight in expected_weights.items():
+        assert torch.equal(weight, receiver.model.policy.state_dict()[key])
+    for key, weight in expected_signals["rnd"].items():
+        assert torch.equal(weight, receiver.signals.rnd.state_dict()[key])
+    validation = receiver.open_environment(training=False)
+    assert validation.signals is None
+    evaluate(receiver.model, validation)
+    assert receiver.signals.metrics == expected_signals["metrics"]
+    validation.close()
+    receiver.cleanup()
+
+
 def test_checkpoint_divergence_stops_before_any_new_choice():
     environment = Sts2Env(worker_factory=LongWorker)
     environment.reset()

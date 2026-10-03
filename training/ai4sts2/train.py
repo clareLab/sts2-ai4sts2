@@ -21,6 +21,7 @@ from ai4sts2.environment import Sts2Env, evaluate, fingerprint, write_json
 from ai4sts2.execution import Execution
 from ai4sts2.game import ROOT, WorkerFailure, prepare_game
 from ai4sts2.metrics import compare_evaluations, summarise
+from ai4sts2.signals import TrainingSignals
 
 
 class TimedPPO(MaskablePPO):
@@ -48,6 +49,9 @@ def search_space():
         "gae_lambda": tune.uniform(0.85, 1.0),
         "clip_range": tune.uniform(0.1, 0.3),
         "epochs": tune.choice([1, 2, 4]),
+        "rnd_scale": tune.choice([0.0, 0.0001, 0.001, 0.01]),
+        "curriculum_mix": tune.choice([0.0, 0.25, 0.5, 0.75, 0.95]),
+        "curriculum_alpha": tune.loguniform(0.02, 0.3),
     }
 
 
@@ -57,7 +61,37 @@ def bound_mutations(config):
             config[name] = min(
                 math.nextafter(domain.upper, domain.lower), max(domain.lower, config[name])
             )
+        elif not domain.is_valid(config[name]):
+            config[name] = min(domain.categories, key=lambda value: abs(value - config[name]))
     return config
+
+
+def mutation_space():
+    return {
+        name: domain.categories if hasattr(domain, "categories") else domain
+        for name, domain in search_space().items()
+    }
+
+
+def ablation_space(seed):
+    return {
+        "variant": tune.grid_search(["control", "exploration", "curriculum"]),
+        "seed": seed,
+        "learning_rate": 0.0003,
+        "entropy": 0.01,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "clip_range": 0.2,
+        "epochs": 2,
+        "rnd_scale": tune.sample_from(
+            lambda spec: 0.001 if spec.config.variant == "exploration" else 0.0
+        ),
+        "curriculum_mix": tune.sample_from(
+            lambda spec: 0.75 if spec.config.variant == "curriculum" else 0.0
+        ),
+        "curriculum_alpha": 0.1,
+        "fixed_steps": True,
+    }
 
 
 def fit_or_recover(tuner, experiment_path, trainable):
@@ -90,6 +124,8 @@ def pilot_report(results, scope, build, baseline, iterations, interrupted=False)
                 "selection_score": result.metrics.get("validation_selection_score"),
                 "random_baseline_comparison": result.metrics.get("random_baseline_comparison"),
                 "iterations": result.metrics.get("training_iteration"),
+                "training_signals": result.metrics.get("training_signals"),
+                "environment_steps": result.metrics.get("environment_steps"),
             }
             for result in successful
         ],
@@ -102,6 +138,7 @@ class PopulationMember(tune.Trainable):
         self.scope = config.get("scope", "run")
         self.build = fingerprint(self.scope)
         self.recoveries = []
+        self.signals = TrainingSignals(config["seed"], config)
         self.execution = selected_execution(self.scope) or Execution(**config.get("execution", {}))
         self.validation_environment = None
         self.environment = None
@@ -155,13 +192,14 @@ class PopulationMember(tune.Trainable):
         self.recoveries.append({"execution": self.execution.to_dict(), "error": str(error)[:2048]})
         self.execution = quarantine_execution(self.execution, error, self.scope)
 
-    def open_environment(self):
+    def open_environment(self, training=True):
         return Sts2Env(
             self.config["executable"],
             seed=self.config["seed"],
             execution=self.execution,
             scope=self.scope,
             max_steps=4096 if self.scope == "run" else 256,
+            signals=self.signals if training else None,
         )
 
     def train_iteration(self):
@@ -173,7 +211,7 @@ class PopulationMember(tune.Trainable):
         training_profile = self.environment.drain_measurements()
         started = time.monotonic()
         if self.validation_environment is None:
-            self.validation_environment = self.open_environment()
+            self.validation_environment = self.open_environment(training=False)
         self.validation_environment.drain_measurements()
         result = evaluate(
             self.model,
@@ -183,9 +221,10 @@ class PopulationMember(tune.Trainable):
         evaluation_seconds = time.monotonic() - started
         evaluation_profile = self.validation_environment.drain_measurements()
         measured_steps = self.sample_count
-        self.sample_count = next_sample_count(
-            training_seconds, evaluation_seconds, measured_steps, self.model.n_steps
-        )
+        if not self.config.get("fixed_steps", False):
+            self.sample_count = next_sample_count(
+                training_seconds, evaluation_seconds, measured_steps, self.model.n_steps
+            )
         self.evaluation = result
         write_json(Path(self.logdir) / "evaluation.json", result)
         if not result["eligible"]:
@@ -218,6 +257,7 @@ class PopulationMember(tune.Trainable):
             "training_episodes": training_episodes,
             "training_progress": summarise(training_episodes) if training_episodes else None,
             "ongoing_episode_steps": self.environment.steps,
+            "training_signals": self.signals.report(),
         }
 
     def save_checkpoint(self, checkpoint_dir):
@@ -234,6 +274,7 @@ class PopulationMember(tune.Trainable):
         )
         write_json(directory / "build.json", self.build)
         write_json(directory / "environment.json", self.environment.snapshot())
+        torch.save(self.signals.snapshot(), directory / "signals.pt")
         write_json(directory / "schedule.json", {"sample_count": self.sample_count})
         if self.evaluation is not None:
             write_json(directory / "evaluation.json", self.evaluation)
@@ -254,6 +295,7 @@ class PopulationMember(tune.Trainable):
         if json.loads((directory / "build.json").read_text()) != self.build:
             raise ValueError("Checkpoint game, bridge, dependencies or schema do not match.")
         self.environment.restore(json.loads((directory / "environment.json").read_text()))
+        self.signals.restore(torch.load(directory / "signals.pt", weights_only=False))
         self.model = TimedPPO.load(
             directory / "policy.zip",
             env=DummyVecEnv([lambda: self.environment]),
@@ -277,6 +319,7 @@ class PopulationMember(tune.Trainable):
         self.apply_parameters(self.config)
 
     def apply_parameters(self, config):
+        self.signals.configure(config)
         self.model.learning_rate = config["learning_rate"]
         self.model.lr_schedule = FloatSchedule(config["learning_rate"])
         for group in self.model.policy.optimizer.param_groups:
@@ -303,7 +346,16 @@ class PopulationMember(tune.Trainable):
                 setattr(self, name, None)
 
 
-def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope="run"):
+def run(
+    minutes=30,
+    iterations=4,
+    steps=128,
+    resume=None,
+    checkpoint=None,
+    scope="run",
+    experiment="pbt",
+    seed=0,
+):
     if not 0 < minutes <= 30:
         raise ValueError("This pilot supports a budget of at most 30 minutes.")
     if iterations < 2 or steps < 64 or steps % 64:
@@ -312,6 +364,13 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
         raise ValueError("Unknown episode scope.")
     if resume and checkpoint:
         raise ValueError("Choose either interrupted-experiment recovery or a starting checkpoint.")
+    if experiment not in {"pbt", "ablation"}:
+        raise ValueError("Unknown experiment.")
+    if experiment == "ablation" and checkpoint:
+        raise ValueError("The ablation requires identical fresh model initialisations.")
+    report_path = (
+        ROOT / f"artifacts/validation/{'pilot' if experiment == 'pbt' else 'ablation'}.json"
+    )
     report = {
         "scope": scope,
         "certifying": False,
@@ -320,8 +379,9 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
         "build": fingerprint(scope),
         "errors": [],
         "trials": [],
+        "experiment": experiment,
     }
-    write_json(ROOT / "artifacts/validation/pilot.json", report)
+    write_json(report_path, report)
     executable = prepare_game()
     started = time.monotonic()
     deadline = min(started + minutes * 60, float(os.environ.get("AI4STS2_DEADLINE", "inf")))
@@ -361,7 +421,7 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
         experiment_path = (
             Path(resume).resolve()
             if resume
-            else ROOT / "artifacts/experiments" / time.strftime("pilot-%Y%m%d-%H%M%S")
+            else ROOT / "artifacts/experiments" / time.strftime(f"{experiment}-%Y%m%d-%H%M%S")
         )
         remaining_seconds = deadline - time.monotonic() - 10
         if remaining_seconds <= 0:
@@ -369,21 +429,25 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
         if resume:
             tuner = tune.Tuner.restore(str(Path(resume).resolve()), trainable=trainable)
         else:
-            scheduler = PopulationBasedTraining(
-                time_attr="training_iteration",
-                metric="validation_selection_score",
-                mode="max",
-                perturbation_interval=2,
-                burn_in_period=2,
-                hyperparam_mutations=search_space() | {"epochs": [1, 2, 4]},
-                custom_explore_fn=bound_mutations,
-                synch=True,
-            )
+            scheduler = None
+            parameters = ablation_space(seed)
+            if experiment == "pbt":
+                scheduler = PopulationBasedTraining(
+                    time_attr="training_iteration",
+                    metric="validation_selection_score",
+                    mode="max",
+                    perturbation_interval=2,
+                    burn_in_period=2,
+                    hyperparam_mutations=mutation_space(),
+                    custom_explore_fn=bound_mutations,
+                    synch=True,
+                )
+                parameters = search_space() | {"seed": tune.randint(1, 2**30)}
             tuner = tune.Tuner(
                 trainable,
                 tune_config=tune.TuneConfig(
                     scheduler=scheduler,
-                    num_samples=2,
+                    num_samples=2 if experiment == "pbt" else 1,
                     reuse_actors=True,
                     time_budget_s=remaining_seconds,
                 ),
@@ -397,10 +461,9 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
                     failure_config=tune.FailureConfig(max_failures=0),
                     verbose=1,
                 ),
-                param_space=search_space()
+                param_space=parameters
                 | {
                     "executable": str(executable),
-                    "seed": tune.randint(1, 2**30),
                     "steps_per_iteration": steps,
                     "initial_checkpoint": checkpoint,
                     "execution": execution.to_dict(),
@@ -410,9 +473,10 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
             )
         results, interrupted = fit_or_recover(tuner, experiment_path, trainable)
         report = pilot_report(results, scope, fingerprint(scope), baseline, iterations, interrupted)
-        write_json(ROOT / "artifacts/validation/pilot.json", report)
+        report["experiment"] = experiment
+        write_json(report_path, report)
         if report["errors"] or (not report["trials"] and not interrupted):
-            raise RuntimeError("Pilot failed. See artifacts/validation/pilot.json.")
+            raise RuntimeError(f"Experiment failed. See {report_path}.")
         return report
     finally:
         ray.shutdown()
