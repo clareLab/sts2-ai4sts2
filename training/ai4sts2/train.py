@@ -14,10 +14,12 @@ from sb3_contrib import MaskablePPO
 from stable_baselines3.common.utils import FloatSchedule
 from stable_baselines3.common.vec_env import DummyVecEnv
 
+from ai4sts2.baseline import run as random_baseline
 from ai4sts2.calibration import calibrate, quarantine_execution, selected_execution
 from ai4sts2.environment import Sts2Env, evaluate, fingerprint, write_json
 from ai4sts2.execution import Execution
 from ai4sts2.game import ROOT, WorkerFailure, prepare_game
+from ai4sts2.metrics import compare_evaluations, summarise
 
 
 class TimedPPO(MaskablePPO):
@@ -149,8 +151,22 @@ class PopulationMember(tune.Trainable):
         )
         self.evaluation = result
         write_json(Path(self.logdir) / "evaluation.json", result)
+        if not result["eligible"]:
+            raise RuntimeError("Validation was truncated; the candidate cannot be ranked.")
+        training_episodes = self.environment.drain_episodes()
         return {
             "validation_win_rate": result["win_rate"],
+            "validation_mean_floor": result["mean_floor"],
+            "validation_median_floor": result["median_floor"],
+            "validation_selection_score": result["selection_score"],
+            "validation_eligible": result["eligible"],
+            "validation_characters": result["characters"],
+            "evaluation_id": result["evaluation_id"],
+            "random_baseline_comparison": (
+                compare_evaluations(result, self.config["baseline"])
+                if self.config.get("baseline")
+                else None
+            ),
             "environment_steps": self.model.num_timesteps,
             "training_seconds": training_seconds,
             "optimisation_seconds": self.model.optimisation_seconds,
@@ -162,7 +178,8 @@ class PopulationMember(tune.Trainable):
             "scope": self.scope,
             "certifying": False,
             "validation_episodes": result["episodes"],
-            "training_episodes": self.environment.drain_episodes(),
+            "training_episodes": training_episodes,
+            "training_progress": summarise(training_episodes) if training_episodes else None,
             "ongoing_episode_steps": self.environment.steps,
         }
 
@@ -276,9 +293,22 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
         execution = selected_execution(scope)
     if execution is None:
         raise RuntimeError("Execution calibration did not produce a compatible configuration.")
+    baseline = random_baseline(
+        minutes=min(5, max(0.001, minutes - (time.monotonic() - started) / 60)),
+        scope=scope,
+        max_steps=4096 if scope == "run" else 256,
+    )
+    if not baseline["eligible"]:
+        raise RuntimeError("Random baseline did not finish every evaluation case.")
+    baseline_reference = {key: baseline[key] for key in ("evaluation_id", "wins", "eligible")} | {
+        "episodes": [
+            {key: episode[key] for key in ("character", "seed", "floor")}
+            for episode in baseline["episodes"]
+        ]
+    }
     remaining_seconds = minutes * 60 - (time.monotonic() - started)
     if remaining_seconds <= 0:
-        raise TimeoutError("The pilot budget was used by execution calibration.")
+        raise TimeoutError("The pilot budget was used by calibration and the random baseline.")
     if checkpoint:
         checkpoint = str(Path(checkpoint).resolve())
     ray.init(
@@ -295,7 +325,7 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
         else:
             scheduler = PopulationBasedTraining(
                 time_attr="training_iteration",
-                metric="validation_win_rate",
+                metric="validation_selection_score",
                 mode="max",
                 perturbation_interval=2,
                 burn_in_period=2,
@@ -329,6 +359,7 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
                     "initial_checkpoint": checkpoint,
                     "execution": execution.to_dict(),
                     "scope": scope,
+                    "baseline": baseline_reference,
                 },
             )
         results = tuner.fit()
@@ -342,12 +373,16 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
                 result.metrics.get("training_iteration", 0) >= iterations for result in results
             ),
             "build": fingerprint(scope),
+            "baseline": baseline,
             "errors": [str(result.error) for result in results if result.error],
             "trials": [
                 {
                     "path": result.path,
                     "config": result.config,
                     "win_rate": result.metrics.get("validation_win_rate"),
+                    "mean_floor": result.metrics.get("validation_mean_floor"),
+                    "selection_score": result.metrics.get("validation_selection_score"),
+                    "random_baseline_comparison": result.metrics.get("random_baseline_comparison"),
                     "iterations": result.metrics.get("training_iteration"),
                 }
                 for result in successful

@@ -10,6 +10,7 @@ from gymnasium import spaces
 
 from ai4sts2.execution import REFERENCE
 from ai4sts2.game import OfficialGame
+from ai4sts2.metrics import summarise
 
 CHARACTERS = ("IRONCLAD", "SILENT", "REGENT", "NECROBINDER", "DEFECT")
 MAX_ACTIONS = 128
@@ -260,35 +261,100 @@ def probe_action(actions):
     return 0
 
 
-def evaluate(model, environment, seed=0, split="validation", max_steps=256):
+def evaluation_plan(scope, seed=0, split="validation", max_steps=256, per_character=1):
+    if per_character < 1 or max_steps < 1:
+        raise ValueError("Use positive episode and step counts.")
+    cases = []
+    for repeat in range(per_character):
+        for index, character in enumerate(CHARACTERS):
+            episode_seed = seed + repeat * len(CHARACTERS) + index
+            action_seed = hashlib.sha256(
+                f"ai4sts2:random-actions:{split}:{episode_seed}:{character}".encode()
+            ).hexdigest()[:16]
+            cases.append(
+                {
+                    "character": character,
+                    "seed_index": episode_seed,
+                    "seed": seed_string(split, episode_seed),
+                    "action_seed": int(action_seed, 16),
+                }
+            )
+    plan = {"scope": scope, "split": split, "max_steps": max_steps, "cases": cases}
+    return plan | {
+        "evaluation_id": hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
+    }
+
+
+def evaluate(
+    model,
+    environment,
+    seed=0,
+    split="validation",
+    max_steps=256,
+    per_character=1,
+    deadline=None,
+    on_episode=None,
+):
+    plan = evaluation_plan(environment.scope, seed, split, max_steps, per_character)
     results = []
     previous_limit = environment.max_steps
+    previous_timeout = getattr(environment.game, "timeout", None)
     environment.max_steps = max_steps
+
+    def check_budget():
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Evaluation budget exhausted.")
+            if previous_timeout is not None:
+                environment.game.timeout = min(previous_timeout, remaining)
+
+    def report():
+        summary = summarise(results)
+        summary.pop("episodes")
+        complete = len(results) == len(plan["cases"])
+        if not complete:
+            summary.update(eligible=False, selection_score=-1.0)
+        return (
+            plan
+            | summary
+            | {
+                "policy": "uniform_random" if model is None else "learned_deterministic",
+                "certifying": False,
+                "complete": complete,
+                "episodes": results.copy(),
+            }
+        )
+
     try:
-        for index, character in enumerate(CHARACTERS):
+        for case in plan["cases"]:
+            check_budget()
             observation, _ = environment.reset(
-                seed=seed + index, options={"character": character, "split": split}
+                seed=case["seed_index"], options={"character": case["character"], "split": split}
             )
+            rng = np.random.default_rng(case["action_seed"])
             terminated = truncated = False
             while not (terminated or truncated):
+                check_budget()
                 if model is None:
-                    action = probe_action(environment.state["actions"])
+                    action = int(rng.choice(np.flatnonzero(environment.action_masks())))
                 else:
                     action, _ = model.predict(
                         observation, deterministic=True, action_masks=environment.action_masks()
                     )
                 observation, _, terminated, truncated, info = environment.step(action)
-            results.append(info | {"truncated": truncated})
+            trajectory = hashlib.sha256(
+                json.dumps(environment.journal, sort_keys=True).encode()
+            ).hexdigest()
+            results.append(info | {"truncated": truncated, "trajectory_digest": trajectory})
+            if on_episode is not None:
+                on_episode(report())
     finally:
         environment.max_steps = previous_limit
+        if previous_timeout is not None:
+            environment.game.timeout = previous_timeout
         environment.drain_episodes()
-    return {
-        "scope": environment.scope,
-        "certifying": False,
-        "episodes": results,
-        "win_rate": sum(r["victory"] for r in results) / len(results),
-        "truncated_episodes": sum(r["truncated"] for r in results),
-    }
+    return report()
 
 
 def fingerprint(scope="first_combat"):

@@ -9,6 +9,8 @@ def state(terminated=False, victory=False):
     return {
         "revision": 1,
         "observation": {
+            "floor": 2,
+            "act": 0,
             "player": {"hp": 50, "max_hp": 80},
             "hand": [{"model": "BASH", "cost": 2}],
             "draw": [
