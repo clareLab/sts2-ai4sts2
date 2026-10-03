@@ -5,6 +5,7 @@ using MegaCrit.Sts2.Core.Nodes.CommonUi;
 using MegaCrit.Sts2.Core.Nodes.Events;
 using MegaCrit.Sts2.Core.Nodes.Events.Custom.CrystalSphere;
 using MegaCrit.Sts2.Core.Nodes.GodotExtensions;
+using MegaCrit.Sts2.Core.Nodes.Screens;
 using MegaCrit.Sts2.Core.Nodes.Screens.CardSelection;
 
 namespace ai4sts2;
@@ -38,6 +39,9 @@ internal static class ScreenDecisions
 
     internal static Decision[]? Capture(Node screen)
     {
+        if (screen is NCardsViewScreen)
+            return Decisions.Descendants(screen).OfType<NButton>().Where(b => b is NConfirmButton or NBackButton && b.IsEnabled && b.IsVisibleInTree())
+                .Select(b => new Decision("proceed", new { kind = "proceed" }, b.ForceClick)).ToArray();
         if (screen is NChooseABundleSelectionScreen bundles)
             return Decisions.Descendants(bundles).OfType<NCardBundle>().Where(b => b.IsVisibleInTree()).Select(b =>
                 new Decision($"bundle:{b.GetInstanceId()}", new { kind = "choose_bundle", cards = b.Bundle.Select(c => Observation.Card(c)).ToArray() }, () => ChooseBundle(bundles, b))).ToArray();

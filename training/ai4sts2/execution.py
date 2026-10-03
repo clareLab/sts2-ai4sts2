@@ -19,10 +19,4 @@ class Execution:
 
 
 REFERENCE = Execution(pause_idle=False)
-CANDIDATES = (
-    Execution(fps=0, fixed_fps=60),
-    Execution(fps=240),
-    Execution(),
-    Execution(fps=0, fixed_fps=60, settle_frames=1, step_frames=1),
-    Execution(fps=0, fixed_fps=60, non_interactive=True),
-)
+CANDIDATES = (Execution(fps=240),)
