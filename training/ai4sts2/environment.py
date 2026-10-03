@@ -14,6 +14,7 @@ from ai4sts2.encoding import ACTION_NODES, NODE_SIZE, STATE_NODES, tree
 from ai4sts2.execution import REFERENCE
 from ai4sts2.game import OfficialGame
 from ai4sts2.metrics import summarise
+from ai4sts2.policy import evaluation_action
 
 CHARACTERS = ("IRONCLAD", "SILENT", "REGENT", "NECROBINDER", "DEFECT")
 MAX_ACTIONS = 128
@@ -377,6 +378,7 @@ def evaluate(
     per_character=1,
     deadline=None,
     on_episode=None,
+    deterministic=True,
 ):
     plan = evaluation_plan(environment.scope, seed, split, max_steps, per_character)
     results = []
@@ -402,7 +404,13 @@ def evaluate(
             plan
             | summary
             | {
-                "policy": "uniform_random" if model is None else "learned_deterministic",
+                "policy": (
+                    "uniform_random"
+                    if model is None
+                    else "learned_deterministic"
+                    if deterministic
+                    else "learned_sampled"
+                ),
                 "certifying": False,
                 "complete": complete,
                 "episodes": results.copy(),
@@ -419,12 +427,9 @@ def evaluate(
             terminated = truncated = False
             while not (terminated or truncated):
                 check_budget()
-                if model is None:
-                    action = int(rng.choice(np.flatnonzero(environment.action_masks())))
-                else:
-                    action, _ = model.predict(
-                        observation, deterministic=True, action_masks=environment.action_masks()
-                    )
+                action = evaluation_action(
+                    model, observation, environment.action_masks(), rng, deterministic
+                )
                 observation, _, terminated, truncated, info = environment.step(action)
             trajectory = hashlib.sha256(
                 json.dumps(environment.journal, sort_keys=True).encode()

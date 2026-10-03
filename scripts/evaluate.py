@@ -15,6 +15,7 @@ from ai4sts2.calibration import calibrate, selected_execution
 from ai4sts2.environment import Sts2Env, evaluation_plan, fingerprint, write_json
 from ai4sts2.game import ROOT, WorkerFailure, prepare_game
 from ai4sts2.metrics import compare_evaluations, summarise
+from ai4sts2.policy import evaluation_action
 from ai4sts2.resources import budget
 from sb3_contrib import MaskablePPO
 
@@ -24,7 +25,13 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def candidates(study, build):
+def candidates(study, build, policy_modes=("deterministic",)):
+    if (
+        not policy_modes
+        or len(set(policy_modes)) != len(policy_modes)
+        or any(mode not in {"deterministic", "sampled"} for mode in policy_modes)
+    ):
+        raise ValueError("Use distinct deterministic or sampled policy modes.")
     if not study["complete"] or not study["trials"] or study["build"] != build:
         raise ValueError("A complete study with the current build is required.")
     result = [{"name": "random", "variant": "random", "checkpoint": None, "sha256": None}]
@@ -32,14 +39,17 @@ def candidates(study, build):
         checkpoint = Path(trial["checkpoint"]).resolve()
         if json.loads((checkpoint / "build.json").read_text()) != build:
             raise ValueError("Checkpoint build does not match the evaluation build.")
-        result.append(
-            {
-                "name": f"{trial['variant']}-{trial['seed']}",
-                "variant": trial["variant"],
-                "checkpoint": str(checkpoint),
-                "sha256": digest(checkpoint / "policy.zip"),
-            }
-        )
+        for mode in policy_modes:
+            result.append(
+                {
+                    "name": f"{trial['variant']}-{trial['seed']}"
+                    + ("-sampled" if mode == "sampled" else ""),
+                    "variant": trial["variant"],
+                    "policy_mode": mode,
+                    "checkpoint": str(checkpoint),
+                    "sha256": digest(checkpoint / "policy.zip"),
+                }
+            )
     if len({item["name"] for item in result}) != len(result):
         raise ValueError("Candidate names must be unique.")
     return result
@@ -69,7 +79,16 @@ def evaluation_requests(game, deadline, cancelled):
         game.timeout = timeout
 
 
-def episode(model, environment, case, deadline, resume=None, checkpoint=None, cancelled=None):
+def episode(
+    model,
+    environment,
+    case,
+    deadline,
+    resume=None,
+    checkpoint=None,
+    cancelled=None,
+    deterministic=True,
+):
     with evaluation_requests(environment.game, deadline, cancelled):
         rng = np.random.default_rng(case["action_seed"])
         if resume is None:
@@ -77,6 +96,8 @@ def episode(model, environment, case, deadline, resume=None, checkpoint=None, ca
                 seed=case["seed_index"], options={"character": case["character"], "split": "test"}
             )
         else:
+            if resume.get("deterministic", True) != deterministic:
+                raise ValueError("The saved continuation uses a different policy mode.")
             parameters = resume["environment"]["journal"]["parameters"]
             if parameters["seed"] != case["seed"] or parameters["character"] != case["character"]:
                 raise ValueError("The saved continuation belongs to a different evaluation case.")
@@ -87,14 +108,15 @@ def episode(model, environment, case, deadline, resume=None, checkpoint=None, ca
         while not (terminated or truncated):
             if checkpoint is not None:
                 checkpoint(
-                    {"environment": environment.snapshot(), "action_rng": rng.bit_generator.state}
+                    {
+                        "environment": environment.snapshot(),
+                        "action_rng": rng.bit_generator.state,
+                        "deterministic": deterministic,
+                    }
                 )
-            if model is None:
-                action = int(rng.choice(np.flatnonzero(environment.action_masks())))
-            else:
-                action, _ = model.predict(
-                    observation, deterministic=True, action_masks=environment.action_masks()
-                )
+            action = evaluation_action(
+                model, observation, environment.action_masks(), rng, deterministic
+            )
             observation, _, terminated, truncated, info = environment.step(action)
         environment.drain_episodes()
         return info | {
@@ -142,7 +164,15 @@ def aggregate(plan, records):
     }
 
 
-def run(study_path, output, minutes=25, per_character=4, workers=0, auto_calibrate=False):
+def run(
+    study_path,
+    output,
+    minutes=25,
+    per_character=4,
+    workers=0,
+    auto_calibrate=False,
+    policy_modes=("deterministic",),
+):
     if not 0 < minutes <= 30:
         raise ValueError("Use a budget between zero and 30 minutes.")
     started = time.monotonic()
@@ -151,7 +181,7 @@ def run(study_path, output, minutes=25, per_character=4, workers=0, auto_calibra
     output.mkdir(parents=True, exist_ok=True)
     resources = budget().report(workers)
     build = fingerprint("run")
-    models = candidates(json.loads(Path(study_path).read_text()), build)
+    models = candidates(json.loads(Path(study_path).read_text()), build, policy_modes)
     manifest = output / "plan.json"
     previous = json.loads(manifest.read_text()) if manifest.exists() else None
     seed = previous["cases"][0]["seed_index"] if previous else secrets.randbits(60)
@@ -244,6 +274,7 @@ def run(study_path, output, minutes=25, per_character=4, workers=0, auto_calibra
                 record.get("resume"),
                 checkpoint,
                 stopped.is_set,
+                candidate.get("policy_mode", "deterministic") == "deterministic",
             )
             record.pop("resume", None)
             record.pop("pending", None)
@@ -310,8 +341,21 @@ if __name__ == "__main__":
     parser.add_argument("--minutes", type=float, default=25)
     parser.add_argument("--per-character", type=int, default=4)
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument(
+        "--policy-modes",
+        nargs="+",
+        choices=("deterministic", "sampled"),
+        default=["deterministic"],
+    )
     args = parser.parse_args()
-    result = run(args.study, args.output, args.minutes, args.per_character, args.workers)
+    result = run(
+        args.study,
+        args.output,
+        args.minutes,
+        args.per_character,
+        args.workers,
+        policy_modes=args.policy_modes,
+    )
     print(json.dumps({"complete": result["complete"], "eligible": result["eligible"]}))
     if not result["eligible"]:
         raise SystemExit(1)

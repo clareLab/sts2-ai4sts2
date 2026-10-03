@@ -204,9 +204,13 @@ def test_paused_cases_are_resumed_but_completed_cases_are_not_repeated(suite, mo
     original = holdout.episode
     paused = []
 
-    def pause_once(model, environment, case, deadline, resume, checkpoint, cancelled):
+    def pause_once(
+        model, environment, case, deadline, resume, checkpoint, cancelled, deterministic
+    ):
         if paused:
-            return original(model, environment, case, deadline, resume, checkpoint, cancelled)
+            return original(
+                model, environment, case, deadline, resume, checkpoint, cancelled, deterministic
+            )
 
         def stop(snapshot):
             checkpoint(snapshot)
@@ -214,7 +218,7 @@ def test_paused_cases_are_resumed_but_completed_cases_are_not_repeated(suite, mo
                 paused.append(case)
                 raise holdout.EvaluationPaused()
 
-        return original(model, environment, case, deadline, resume, stop, cancelled)
+        return original(model, environment, case, deadline, resume, stop, cancelled, deterministic)
 
     monkeypatch.setattr(holdout, "episode", pause_once)
     first = holdout.run(study, output, per_character=1, workers=1)

@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import torch
 from sb3_contrib.common.maskable.distributions import MaskableCategoricalDistribution
 from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPolicy
@@ -7,6 +8,28 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from torch import nn
 
 from ai4sts2.encoding import TreeFeatures
+
+
+def evaluation_action(model, observation, mask, rng, deterministic=True):
+    if model is None:
+        return int(rng.choice(np.flatnonzero(mask)))
+    if deterministic:
+        action, _ = model.predict(observation, deterministic=True, action_masks=mask)
+        return int(action)
+    model.policy.set_training_mode(False)
+    with torch.no_grad():
+        tensors, _ = model.policy.obs_to_tensor(observation)
+        distribution = model.policy.get_distribution(tensors, action_masks=mask)
+        probabilities = distribution.distribution.probs[0].cpu().numpy().astype(np.float64)
+    if (
+        probabilities.shape != mask.shape
+        or not np.isfinite(probabilities).all()
+        or (probabilities < 0).any()
+        or (probabilities[~mask] != 0).any()
+        or probabilities.sum() <= 0
+    ):
+        raise ValueError("Invalid masked policy probabilities.")
+    return int(rng.choice(len(probabilities), p=probabilities / probabilities.sum()))
 
 
 class ActionFeatures(BaseFeaturesExtractor):

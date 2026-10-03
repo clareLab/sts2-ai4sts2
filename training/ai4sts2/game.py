@@ -114,6 +114,7 @@ class OfficialGame:
         self.measurements = {}
         self.log_path = self.directory / "game.log"
         self.log = self.log_path.open("w")
+        self.journal = (self.directory / "requests.jsonl").open("w", buffering=1)
         self.process = subprocess.Popen(
             command,
             cwd=executable.parent,
@@ -161,10 +162,10 @@ class OfficialGame:
             )
         self.sequence += 1
         identifier = str(self.sequence)
+        request = json.dumps({"id": identifier, "method": method, "params": parameters or {}})
+        self.journal.write(request + "\n")
         try:
-            self.process.stdin.write(
-                json.dumps({"id": identifier, "method": method, "params": parameters or {}}) + "\n"
-            )
+            self.process.stdin.write(request + "\n")
             self.process.stdin.flush()
         except OSError as error:
             self.close()
@@ -216,7 +217,7 @@ class OfficialGame:
                     pass
                 self.process.wait(timeout=5)
         self.reader.join(timeout=2)
-        for stream in (self.process.stdin, self.process.stdout, self.log):
+        for stream in (self.process.stdin, self.process.stdout, self.log, self.journal):
             stream.close()
 
     def __enter__(self):
