@@ -15,6 +15,7 @@ using MegaCrit.Sts2.Core.Nodes.Combat;
 using MegaCrit.Sts2.Core.Nodes.Events;
 using MegaCrit.Sts2.Core.Nodes.GodotExtensions;
 using MegaCrit.Sts2.Core.Nodes.Rooms;
+using MegaCrit.Sts2.Core.Nodes.Screens;
 using MegaCrit.Sts2.Core.Nodes.Screens.Map;
 using MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext;
 using MegaCrit.Sts2.Core.Runs;
@@ -34,17 +35,18 @@ internal static class Decisions
         if (NGame.Instance!.Transition.InTransition || NMapScreen.Instance?.IsTraveling == true) return [];
         var screen = ActiveScreenContext.Instance.GetCurrentScreen() as Node;
         if (screen == null) return [];
+        if (screen is NInspectCardScreen && !screen.IsProcessingInput()) return [];
         var player = run.Players.Single();
         if (screen is NCombatRoom && CombatManager.Instance.IsInProgress)
         {
-            if (NPlayerHand.Instance?.IsInCardSelection == true) return Controls(NPlayerHand.Instance).ToArray();
+            if (NPlayerHand.Instance?.IsInCardSelection == true) return Controls(NPlayerHand.Instance, player).ToArray();
             if (player.PlayerCombatState?.Phase != PlayerTurnPhase.Play || RunManager.Instance.ActionExecutor.IsRunning || CombatManager.Instance.PlayerActionsDisabled) return [];
             return Combat(player).ToArray();
         }
         if (screen is NMapScreen map)
             return Descendants(map).OfType<NMapPoint>().Where(p => p.IsEnabled && p.IsVisibleInTree())
                 .Select(p => new Decision(p.GetInstanceId().ToString(), new { kind = "map", row = p.Point.coord.row, column = p.Point.coord.col, room = p.Point.PointType.ToString() }, p.ForceClick)).ToArray();
-        return Controls(screen).ToArray();
+        return Controls(screen, player).ToArray();
     }
 
     private static IEnumerable<Decision> Combat(Player player)
@@ -60,7 +62,7 @@ internal static class Decisions
                 if (!card.IsValidTarget(target)) continue;
                 var captured = target;
                 yield return new Decision($"card:{card.GetHashCode()}:{target?.CombatId}",
-                    new { kind = "play", card = Observation.Card(card), target = target == null ? null : Observation.Creature(target) },
+                    new { kind = "play", card = Observation.Card(card, target), target = target == null ? null : Observation.Creature(target) },
                     () => RunManager.Instance.ActionQueueSynchronizer.RequestEnqueue(new PlayCardAction(card, captured)));
             }
         }
@@ -84,17 +86,29 @@ internal static class Decisions
             () => RunManager.Instance.ActionQueueSynchronizer.RequestEnqueue(new EndPlayerTurnAction(player, player.PlayerCombatState.TurnNumber)));
     }
 
-    private static IEnumerable<Decision> Controls(Node screen)
+    private static IEnumerable<Decision> Controls(Node screen, Player player)
     {
         var selected = Descendants(screen).OfType<NCardGrid>().SelectMany(g => (IEnumerable<CardModel>)HighlightedCards.GetValue(g)!).ToHashSet();
-        var holders = Descendants(screen).OfType<NCardHolder>().Where(h => h.IsVisibleInTree() && h.Hitbox.IsEnabled && h.CardModel != null).ToArray();
+        var allHolders = Descendants(screen).OfType<NCardHolder>().Where(h => h.CardModel != null).ToArray();
+        if (screen is NPlayerHand)
+        {
+            var represented = allHolders.Select(h => h.CardModel!).ToHashSet();
+            if (PileType.Hand.GetPile(player).Cards.Any(c => !represented.Contains(c))) yield break;
+            if (allHolders.Any(h => h.IsVisibleInTree() && !h.Hitbox.IsEnabled)) yield break;
+        }
+        var blockedGrids = Descendants(screen).OfType<NCardGrid>().Where(g => g.FocusBehaviorRecursive == Control.FocusBehaviorRecursiveEnum.Disabled).ToArray();
+        var holders = allHolders.Where(h => h is not NPreviewCardHolder && h.IsVisibleInTree() && h.Hitbox.IsEnabled && !blockedGrids.Any(g => g.IsAncestorOf(h))).ToArray();
         foreach (var holder in holders)
             yield return new Decision(holder.GetInstanceId().ToString(), new { kind = "select_card", card = Observation.Card(holder.CardModel!), selected = selected.Contains(holder.CardModel!) || holder is NSelectedHandCardHolder },
                 () => holder.EmitSignal(NCardHolder.SignalName.Pressed, holder));
-        foreach (var button in Descendants(screen).OfType<NButton>())
+        var buttons = Descendants(screen).OfType<NButton>().Where(b => b.IsEnabled && b.IsVisibleInTree()).ToArray();
+        bool hasEventOptions = screen is NEventRoom && buttons.OfType<NEventOptionButton>().Any(b => !b.Option.IsLocked);
+        foreach (var button in buttons)
         {
             if (!button.IsEnabled || !button.IsVisibleInTree() || holders.Any(h => h.IsAncestorOf(button))) continue;
-            if (button is NPeekButton) continue;
+            if (button is NPeekButton or NCardHolderHitbox) continue;
+            if (blockedGrids.Any(g => g.IsAncestorOf(button))) continue;
+            if (hasEventOptions && button is NAncientDialogueHitbox) continue;
             if (screen is NEventRoom && button is not (NEventOptionButton or NAncientDialogueHitbox or NProceedButton)) continue;
             if (button is NEventOptionButton { Option.IsLocked: true }) continue;
             var labels = Descendants(button).OfType<RichTextLabel>().Where(l => l.IsVisibleInTree()).Select(l => l.GetParsedText());

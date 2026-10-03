@@ -17,6 +17,9 @@ internal static class Worker
 {
     private static readonly ConcurrentQueue<string> Requests = new();
     private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
+    private static readonly ExecutionOptions Execution = ExecutionOptions.Load(Json);
+    private static readonly bool AuditEnabled = System.Environment.GetEnvironmentVariable("AI4STS2_AUDIT") == "1";
+    private static Dictionary<string, double> _timings = new();
     private static Task? _pending;
     private static RunState? _run;
     private static long _revision;
@@ -50,6 +53,8 @@ internal static class Worker
 
     private static async Task Handle(string line)
     {
+        var timer = Stopwatch.StartNew();
+        _timings = new();
         string? id = null;
         try
         {
@@ -67,12 +72,13 @@ internal static class Worker
             await Ready();
             object result;
             if (method == "hello")
-                result = new { protocol = 1, engine = "official", test_mode = TestMode.IsOn, characters = ModelDb.AllCharacters.Select(c => c.Id.Entry).ToArray() };
+                result = new { protocol = 2, engine = "official", test_mode = TestMode.IsOn, execution = Execution, characters = ModelDb.AllCharacters.Select(c => c.Id.Entry).ToArray() };
             else if (method == "reset") result = await Reset(request.GetProperty("params"));
             else if (method == "observe") result = await Observe();
             else if (method == "step") result = await Step(request.GetProperty("params"));
             else throw new ArgumentException($"Unknown method: {method}");
-            Reply(new { id, ok = true, result });
+            _timings["engine_ms"] = timer.Elapsed.TotalMilliseconds;
+            Reply(new { id, ok = true, result, timing = _timings });
         }
         catch (Exception error)
         {
@@ -96,6 +102,7 @@ internal static class Worker
             await Frame();
         }
         await NGame.Instance.GameStartupComplete;
+        Execution.Apply();
     }
 
     private static async Task<object> Reset(JsonElement parameters)
@@ -131,8 +138,7 @@ internal static class Worker
         var decision = _decisions[index];
         _decisions = [];
         decision.Execute();
-        await Frame();
-        await Frame();
+        for (int i = 0; i < Execution.StepFrames; i++) await Frame();
         return await Observe();
     }
 
@@ -152,22 +158,39 @@ internal static class Worker
             {
                 _revision++;
                 _decisions = [];
-                return new { revision = _revision, observation = Observation.Capture(_run), actions = Array.Empty<object>(), terminated = true, victory = !dead && (victory || (combatComplete && _combatWon)), scope = _scope };
+                return Snapshot(true, !dead && (victory || (combatComplete && _combatWon)));
             }
             var available = Decisions.Capture(_run);
             string signature = string.Join('|', available.Select(a => a.Key));
             stableFrames = available.Length > 0 && signature == previous ? stableFrames + 1 : 0;
             previous = signature;
-            if (stableFrames >= 3)
+            if (stableFrames >= Execution.SettleFrames)
             {
                 _revision++;
                 _decisions = available;
-                return new { revision = _revision, observation = Observation.Capture(_run), actions = available.Select(a => a.Visible).ToArray(), terminated = false, victory = false, scope = _scope };
+                return Snapshot(false, false);
             }
             if (timer.Elapsed.TotalSeconds > 30) throw new TimeoutException($"No stable decision: {Decisions.ScreenName}, floor {_run.TotalFloor}.");
             await Frame();
         }
     }
 
-    private static async Task Frame() => await Tree.ToSignal(Tree, SceneTree.SignalName.ProcessFrame);
+    private static object Snapshot(bool terminated, bool victory)
+    {
+        var timer = Stopwatch.StartNew();
+        var observation = Observation.Capture(_run!);
+        var actions = _decisions.Select(a => a.Visible).ToArray();
+        _timings["observation_ms"] = timer.Elapsed.TotalMilliseconds;
+        timer.Restart();
+        string? audit = AuditEnabled ? Audit.Capture(_run!) : null;
+        _timings["audit_ms"] = timer.Elapsed.TotalMilliseconds;
+        return new { revision = _revision, observation, actions, terminated, victory, scope = _scope, audit };
+    }
+
+    private static async Task Frame()
+    {
+        var timer = Stopwatch.StartNew();
+        await Tree.ToSignal(Tree, SceneTree.SignalName.ProcessFrame);
+        _timings["frame_wait_ms"] = _timings.GetValueOrDefault("frame_wait_ms") + timer.Elapsed.TotalMilliseconds;
+    }
 }

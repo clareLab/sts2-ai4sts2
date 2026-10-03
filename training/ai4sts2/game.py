@@ -8,6 +8,8 @@ import threading
 import time
 from pathlib import Path
 
+from ai4sts2.execution import REFERENCE
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -44,7 +46,7 @@ def prepare_game():
 
 
 class OfficialGame:
-    def __init__(self, executable=None, timeout=75):
+    def __init__(self, executable=None, timeout=75, execution=REFERENCE, audit=False):
         executable = Path(executable or prepare_game())
         directory = ROOT / "artifacts/workers"
         directory.mkdir(parents=True, exist_ok=True)
@@ -62,7 +64,7 @@ class OfficialGame:
                     "skip_intro_logo": True,
                     "seen_ea_disclaimer": True,
                     "fullscreen": False,
-                    "fps_limit": 60,
+                    "fps_limit": execution.fps,
                     "language": "eng",
                 }
             )
@@ -73,6 +75,8 @@ class OfficialGame:
             "XDG_CONFIG_HOME": str(self.directory / "config"),
             "LP_NUM_THREADS": "1",
             "DOTNET_PROCESSOR_COUNT": "2",
+            "AI4STS2_EXECUTION": json.dumps(execution.to_dict()),
+            "AI4STS2_AUDIT": "1" if audit else "0",
         }
         command = [
             str(executable),
@@ -82,11 +86,14 @@ class OfficialGame:
             "--force-steam=off",
             "--ai4sts2-worker",
         ]
+        if execution.fixed_fps:
+            command += ["--fixed-fps", str(execution.fixed_fps)]
         if shutil.which("steam-run"):
             command.insert(0, "steam-run")
         self.timeout = timeout
         self.sequence = 0
         self.responses = queue.Queue()
+        self.measurements = {}
         self.log_path = self.directory / "game.log"
         self.log = self.log_path.open("w")
         self.process = subprocess.Popen(
@@ -125,6 +132,7 @@ class OfficialGame:
             self.responses.put(None)
 
     def request(self, method, parameters=None):
+        started = time.perf_counter()
         if self.process.poll() is not None:
             raise RuntimeError(f"Official worker exited. See {self.log_path}")
         self.sequence += 1
@@ -146,17 +154,35 @@ class OfficialGame:
         if not response["ok"]:
             self.close()
             raise RuntimeError(response["error"])
+        measurement = self.measurements.setdefault(method, {})
+        timing = response.get("timing", {})
+        wall_ms = (time.perf_counter() - started) * 1000
+        for key, value in (timing | {"wall_ms": wall_ms, "calls": 1}).items():
+            measurement[key] = measurement.get(key, 0) + value
+        measurement["transport_ms"] = measurement.get("transport_ms", 0) + max(
+            0, wall_ms - timing.get("engine_ms", wall_ms)
+        )
         return response["result"]
+
+    def drain_measurements(self):
+        result, self.measurements = self.measurements, {}
+        return result
 
     def close(self):
         import signal
 
         if self.process.poll() is None:
-            os.killpg(self.process.pid, signal.SIGTERM)
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                os.killpg(self.process.pid, signal.SIGKILL)
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 self.process.wait(timeout=5)
         self.reader.join(timeout=2)
         for stream in (self.process.stdin, self.process.stdout, self.log):

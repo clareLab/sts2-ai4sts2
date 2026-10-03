@@ -7,6 +7,8 @@ def main():
     parser = argparse.ArgumentParser(prog="ai4sts2")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("check")
+    calibration = commands.add_parser("calibrate")
+    calibration.add_argument("--minutes", type=float, default=5)
     probe = commands.add_parser("probe")
     probe.add_argument("--character", default="IRONCLAD")
     probe.add_argument("--steps", type=int, default=80)
@@ -17,7 +19,11 @@ def main():
     pilot.add_argument("--resume", help="Recover an interrupted Ray experiment.")
     pilot.add_argument("--checkpoint", help="Start another bounded pilot from a saved model.")
     args = parser.parse_args()
-    if args.command == "pilot":
+    if args.command == "calibrate":
+        from ai4sts2.calibration import calibrate
+
+        print(json.dumps(calibrate(args.minutes), indent=2))
+    elif args.command == "pilot":
         from ai4sts2.train import run
 
         print(

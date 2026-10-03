@@ -14,7 +14,7 @@ def member(monkeypatch, learning_rate=0.0003, entropy=0.01):
     monkeypatch.setattr(
         training,
         "Sts2Env",
-        lambda executable, seed: Sts2Env(seed=seed, worker_factory=FakeWorker),
+        lambda executable, seed, **_: Sts2Env(seed=seed, worker_factory=FakeWorker),
     )
     instance = object.__new__(PopulationMember)
     instance.config = {
@@ -34,6 +34,7 @@ def test_pbt_restores_weights_and_optimizer_then_applies_mutations(monkeypatch, 
     donor.save_checkpoint(str(tmp_path))
     assert json.loads((tmp_path / "evaluation.json").read_text()) == donor.evaluation
     receiver = member(monkeypatch, learning_rate=0.001, entropy=0.03)
+    receiver.config |= {"gamma": 0.97, "gae_lambda": 0.9, "clip_range": 0.15, "epochs": 4}
     receiver.load_checkpoint(str(tmp_path))
     for key, weight in donor.model.policy.state_dict().items():
         assert torch.equal(weight, receiver.model.policy.state_dict()[key])
@@ -42,6 +43,12 @@ def test_pbt_restores_weights_and_optimizer_then_applies_mutations(monkeypatch, 
     assert receiver.model.lr_schedule(0.5) == 0.001
     assert all(group["lr"] == 0.001 for group in receiver.model.policy.optimizer.param_groups)
     assert receiver.model.num_timesteps == donor.model.num_timesteps
+    assert receiver.model.gamma == receiver.model.rollout_buffer.gamma == 0.97
+    assert receiver.model.gae_lambda == receiver.model.rollout_buffer.gae_lambda == 0.9
+    assert receiver.model.clip_range(0.5) == 0.15
+    assert receiver.model.n_epochs == 4
+    assert receiver.sample_count == donor.sample_count
+    assert receiver.evaluation == donor.evaluation
     assert receiver.environment.rng.bit_generator.state == donor.environment.rng.bit_generator.state
     donor.cleanup()
     receiver.cleanup()

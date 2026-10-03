@@ -44,6 +44,8 @@ def test_hidden_state_and_draw_order_do_not_change_policy_input():
     original = state()
     changed = copy.deepcopy(original)
     changed["seed"] = "secret"
+    changed["audit"] = "native-secret"
+    changed["timing"] = {"rng_dependent_ms": 55}
     changed["revision"] = 98765
     changed["observation"]["rng"] = {"counter": 991}
     changed["observation"]["player"]["native_state"] = {"secret": 55}
@@ -115,11 +117,11 @@ def test_illegal_actions_never_reach_game(action):
     assert len(env.game.calls) == 1
 
 
-def test_timeout_is_not_counted_as_victory():
+def test_budget_truncation_is_not_given_a_death_penalty():
     env = Sts2Env(max_steps=1, worker_factory=FakeWorker)
     env.reset()
     _, reward, terminated, truncated, info = env.step(0)
-    assert not terminated and truncated and not info["victory"] and reward == -1
+    assert not terminated and truncated and not info["victory"] and reward == 0
 
 
 def test_terminal_reward_and_lifecycle():

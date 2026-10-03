@@ -1,23 +1,25 @@
 import hashlib
 import json
 import math
+import time
 
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from ai4sts2.execution import REFERENCE
 from ai4sts2.game import OfficialGame
 
 CHARACTERS = ("IRONCLAD", "SILENT", "REGENT", "NECROBINDER", "DEFECT")
 MAX_ACTIONS = 128
 STATE_FEATURES = 512
 ACTION_FEATURES = 64
-SCHEMA = 1
+SCHEMA = 2
 VISIBLE_FIELDS = frozenset(
     "character ascension floor act screen player gold deck relics potions energy stars orbs turn "
     "hand draw discard exhaust creatures model type cost upgrades enchantment side hp max_hp "
     "block powers amount intents damage repeats passive evoke kind card target row column room "
-    "control label selected".split()
+    "control label selected keywords variables".split()
 )
 
 
@@ -78,7 +80,7 @@ def encode(state):
 
 
 def seed_string(split, seed):
-    if split not in {"train", "validation", "test"}:
+    if split not in {"train", "validation", "test", "calibration"}:
         raise ValueError("Unknown seed split.")
     return hashlib.sha256(f"ai4sts2:{split}:{seed}".encode()).hexdigest()[:16].upper()
 
@@ -86,9 +88,23 @@ def seed_string(split, seed):
 class Sts2Env(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, executable=None, seed=0, max_steps=256, worker_factory=OfficialGame):
+    def __init__(
+        self,
+        executable=None,
+        seed=0,
+        max_steps=1024,
+        worker_factory=OfficialGame,
+        execution=REFERENCE,
+        scope="first_combat",
+    ):
         super().__init__()
-        self.game = worker_factory(executable)
+        self.game = (
+            worker_factory(executable, execution=execution)
+            if worker_factory is OfficialGame
+            else worker_factory(executable)
+        )
+        self.scope = scope
+        self.encoding_seconds = 0.0
         self.rng = np.random.default_rng(seed)
         self.max_steps = max_steps
         self.state = None
@@ -115,11 +131,17 @@ class Sts2Env(gym.Env):
             {
                 "character": self.character,
                 "seed": seed_string(split, episode_seed),
-                "scope": "first_combat",
+                "scope": self.scope,
             },
         )
         self.steps = 0
-        return encode(self.state), {"scope": "first_combat", "character": self.character}
+        return self.encode(), {"scope": self.scope, "character": self.character}
+
+    def encode(self):
+        started = time.perf_counter()
+        observation = encode(self.state)
+        self.encoding_seconds += time.perf_counter() - started
+        return observation
 
     def action_masks(self):
         return np.arange(MAX_ACTIONS) < len(self.state["actions"])
@@ -141,15 +163,23 @@ class Sts2Env(gym.Env):
         terminated = self.state["terminated"]
         truncated = not terminated and self.steps >= self.max_steps
         victory = bool(terminated and self.state["victory"])
-        reward = float(1 if victory else -1) if terminated or truncated else 0.0
+        reward = float(1 if victory else -1) if terminated else 0.0
         info = {
-            "scope": "first_combat",
+            "scope": self.scope,
             "character": self.character,
             "victory": victory,
             "hp": self.state["observation"]["player"]["hp"],
             "steps": self.steps,
+            "truncated": truncated,
+            "screen": self.state["observation"].get("screen"),
         }
-        return encode(self.state), reward, terminated, truncated, info
+        return self.encode(), reward, terminated, truncated, info
+
+    def drain_measurements(self):
+        result = self.game.drain_measurements()
+        result["encoding_seconds"] = self.encoding_seconds
+        self.encoding_seconds = 0.0
+        return result
 
     def close(self):
         self.game.close()
@@ -165,29 +195,35 @@ def probe_action(actions):
     return 0
 
 
-def evaluate(model, environment, seed=0, split="validation"):
+def evaluate(model, environment, seed=0, split="validation", max_steps=256):
     results = []
-    for index, character in enumerate(CHARACTERS):
-        observation, _ = environment.reset(
-            seed=seed + index, options={"character": character, "split": split}
-        )
-        terminated = truncated = False
-        while not (terminated or truncated):
-            if model is None:
-                action = probe_action(environment.state["actions"])
-            else:
-                action, _ = model.predict(
-                    observation, deterministic=True, action_masks=environment.action_masks()
-                )
-            observation, _, terminated, truncated, info = environment.step(action)
-        results.append(info | {"truncated": truncated})
-    if model is not None:
-        model._last_obs = None
+    previous_limit = environment.max_steps
+    environment.max_steps = max_steps
+    try:
+        for index, character in enumerate(CHARACTERS):
+            observation, _ = environment.reset(
+                seed=seed + index, options={"character": character, "split": split}
+            )
+            terminated = truncated = False
+            while not (terminated or truncated):
+                if model is None:
+                    action = probe_action(environment.state["actions"])
+                else:
+                    action, _ = model.predict(
+                        observation, deterministic=True, action_masks=environment.action_masks()
+                    )
+                observation, _, terminated, truncated, info = environment.step(action)
+            results.append(info | {"truncated": truncated})
+    finally:
+        if model is not None:
+            model._last_obs = None
+        environment.max_steps = previous_limit
     return {
-        "scope": "first_combat",
+        "scope": environment.scope,
         "certifying": False,
         "episodes": results,
         "win_rate": sum(r["victory"] for r in results) / len(results),
+        "truncated_episodes": sum(r["truncated"] for r in results),
     }
 
 

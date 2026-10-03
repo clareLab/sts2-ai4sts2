@@ -9,15 +9,22 @@ namespace ai4sts2;
 
 internal static class Observation
 {
-    internal static object Card(CardModel card) => new
+    internal static object Card(CardModel card, Creature? target = null)
     {
-        model = card.Id.Entry,
-        type = card.Type.ToString(),
-        cost = card.EnergyCost.GetResolved(),
-        stars = card.GetStarCostWithModifiers(),
-        upgrades = card.CurrentUpgradeLevel,
-        enchantment = card.Enchantment?.Id.Entry
-    };
+        var variables = card.DynamicVars.Clone(card);
+        card.UpdateDynamicVarPreview(CardPreviewMode.Normal, target, variables);
+        return new
+        {
+            model = card.Id.Entry,
+            type = card.Type.ToString(),
+            cost = card.EnergyCost.GetResolved(),
+            stars = card.GetStarCostWithModifiers(),
+            upgrades = card.CurrentUpgradeLevel,
+            enchantment = card.Enchantment?.Id.Entry,
+            keywords = card.Keywords.Select(k => k.ToString()).Order().ToArray(),
+            variables = variables.Values.OrderBy(v => v.Name).Select(v => new { model = v.Name, amount = v.PreviewValue }).ToArray()
+        };
+    }
 
     internal static object Creature(Creature creature) => new
     {
@@ -42,7 +49,7 @@ internal static class Observation
         object[] Pile(PileType type, bool unordered = false)
         {
             if (combat == null) return [];
-            var cards = type.GetPile(player).Cards.Select(Card);
+            var cards = type.GetPile(player).Cards.Select(c => Card(c));
             return (unordered ? cards.OrderBy(c => JsonSerializer.Serialize(c)) : cards).ToArray();
         }
         return new
@@ -54,7 +61,7 @@ internal static class Observation
             screen = Decisions.ScreenName,
             player = Creature(player.Creature),
             gold = player.Gold,
-            deck = player.Deck.Cards.OrderBy(c => c.Id.Entry).ThenBy(c => c.CurrentUpgradeLevel).Select(Card).ToArray(),
+            deck = player.Deck.Cards.OrderBy(c => c.Id.Entry).ThenBy(c => c.CurrentUpgradeLevel).Select(c => Card(c)).ToArray(),
             relics = player.Relics.Select(r => r.Id.Entry).Order().ToArray(),
             potions = player.Potions.Select(p => p.Id.Entry).ToArray(),
             energy = combat?.Energy ?? 0,
