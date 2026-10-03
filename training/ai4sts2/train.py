@@ -78,8 +78,16 @@ def mutation_space():
 def ablation_space(seed, repeats=1, study="signals"):
     if repeats < 1:
         raise ValueError("Use at least one model initialisation.")
-    if study not in {"signals", "policies"}:
+    if study not in {"signals", "policies", "encodings"}:
         raise ValueError("Unknown ablation study.")
+    if study == "encodings":
+        return ablation_space(seed, repeats) | {
+            "variant": tune.grid_search(["hash", "tree"]),
+            "encoding": tune.sample_from(lambda spec: spec["config"]["variant"]),
+            "policy": "shared",
+            "rnd_scale": 0.0,
+            "curriculum_mix": 0.0,
+        }
     if study == "policies":
         return ablation_space(seed, repeats) | {
             "variant": tune.grid_search(["flat", "shared"]),
@@ -153,6 +161,9 @@ class PopulationMember(tune.Trainable):
         policy = config.get("policy", "flat")
         if policy not in {"flat", "shared"}:
             raise ValueError("Unknown policy architecture.")
+        encoding = config.get("encoding", "hash")
+        if encoding not in {"hash", "tree"} or (encoding == "tree" and policy != "shared"):
+            raise ValueError("Structured observations require the shared policy.")
         self.scope = config.get("scope", "run")
         self.build = fingerprint(self.scope)
         self.recoveries = []
@@ -179,7 +190,7 @@ class PopulationMember(tune.Trainable):
             gae_lambda=config.get("gae_lambda", 0.95),
             clip_range=config.get("clip_range", 0.2),
             policy_kwargs=(
-                {"width": config.get("width", 64)}
+                {"width": config.get("width", 64), "encoding": encoding}
                 if policy == "shared"
                 else {"net_arch": {"pi": [64], "vf": [64]}}
             ),
@@ -222,6 +233,7 @@ class PopulationMember(tune.Trainable):
             scope=self.scope,
             max_steps=4096 if self.scope == "run" else 256,
             signals=self.signals if training else None,
+            encoding=self.config.get("encoding", "hash"),
         )
 
     def train_iteration(self):
@@ -350,6 +362,8 @@ class PopulationMember(tune.Trainable):
             actual == "shared" and self.model.policy.width != config.get("width", 64)
         ):
             raise ValueError("Checkpoint policy architecture does not match the configuration.")
+        if getattr(self.model.policy, "encoding", "hash") != config.get("encoding", "hash"):
+            raise ValueError("Checkpoint observation encoding does not match the configuration.")
         self.signals.configure(config)
         self.model.learning_rate = config["learning_rate"]
         self.model.lr_schedule = FloatSchedule(config["learning_rate"])
@@ -390,6 +404,7 @@ def run(
     repeats=1,
     policy="flat",
     width=64,
+    encoding="hash",
 ):
     if not 0 < minutes <= 30:
         raise ValueError("This pilot supports a budget of at most 30 minutes.")
@@ -399,16 +414,21 @@ def run(
         raise ValueError("Unknown episode scope.")
     if policy not in {"flat", "shared"} or not isinstance(width, int) or width < 1:
         raise ValueError("Invalid policy architecture or width.")
+    if encoding not in {"hash", "tree"} or (encoding == "tree" and policy != "shared"):
+        raise ValueError("Structured observations require the shared policy.")
     if resume and checkpoint:
         raise ValueError("Choose either interrupted-experiment recovery or a starting checkpoint.")
-    if experiment not in {"pbt", "ablation", "policy_ablation"}:
+    if experiment not in {"pbt", "ablation", "policy_ablation", "encoding_ablation"}:
         raise ValueError("Unknown experiment.")
     if experiment != "pbt" and checkpoint:
         raise ValueError("The ablation requires identical fresh model initialisations.")
     resources = budget().report(workers)
-    report_name = {"pbt": "pilot", "ablation": "ablation", "policy_ablation": "policies"}[
-        experiment
-    ]
+    studies = {
+        "ablation": "signals",
+        "policy_ablation": "policies",
+        "encoding_ablation": "encodings",
+    }
+    report_name = {"pbt": "pilot", "ablation": "ablation"}.get(experiment, studies.get(experiment))
     report_path = ROOT / f"artifacts/validation/{report_name}.json"
     report = {
         "scope": scope,
@@ -470,9 +490,7 @@ def run(
             tuner = tune.Tuner.restore(str(Path(resume).resolve()), trainable=trainable)
         else:
             scheduler = None
-            parameters = ablation_space(
-                seed, repeats, "policies" if experiment == "policy_ablation" else "signals"
-            )
+            parameters = ablation_space(seed, repeats, studies.get(experiment, "signals"))
             if experiment == "pbt":
                 scheduler = PopulationBasedTraining(
                     time_attr="training_iteration",
@@ -488,6 +506,7 @@ def run(
                     "seed": tune.randint(1, 2**30),
                     "policy": policy,
                     "width": width,
+                    "encoding": encoding,
                 }
             tuner = tune.Tuner(
                 trainable,

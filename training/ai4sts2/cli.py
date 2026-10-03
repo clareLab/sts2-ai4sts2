@@ -38,6 +38,7 @@ def main():
     pilot.add_argument("--checkpoint", help="Start another bounded pilot from a saved model.")
     pilot.add_argument("--policy", choices=("flat", "shared"), default="flat")
     pilot.add_argument("--width", type=int, default=64)
+    pilot.add_argument("--encoding", choices=("hash", "tree"), default="hash")
     pilot.add_argument(
         "--workers", type=int, default=0, help="Concurrent trials; zero selects automatically."
     )
@@ -47,7 +48,9 @@ def main():
     ablation.add_argument("--steps", type=int, default=256)
     ablation.add_argument("--seed", type=int, default=0)
     ablation.add_argument("--repeats", type=int, default=1)
-    ablation.add_argument("--study", choices=("signals", "policies"), default="signals")
+    ablation.add_argument(
+        "--study", choices=("signals", "policies", "encodings"), default="signals"
+    )
     ablation.add_argument(
         "--workers", type=int, default=0, help="Concurrent trials; zero selects automatically."
     )
@@ -101,6 +104,8 @@ def main():
                         if args.command == "pilot"
                         else "policy_ablation"
                         if args.study == "policies"
+                        else "encoding_ablation"
+                        if args.study == "encodings"
                         else "ablation"
                     ),
                     getattr(args, "seed", 0),
@@ -108,6 +113,7 @@ def main():
                     getattr(args, "repeats", 1),
                     getattr(args, "policy", "flat"),
                     getattr(args, "width", 64),
+                    getattr(args, "encoding", "hash"),
                 ),
                 indent=2,
             )

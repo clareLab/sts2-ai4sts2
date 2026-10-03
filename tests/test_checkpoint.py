@@ -7,7 +7,7 @@ from ai4sts2.train import PopulationMember
 from test_environment import FakeWorker
 
 
-def member(monkeypatch, learning_rate=0.0003, entropy=0.01, policy="flat"):
+def member(monkeypatch, learning_rate=0.0003, entropy=0.01, policy="flat", encoding="hash"):
     import ai4sts2.train as training
 
     monkeypatch.setattr(training, "fingerprint", lambda *_: {"game": "test", "schema": 1})
@@ -24,6 +24,7 @@ def member(monkeypatch, learning_rate=0.0003, entropy=0.01, policy="flat"):
         "entropy": entropy,
         "seed": 5,
         "policy": policy,
+        "encoding": encoding,
     }
     instance.setup(instance.config)
     return instance
@@ -87,3 +88,25 @@ def test_reused_actor_starts_an_independent_candidate(monkeypatch):
     assert instance.model.num_timesteps == 0
     assert instance.environment.game is not old_worker
     instance.cleanup()
+
+
+def test_structured_member_resumes_optimizer_and_unfinished_episode(monkeypatch, tmp_path):
+    donor = member(monkeypatch, policy="shared", encoding="tree")
+    receiver = member(monkeypatch, policy="shared", encoding="tree")
+    incompatible = member(monkeypatch, policy="shared")
+    try:
+        donor.model.learn(total_timesteps=64)
+        donor.save_checkpoint(tmp_path)
+        receiver.load_checkpoint(tmp_path)
+        donor.model.learn(total_timesteps=64, reset_num_timesteps=False)
+        receiver.load_checkpoint(tmp_path)
+        receiver.model.learn(total_timesteps=64, reset_num_timesteps=False)
+        for key, weight in donor.model.policy.state_dict().items():
+            torch.testing.assert_close(
+                weight, receiver.model.policy.state_dict()[key], rtol=0, atol=0
+            )
+        with pytest.raises(ValueError, match="encoding"):
+            incompatible.load_checkpoint(tmp_path)
+    finally:
+        for instance in (donor, receiver, incompatible):
+            instance.cleanup()

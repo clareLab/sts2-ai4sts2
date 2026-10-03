@@ -6,9 +6,13 @@ from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPo
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from torch import nn
 
+from ai4sts2.encoding import TreeFeatures
+
 
 class ActionFeatures(BaseFeaturesExtractor):
     def __init__(self, observation_space):
+        self.state_size = observation_space["state"].shape[0]
+        self.action_count, self.action_size = observation_space["actions"].shape
         super().__init__(
             observation_space,
             sum(math.prod(space.shape) for space in observation_space.spaces.values()),
@@ -19,10 +23,10 @@ class ActionFeatures(BaseFeaturesExtractor):
 
 
 class ActionNetwork(nn.Module):
-    def __init__(self, observation_space, width):
+    def __init__(self, extractor, width):
         super().__init__()
-        self.state_size = observation_space["state"].shape[0]
-        self.action_count, self.action_size = observation_space["actions"].shape
+        self.state_size = extractor.state_size
+        self.action_count, self.action_size = extractor.action_count, extractor.action_size
         self.latent_dim_pi = self.latent_dim_vf = width
         self.state_encoder = nn.Sequential(nn.Linear(self.state_size, width), nn.Tanh())
         self.action_encoder = nn.Sequential(nn.Linear(self.action_size, width), nn.Tanh())
@@ -60,16 +64,22 @@ class SharedCategorical(MaskableCategoricalDistribution):
 
 
 class SharedActionPolicy(MaskableMultiInputActorCriticPolicy):
-    def __init__(self, *args, width=64, **kwargs):
+    def __init__(self, *args, width=64, encoding="hash", **kwargs):
         if not isinstance(width, int) or width < 1:
             raise ValueError("Use a positive network width.")
         self.width = width
-        kwargs["features_extractor_class"] = ActionFeatures
+        if encoding not in {"hash", "tree"}:
+            raise ValueError("Unknown observation encoding.")
+        self.encoding = encoding
+        kwargs["features_extractor_class"] = TreeFeatures if encoding == "tree" else ActionFeatures
         super().__init__(*args, **kwargs)
 
     def _build_mlp_extractor(self):
-        self.mlp_extractor = ActionNetwork(self.observation_space, self.width).to(self.device)
+        self.mlp_extractor = ActionNetwork(self.features_extractor, self.width).to(self.device)
         self.action_dist = SharedCategorical(self.action_space.n)
 
     def _get_constructor_parameters(self):
-        return super()._get_constructor_parameters() | {"width": self.width}
+        return super()._get_constructor_parameters() | {
+            "width": self.width,
+            "encoding": self.encoding,
+        }

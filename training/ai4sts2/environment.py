@@ -10,6 +10,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from ai4sts2.encoding import ACTION_NODES, NODE_SIZE, STATE_NODES, tree
 from ai4sts2.execution import REFERENCE
 from ai4sts2.game import OfficialGame
 from ai4sts2.metrics import summarise
@@ -79,13 +80,20 @@ def visible_observation(state):
     return observation
 
 
-def encode(state):
+def encode(state, encoding="hash"):
+    if encoding not in {"hash", "tree"}:
+        raise ValueError("Unknown observation encoding.")
     actions = state["actions"]
     if len(actions) > MAX_ACTIONS:
         raise ValueError(f"Action capacity exceeded: {len(actions)} > {MAX_ACTIONS}")
     if not actions and not state["terminated"]:
         raise ValueError("Non-terminal state has no legal action.")
     observation = visible_observation(state)
+    if encoding == "tree":
+        matrix = np.zeros((MAX_ACTIONS, ACTION_NODES, NODE_SIZE), dtype=np.float32)
+        for index, action in enumerate(actions):
+            matrix[index] = tree(public_fields(action), ACTION_NODES)
+        return {"state": tree(observation, STATE_NODES), "actions": matrix}
     matrix = np.zeros((MAX_ACTIONS, ACTION_FEATURES), dtype=np.float32)
     for index, action in enumerate(actions):
         matrix[index] = features(public_fields(action), ACTION_FEATURES)
@@ -115,10 +123,12 @@ class Sts2Env(gym.Env):
         execution=REFERENCE,
         scope="first_combat",
         signals=None,
+        encoding="hash",
     ):
         super().__init__()
         if scope not in {"run", "first_combat"}:
             raise ValueError("Unknown episode scope.")
+        self.set_encoding(encoding)
         self.game = (
             worker_factory(executable, execution=execution)
             if worker_factory is OfficialGame
@@ -136,10 +146,23 @@ class Sts2Env(gym.Env):
         self.journal = None
         self.completed = []
         self.action_space = spaces.Discrete(MAX_ACTIONS)
+
+    def set_encoding(self, encoding):
+        if encoding not in {"hash", "tree"}:
+            raise ValueError("Unknown observation encoding.")
+        if getattr(self, "encoding", None) == encoding:
+            return
+        self.encoding = encoding
+        state_shape, action_shape = (
+            ((STATE_NODES, NODE_SIZE), (MAX_ACTIONS, ACTION_NODES, NODE_SIZE))
+            if encoding == "tree"
+            else ((STATE_FEATURES,), (MAX_ACTIONS, ACTION_FEATURES))
+        )
+        limit = np.inf if encoding == "tree" else 1
         self.observation_space = spaces.Dict(
             {
-                "state": spaces.Box(-1, 1, (STATE_FEATURES,), dtype=np.float32),
-                "actions": spaces.Box(-1, 1, (MAX_ACTIONS, ACTION_FEATURES), dtype=np.float32),
+                "state": spaces.Box(-limit, limit, state_shape, dtype=np.float32),
+                "actions": spaces.Box(-limit, limit, action_shape, dtype=np.float32),
             }
         )
 
@@ -179,7 +202,7 @@ class Sts2Env(gym.Env):
 
     def encode(self):
         started = time.perf_counter()
-        observation = encode(self.state)
+        observation = encode(self.state, self.encoding)
         self.encoding_seconds += time.perf_counter() - started
         return observation
 
@@ -231,6 +254,7 @@ class Sts2Env(gym.Env):
         return copy.deepcopy(
             {
                 "scope": self.scope,
+                "encoding": self.encoding,
                 "max_steps": self.max_steps,
                 "journal": self.journal,
                 "completed": self.completed,
@@ -242,6 +266,8 @@ class Sts2Env(gym.Env):
     def restore(self, snapshot):
         if snapshot["scope"] != self.scope or snapshot["max_steps"] != self.max_steps:
             raise ValueError("Checkpoint episode scope or step limit does not match.")
+        if snapshot.get("encoding", "hash") != self.encoding:
+            raise ValueError("Checkpoint observation encoding does not match.")
         journal = snapshot["journal"]
         if journal is None:
             self.state = None

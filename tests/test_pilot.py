@@ -104,3 +104,22 @@ def test_policy_ablation_keeps_rewards_and_hyperparameters_paired():
     assert common[0]["rnd_scale"] == common[0]["curriculum_mix"] == 0
     with pytest.raises(ValueError, match="Unknown ablation study"):
         ablation_space(7, study="unknown")
+
+
+def test_encoding_ablation_changes_only_input_representation():
+    from ray.tune.search.variant_generator import generate_variants
+
+    variants = [
+        spec["config"]
+        for _, spec in generate_variants({"config": ablation_space(7, 3, "encodings")})
+    ]
+    assert {(v["encoding"], v["seed"]) for v in variants} == {
+        (encoding, seed) for encoding in ("hash", "tree") for seed in (7, 8, 9)
+    }
+    common = [
+        {key: value for key, value in v.items() if key not in {"variant", "encoding", "seed"}}
+        for v in variants
+    ]
+    assert all(config == common[0] for config in common)
+    assert common[0]["policy"] == "shared"
+    assert common[0]["rnd_scale"] == common[0]["curriculum_mix"] == 0

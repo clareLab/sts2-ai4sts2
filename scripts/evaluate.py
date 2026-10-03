@@ -181,9 +181,11 @@ def run(study_path, output, minutes=25, per_character=4, workers=0):
                 )
                 with lock:
                     environments.append(local.environment)
-            record["episode"] = episode(
-                local.models[candidate["name"]], local.environment, case, deadline
+            model = local.models[candidate["name"]]
+            local.environment.set_encoding(
+                getattr(model.policy, "encoding", "hash") if model is not None else "hash"
             )
+            record["episode"] = episode(model, local.environment, case, deadline)
         except Exception as error:
             if getattr(local, "environment", None) is not None:
                 local.environment.close()

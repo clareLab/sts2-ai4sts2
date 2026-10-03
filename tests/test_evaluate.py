@@ -154,3 +154,25 @@ def test_corrupt_cache_fails_before_starting_game(suite):
     with pytest.raises(ValueError, match="Cached episode"):
         holdout.run(study, output, per_character=1)
     assert len(environments) == count
+
+
+def test_evaluation_switches_encoding_without_restarting_game(suite, monkeypatch):
+    from types import SimpleNamespace
+
+    study, output, environments = suite
+    observed = []
+
+    class Policy:
+        policy = SimpleNamespace(encoding="tree")
+
+        def predict(self, observation, deterministic, action_masks):
+            observed.append(observation["state"].ndim)
+            assert observation["state"].ndim == 2
+            return int(action_masks.sum()) - 1, None
+
+    monkeypatch.setattr(holdout.MaskablePPO, "load", lambda *_args, **_kwargs: Policy())
+    result = holdout.run(study, output, per_character=1, workers=1)
+    assert result["complete"] and result["eligible"]
+    assert len(observed) == 20
+    assert len(environments) == 1
+    assert environments[0].game.closed
