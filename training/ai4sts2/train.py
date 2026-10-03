@@ -287,6 +287,8 @@ class PopulationMember(tune.Trainable):
             max_steps=4096 if self.scope == "run" else 256,
             signals=self.signals if training else None,
             encoding=self.config.get("encoding", "hash"),
+            discount=self.config.get("gamma", 0.99),
+            progress_scale=self.config.get("progress_scale", 0.0) if training else 0.0,
         )
 
     def train_iteration(self):
@@ -426,6 +428,7 @@ class PopulationMember(tune.Trainable):
             group["lr"] = config["learning_rate"]
         self.model.ent_coef = config["entropy"]
         self.model.gamma = config.get("gamma", self.model.gamma)
+        self.environment.configure_reward(self.model.gamma, config.get("progress_scale", 0.0))
         self.model.gae_lambda = config.get("gae_lambda", self.model.gae_lambda)
         self.model.rollout_buffer.gamma = self.model.gamma
         self.model.rollout_buffer.gae_lambda = self.model.gae_lambda

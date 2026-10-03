@@ -111,6 +111,15 @@ def state_digest(state):
     return hashlib.sha256(json.dumps(visible, sort_keys=True).encode()).hexdigest()
 
 
+def floor_potential(state):
+    if state["terminated"]:
+        return 0.0
+    floor = state["observation"]["floor"]
+    if not isinstance(floor, int) or isinstance(floor, bool) or floor < 0:
+        raise ValueError("Invalid visible floor.")
+    return floor / (1 + floor)
+
+
 class Sts2Env(gym.Env):
     metadata = {"render_modes": []}
 
@@ -124,10 +133,13 @@ class Sts2Env(gym.Env):
         scope="first_combat",
         signals=None,
         encoding="hash",
+        discount=0.99,
+        progress_scale=0.0,
     ):
         super().__init__()
         if scope not in {"run", "first_combat"}:
             raise ValueError("Unknown episode scope.")
+        self.configure_reward(discount, progress_scale)
         self.set_encoding(encoding)
         self.game = (
             worker_factory(executable, execution=execution)
@@ -146,6 +158,14 @@ class Sts2Env(gym.Env):
         self.journal = None
         self.completed = []
         self.action_space = spaces.Discrete(MAX_ACTIONS)
+
+    def configure_reward(self, discount, progress_scale):
+        if not math.isfinite(discount) or not 0 < discount <= 1:
+            raise ValueError("Invalid reward discount.")
+        if not math.isfinite(progress_scale) or progress_scale < 0:
+            raise ValueError("Invalid progress reward scale.")
+        self.discount = float(discount)
+        self.progress_scale = float(progress_scale)
 
     def set_encoding(self, encoding):
         if encoding not in {"hash", "tree"}:
@@ -220,6 +240,7 @@ class Sts2Env(gym.Env):
             or not 0 <= action < len(self.state["actions"])
         ):
             raise ValueError("Illegal action.")
+        potential = floor_potential(self.state) if self.progress_scale else 0.0
         self.state = self.game.request(
             "step", {"revision": self.state["revision"], "action": action}
         )
@@ -244,6 +265,12 @@ class Sts2Env(gym.Env):
         if terminated or truncated:
             self.completed.append(info.copy())
             info["episode"] = {"r": reward, "l": self.steps}
+        if self.progress_scale:
+            progress_reward = self.progress_scale * (
+                self.discount * floor_potential(self.state) - potential
+            )
+            info["progress_reward"] = progress_reward
+            reward += progress_reward
         if self.signals is not None:
             bonus = self.signals.observe(self.state, info, terminated or truncated)
             info["intrinsic_reward"] = bonus
@@ -256,6 +283,7 @@ class Sts2Env(gym.Env):
                 "scope": self.scope,
                 "encoding": self.encoding,
                 "max_steps": self.max_steps,
+                "reward": {"discount": self.discount, "progress_scale": self.progress_scale},
                 "journal": self.journal,
                 "completed": self.completed,
                 "rng": self.rng.bit_generator.state,
@@ -268,6 +296,7 @@ class Sts2Env(gym.Env):
             raise ValueError("Checkpoint episode scope or step limit does not match.")
         if snapshot.get("encoding", "hash") != self.encoding:
             raise ValueError("Checkpoint observation encoding does not match.")
+        self.configure_reward(**snapshot["reward"])
         journal = snapshot["journal"]
         if journal is None:
             self.state = None

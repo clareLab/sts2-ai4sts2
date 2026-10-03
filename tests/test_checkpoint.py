@@ -37,7 +37,13 @@ def test_pbt_restores_weights_and_optimizer_then_applies_mutations(monkeypatch, 
     donor.save_checkpoint(str(tmp_path))
     assert json.loads((tmp_path / "evaluation.json").read_text()) == donor.evaluation
     receiver = member(monkeypatch, learning_rate=0.001, entropy=0.03)
-    receiver.config |= {"gamma": 0.97, "gae_lambda": 0.9, "clip_range": 0.15, "epochs": 4}
+    receiver.config |= {
+        "gamma": 0.97,
+        "gae_lambda": 0.9,
+        "clip_range": 0.15,
+        "epochs": 4,
+        "progress_scale": 0.5,
+    }
     receiver.load_checkpoint(str(tmp_path))
     for key, weight in donor.model.policy.state_dict().items():
         assert torch.equal(weight, receiver.model.policy.state_dict()[key])
@@ -47,6 +53,11 @@ def test_pbt_restores_weights_and_optimizer_then_applies_mutations(monkeypatch, 
     assert all(group["lr"] == 0.001 for group in receiver.model.policy.optimizer.param_groups)
     assert receiver.model.num_timesteps == donor.model.num_timesteps
     assert receiver.model.gamma == receiver.model.rollout_buffer.gamma == 0.97
+    assert receiver.environment.discount == 0.97
+    assert receiver.environment.progress_scale == 0.5
+    validation = receiver.open_environment(training=False)
+    assert validation.progress_scale == 0
+    validation.close()
     assert receiver.model.gae_lambda == receiver.model.rollout_buffer.gae_lambda == 0.9
     assert receiver.model.clip_range(0.5) == 0.15
     assert receiver.model.n_epochs == 4

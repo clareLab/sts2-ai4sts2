@@ -57,8 +57,13 @@ def test_validation_and_iteration_boundaries_preserve_an_unfinished_run(monkeypa
     candidate.cleanup()
 
 
-def test_checkpoint_continues_identical_actions_weights_and_seed_stream(monkeypatch, tmp_path):
+@pytest.mark.parametrize("progress_scale", [0.0, 1.0])
+def test_checkpoint_continues_identical_actions_weights_and_seed_stream(
+    monkeypatch, tmp_path, progress_scale
+):
     donor = long_member(monkeypatch, tmp_path / "donor")
+    donor.config |= {"gamma": 1.0, "progress_scale": progress_scale}
+    donor.apply_parameters(donor.config)
     donor.model.learn(total_timesteps=64)
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
@@ -71,6 +76,7 @@ def test_checkpoint_continues_identical_actions_weights_and_seed_stream(monkeypa
     expected_actions = [call for call in donor.environment.game.calls if call[0] == "step"]
     donor.cleanup()
     receiver = long_member(monkeypatch, tmp_path / "receiver")
+    receiver.config |= {"gamma": 1.0, "progress_scale": progress_scale}
     receiver.load_checkpoint(checkpoint)
     assert receiver.environment.steps == 64
     assert receiver.model.num_timesteps == 64
