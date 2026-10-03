@@ -8,6 +8,7 @@ version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 authors = [{ name = "clareLab", email = "yaho@clarelab.moe" }]
 dependencies = [
+    "filelock>=4,<5",
     "matplotlib>=3.10,<4",
     "ray[tune]>=2.49,<3",
     "sb3-contrib>=2.7,<3",

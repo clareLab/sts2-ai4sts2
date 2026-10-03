@@ -8,6 +8,7 @@ class Execution:
     step_frames: int = 2
     non_interactive: bool = False
     fixed_fps: int = 0
+    pause_idle: bool = True
 
     def __post_init__(self):
         if self.fps < 0 or self.settle_frames < 1 or self.step_frames < 1 or self.fixed_fps < 0:
@@ -17,10 +18,11 @@ class Execution:
         return asdict(self)
 
 
-REFERENCE = Execution()
+REFERENCE = Execution(pause_idle=False)
 CANDIDATES = (
-    Execution(fps=240),
     Execution(fps=0, fixed_fps=60),
+    Execution(fps=240),
+    Execution(),
     Execution(fps=0, fixed_fps=60, settle_frames=1, step_frames=1),
     Execution(fps=0, fixed_fps=60, non_interactive=True),
 )

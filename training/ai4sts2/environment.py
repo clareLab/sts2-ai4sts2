@@ -2,7 +2,9 @@ import copy
 import hashlib
 import json
 import math
+import tempfile
 import time
+from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
@@ -404,6 +406,13 @@ def fingerprint(scope="first_combat"):
 
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2) + "\n")
-    temporary.replace(path)
+    with tempfile.NamedTemporaryFile(
+        mode="w", dir=path.parent, prefix=path.name, delete=False
+    ) as stream:
+        temporary = stream.name
+        try:
+            stream.write(json.dumps(value, indent=2) + "\n")
+            stream.close()
+            Path(temporary).replace(path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)

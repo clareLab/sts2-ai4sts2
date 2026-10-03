@@ -71,3 +71,15 @@ def test_ablation_changes_one_factor_and_uses_identical_initialisation():
         (0.001, 0),
         (0, 0.75),
     ]
+
+
+def test_repeated_ablation_pairs_all_variants_with_each_model_seed():
+    from ray.tune.search.variant_generator import generate_variants
+
+    variants = [spec["config"] for _, spec in generate_variants({"config": ablation_space(7, 3)})]
+    assert len(variants) == 9
+    assert {(v["seed"], v["variant"]) for v in variants} == {
+        (seed, name) for seed in (7, 8, 9) for name in ("control", "exploration", "curriculum")
+    }
+    with pytest.raises(ValueError):
+        ablation_space(7, 0)

@@ -5,7 +5,7 @@ using MegaCrit.Sts2.Core.Saves;
 
 namespace ai4sts2;
 
-internal sealed record ExecutionOptions(int Fps = 60, int SettleFrames = 3, int StepFrames = 2, bool NonInteractive = false)
+internal sealed record ExecutionOptions(int Fps = 60, int SettleFrames = 3, int StepFrames = 2, bool NonInteractive = false, bool PauseIdle = true)
 {
     internal static ExecutionOptions Load(JsonSerializerOptions json)
     {

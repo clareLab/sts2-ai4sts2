@@ -6,9 +6,12 @@ import random
 import time
 from pathlib import Path
 
+from filelock import FileLock
+
 from ai4sts2.environment import CHARACTERS, fingerprint, probe_action, seed_string, write_json
 from ai4sts2.execution import CANDIDATES, REFERENCE, Execution
 from ai4sts2.game import ROOT, OfficialGame, prepare_game
+from ai4sts2.resources import capacity
 
 
 def hardware():
@@ -23,27 +26,11 @@ def hardware():
             ),
             cpu,
         )
-    quotas = []
-    cgroup = Path("/proc/self/cgroup")
-    if cgroup.is_file():
-        relative = next(
-            (line[3:] for line in cgroup.read_text().splitlines() if line.startswith("0::")), ""
-        )
-        root = Path("/sys/fs/cgroup")
-        directory = root / relative.lstrip("/")
-        for parent in (directory, *directory.parents):
-            if parent == root.parent:
-                break
-            limit = parent / "cpu.max"
-            if limit.is_file():
-                quota, period = limit.read_text().split()
-                if quota != "max":
-                    quotas.append(int(quota) / int(period))
     return {
         "machine": platform.machine(),
         "model": cpu,
         "cpus": os.cpu_count(),
-        "cpu_quota": min(quotas, default=None),
+        "cpu_capacity": capacity(available=False)[0],
         "system": platform.system(),
     }
 
@@ -232,6 +219,11 @@ def selected_execution(scope="first_combat"):
 
 
 def quarantine_execution(execution, error, scope="first_combat"):
+    with FileLock(ROOT / "artifacts/runtime.lock", timeout=30):
+        return quarantine_locked(execution, error, scope)
+
+
+def quarantine_locked(execution, error, scope):
     report = cached_report(scope)
     if report is None:
         raise RuntimeError(

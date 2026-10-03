@@ -52,3 +52,37 @@ def test_pbt_mutations_remain_within_valid_parameter_domains():
     assert 0 < result["gae_lambda"] < 1
     for key, domain in search_space().items():
         assert domain.is_valid(result[key])
+
+
+def test_concurrent_recovery_retains_every_failed_execution(monkeypatch, tmp_path):
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+
+    import ai4sts2.calibration as calibration
+    from ai4sts2.environment import write_json
+
+    path = tmp_path / "artifacts/runtime.json"
+    candidates = [Execution(fps=fps) for fps in (60, 120, 240)]
+    write_json(
+        path,
+        {
+            "results": [
+                {"execution": execution.to_dict(), "valid": True, "seconds": index + 1}
+                for index, execution in enumerate(candidates)
+            ]
+        },
+    )
+    monkeypatch.setattr(calibration, "ROOT", tmp_path)
+    monkeypatch.setattr(calibration, "cached_report", lambda _: json.loads(path.read_text()))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(
+            pool.map(
+                lambda execution: calibration.quarantine_execution(
+                    execution, RuntimeError("failed")
+                ),
+                candidates[:2],
+            )
+        )
+    saved = json.loads(path.read_text())
+    assert all("runtime_failure" in result for result in saved["results"][:2])
+    assert saved["selected"] == candidates[2].to_dict()

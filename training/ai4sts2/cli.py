@@ -36,11 +36,18 @@ def main():
     pilot.add_argument("--scope", choices=("run", "first_combat"), default="run")
     pilot.add_argument("--resume", help="Recover an interrupted Ray experiment.")
     pilot.add_argument("--checkpoint", help="Start another bounded pilot from a saved model.")
+    pilot.add_argument(
+        "--workers", type=int, default=0, help="Concurrent trials; zero selects automatically."
+    )
     ablation = commands.add_parser("ablate")
     ablation.add_argument("--minutes", type=float, default=20)
     ablation.add_argument("--iterations", type=int, default=2)
     ablation.add_argument("--steps", type=int, default=256)
     ablation.add_argument("--seed", type=int, default=0)
+    ablation.add_argument("--repeats", type=int, default=1)
+    ablation.add_argument(
+        "--workers", type=int, default=0, help="Concurrent trials; zero selects automatically."
+    )
     ablation.add_argument("--scope", choices=("run", "first_combat"), default="run")
     args = parser.parse_args()
     if args.command == "baseline":
@@ -88,6 +95,8 @@ def main():
                     args.scope,
                     "pbt" if args.command == "pilot" else "ablation",
                     getattr(args, "seed", 0),
+                    args.workers,
+                    getattr(args, "repeats", 1),
                 ),
                 indent=2,
             )

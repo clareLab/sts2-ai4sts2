@@ -17,7 +17,7 @@ namespace ai4sts2;
 
 internal static class Worker
 {
-    private static readonly ConcurrentQueue<string> Requests = new();
+    private static readonly BlockingCollection<string> Requests = new();
     private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
     private static readonly ExecutionOptions Execution = ExecutionOptions.Load(Json);
     private static readonly bool AuditEnabled = System.Environment.GetEnvironmentVariable("AI4STS2_AUDIT") == "1";
@@ -43,14 +43,14 @@ internal static class Worker
         Tree.ProcessFrame += Tick;
         _ = Task.Run(async () =>
         {
-            while (await Console.In.ReadLineAsync() is { } line) Requests.Enqueue(line);
-            Requests.Enqueue("{\"id\":\"eof\",\"method\":\"close\"}");
+            while (await Console.In.ReadLineAsync() is { } line) Requests.Add(line);
+            Requests.Add("{\"id\":\"eof\",\"method\":\"close\"}");
         });
     }
 
     private static void Tick()
     {
-        if (_pending is { IsCompleted: false } || !Requests.TryDequeue(out var line)) return;
+        if (_pending is { IsCompleted: false } || !Requests.TryTake(out var line, Execution.PauseIdle ? Timeout.Infinite : 0)) return;
         _pending = Handle(line);
     }
 

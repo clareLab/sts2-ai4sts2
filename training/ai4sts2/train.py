@@ -21,6 +21,7 @@ from ai4sts2.environment import Sts2Env, evaluate, fingerprint, write_json
 from ai4sts2.execution import Execution
 from ai4sts2.game import ROOT, WorkerFailure, prepare_game
 from ai4sts2.metrics import compare_evaluations, summarise
+from ai4sts2.resources import TRIAL_MEMORY, budget
 from ai4sts2.signals import TrainingSignals
 
 
@@ -73,10 +74,12 @@ def mutation_space():
     }
 
 
-def ablation_space(seed):
+def ablation_space(seed, repeats=1):
+    if repeats < 1:
+        raise ValueError("Use at least one model initialisation.")
     return {
         "variant": tune.grid_search(["control", "exploration", "curriculum"]),
-        "seed": seed,
+        "seed": tune.grid_search(list(range(seed, seed + repeats))),
         "learning_rate": 0.0003,
         "entropy": 0.01,
         "gamma": 0.99,
@@ -84,10 +87,10 @@ def ablation_space(seed):
         "clip_range": 0.2,
         "epochs": 2,
         "rnd_scale": tune.sample_from(
-            lambda spec: 0.001 if spec.config.variant == "exploration" else 0.0
+            lambda spec: 0.001 if spec["config"]["variant"] == "exploration" else 0.0
         ),
         "curriculum_mix": tune.sample_from(
-            lambda spec: 0.75 if spec.config.variant == "curriculum" else 0.0
+            lambda spec: 0.75 if spec["config"]["variant"] == "curriculum" else 0.0
         ),
         "curriculum_alpha": 0.1,
         "fixed_steps": True,
@@ -355,6 +358,8 @@ def run(
     scope="run",
     experiment="pbt",
     seed=0,
+    workers=0,
+    repeats=1,
 ):
     if not 0 < minutes <= 30:
         raise ValueError("This pilot supports a budget of at most 30 minutes.")
@@ -368,6 +373,7 @@ def run(
         raise ValueError("Unknown experiment.")
     if experiment == "ablation" and checkpoint:
         raise ValueError("The ablation requires identical fresh model initialisations.")
+    resources = budget().report(workers)
     report_path = (
         ROOT / f"artifacts/validation/{'pilot' if experiment == 'pbt' else 'ablation'}.json"
     )
@@ -380,6 +386,7 @@ def run(
         "errors": [],
         "trials": [],
         "experiment": experiment,
+        "resources": resources,
     }
     write_json(report_path, report)
     executable = prepare_game()
@@ -410,14 +417,14 @@ def run(
     if checkpoint:
         checkpoint = str(Path(checkpoint).resolve())
     ray.init(
-        num_cpus=2,
+        num_cpus=resources["concurrent_trials"],
         num_gpus=0,
         include_dashboard=False,
         object_store_memory=100 * 1024 * 1024,
         _node_ip_address="127.0.0.1",
     )
     try:
-        trainable = tune.with_resources(PopulationMember, {"cpu": 2})
+        trainable = tune.with_resources(PopulationMember, {"cpu": 1, "memory": TRIAL_MEMORY})
         experiment_path = (
             Path(resume).resolve()
             if resume
@@ -430,7 +437,7 @@ def run(
             tuner = tune.Tuner.restore(str(Path(resume).resolve()), trainable=trainable)
         else:
             scheduler = None
-            parameters = ablation_space(seed)
+            parameters = ablation_space(seed, repeats)
             if experiment == "pbt":
                 scheduler = PopulationBasedTraining(
                     time_attr="training_iteration",
@@ -440,7 +447,7 @@ def run(
                     burn_in_period=2,
                     hyperparam_mutations=mutation_space(),
                     custom_explore_fn=bound_mutations,
-                    synch=True,
+                    synch=False,
                 )
                 parameters = search_space() | {"seed": tune.randint(1, 2**30)}
             tuner = tune.Tuner(
@@ -449,6 +456,7 @@ def run(
                     scheduler=scheduler,
                     num_samples=2 if experiment == "pbt" else 1,
                     reuse_actors=True,
+                    max_concurrent_trials=resources["concurrent_trials"],
                     time_budget_s=remaining_seconds,
                 ),
                 run_config=tune.RunConfig(
@@ -474,6 +482,7 @@ def run(
         results, interrupted = fit_or_recover(tuner, experiment_path, trainable)
         report = pilot_report(results, scope, fingerprint(scope), baseline, iterations, interrupted)
         report["experiment"] = experiment
+        report["resources"] = resources
         write_json(report_path, report)
         if report["errors"] or (not report["trials"] and not interrupted):
             raise RuntimeError(f"Experiment failed. See {report_path}.")
