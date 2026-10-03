@@ -37,6 +37,11 @@ internal static class CardSelection
 
     internal static Decision[]? Capture(Node screen, RunState run)
     {
+        if (screen is NChooseACardSelectionScreen choice && !Raw)
+        {
+            Reset();
+            return CaptureChoice(choice);
+        }
         Node? owner = NPlayerHand.Instance?.IsInCardSelection == true ? NPlayerHand.Instance : screen is NCardGridSelectionScreen ? screen : null;
         if (owner == null)
         {
@@ -78,6 +83,31 @@ internal static class CardSelection
         if (session.Draft.CanSkip)
             decisions.Add(new Decision("skip_selection", new { kind = "skip_selection" }, () => Complete(session, true)));
         return decisions.ToArray();
+    }
+
+    private static Decision[] CaptureChoice(NChooseACardSelectionScreen screen)
+    {
+        var source = Read<TaskCompletionSource<IEnumerable<CardModel>>>(screen, "_completionSource");
+        if (source.Task.IsCompleted) return [];
+        var decisions = Decisions.Descendants(screen).OfType<NCardHolder>()
+            .Where(h => h is not NPreviewCardHolder && h.CardModel != null && h.IsVisibleInTree() && h.Hitbox.IsEnabled)
+            .Select(h => new Decision($"choose:{h.GetInstanceId()}", new { kind = "choose_card", card = Observation.Card(h.CardModel!) },
+                () => CompleteChoice(source.Task, () => h.EmitSignal(NCardHolder.SignalName.Pressed, h), [h.CardModel!]))).ToList();
+        var skip = Decisions.Descendants(screen).OfType<NChoiceSelectionSkipButton>().SingleOrDefault(b => b.IsEnabled && b.IsVisibleInTree());
+        if (skip != null)
+            decisions.Add(new Decision("skip_selection", new { kind = "skip_selection" }, () => CompleteChoice(source.Task, skip.ForceClick, [])));
+        return decisions.ToArray();
+    }
+
+    private static async Task CompleteChoice(Task<IEnumerable<CardModel>> completion, Action activate, IEnumerable<CardModel> selected)
+    {
+        var timer = Stopwatch.StartNew();
+        while (!completion.IsCompleted)
+        {
+            activate();
+            if (!completion.IsCompleted) await Wait(timer);
+        }
+        if (!(await completion).SequenceEqual(selected)) throw new InvalidOperationException("Native selection returned different cards.");
     }
 
     private static object? Preview(Node owner, CardModel card)
