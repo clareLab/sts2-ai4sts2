@@ -70,6 +70,44 @@ def test_plan_freezes_search_cases_and_rejects_changed_request(study, tmp_path):
         study.prepare_plan(tmp_path / "output", steps=512)
 
 
+def test_two_round_plan_preserves_whole_rollouts_and_freezes_epoch_search(study, tmp_path):
+    frozen = study.prepare_plan(
+        tmp_path / "output", tmp_path / "initial.json", steps=256, iterations=2
+    )
+    assert frozen["iterations"] == 2 and frozen["steps_per_iteration"] == 128
+    assert all(member["epochs"] in (2, 4, 8, 16) for member in frozen["members"].values())
+    assert study.prepare_plan(tmp_path / "output") == frozen
+    with pytest.raises(ValueError, match="different request"):
+        study.prepare_plan(tmp_path / "output", iterations=4)
+
+
+@pytest.mark.parametrize("steps,iterations", [(128, 1), (256, 3), (128, 4)])
+def test_plan_rejects_incomplete_rollouts(study, tmp_path, steps, iterations):
+    with pytest.raises(ValueError, match="whole rollouts"):
+        study.prepare_plan(
+            tmp_path / "output", tmp_path / "initial.json", steps=steps, iterations=iterations
+        )
+
+
+def test_optimiser_mutations_leave_reward_and_curriculum_unchanged(study):
+    config = {
+        "learning_rate": 1.0,
+        "entropy": 0.0,
+        "epochs": 8,
+        "gamma": 1.0,
+        "gae_lambda": 0.95,
+        "clip_range": 0.2,
+        "rnd_scale": 0.0,
+        "curriculum_mix": 0.0,
+        "progress_scale": 0.0,
+    }
+    fixed = {key: value for key, value in config.items() if key not in study.optimiser_space()}
+    result = study.bound_optimiser(config.copy())
+    assert result["epochs"] == 8
+    assert all(domain.is_valid(result[key]) for key, domain in study.optimiser_space().items())
+    assert {key: result[key] for key in fixed} == fixed
+
+
 def test_population_uses_frozen_iteration_size_after_loading_source(study, tmp_path, monkeypatch):
     donor = member(monkeypatch)
     checkpoint = tmp_path / "restored"
@@ -180,6 +218,13 @@ def test_resumed_population_synchronises_after_the_last_saved_round(study, tmp_p
     assert len(calls) == 1 and calls[0]["resume"]
     assert calls[0]["config"] == {}
     assert calls[0]["scheduler"]["burn_in_period"] == 4
+    assert set(calls[0]["scheduler"]["hyperparam_mutations"]) == {
+        "learning_rate",
+        "entropy",
+        "epochs",
+    }
+    assert calls[0]["scheduler"]["hyperparam_mutations"]["epochs"] == [2, 4, 8, 16]
+    assert calls[0]["scheduler"]["custom_explore_fn"] is study.bound_optimiser
     assert calls[0]["max_failures"] == 0
     assert calls[0]["stop"] == {"training_iteration": 4}
 

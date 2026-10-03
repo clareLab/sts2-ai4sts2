@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import random
 import secrets
@@ -18,7 +19,7 @@ from ai4sts2.calibration import calibrate, selected_execution
 from ai4sts2.environment import evaluation_plan, fingerprint, write_json
 from ai4sts2.game import ROOT, prepare_game
 from ai4sts2.resources import TRIAL_MEMORY, budget
-from ai4sts2.train import PopulationMember, bound_mutations, search_space
+from ai4sts2.train import PopulationMember, search_space
 from filelock import FileLock
 from ray import tune
 from ray.tune.schedulers import PopulationBasedTraining
@@ -28,6 +29,23 @@ class StudyMember(PopulationMember):
     def setup(self, config):
         super().setup(config)
         self.sample_count = config["steps_per_iteration"]
+
+
+def optimiser_space():
+    return {key: search_space()[key] for key in ("learning_rate", "entropy")} | {
+        "epochs": tune.choice([2, 4, 8, 16])
+    }
+
+
+def bound_optimiser(config):
+    for key, domain in optimiser_space().items():
+        if hasattr(domain, "lower"):
+            config[key] = min(
+                math.nextafter(domain.upper, domain.lower), max(domain.lower, config[key])
+            )
+        elif not domain.is_valid(config[key]):
+            config[key] = min(domain.categories, key=lambda value: abs(value - config[key]))
+    return config
 
 
 def runner_identity():
@@ -64,13 +82,16 @@ def training_parameters(config):
     return {key: value for key, value in config.items() if key not in ignored}
 
 
-def prepare_plan(output, initial=None, control=None, steps=None, per_character=None):
+def prepare_plan(
+    output, initial=None, control=None, steps=None, per_character=None, iterations=None
+):
     path = output / "plan.json"
     requested = {
         "initial": initial,
         "control": control,
         "steps": steps,
         "per_character": per_character,
+        "iterations": iterations,
     }
     if path.exists():
         plan = json.loads(path.read_text())
@@ -90,10 +111,11 @@ def prepare_plan(output, initial=None, control=None, steps=None, per_character=N
     )
     steps = 3072 if steps is None else steps
     per_character = 2 if per_character is None else per_character
+    iterations = 4 if iterations is None else iterations
     if len(sources) < 2 or len({trial["environment_steps"] for trial in sources}) != 1:
         raise ValueError("Use at least two distinct initialisations at the same step count.")
-    if steps < 256 or steps % 256 or per_character < 1:
-        raise ValueError("Use positive case counts and a training budget divisible by 256.")
+    if iterations < 2 or steps < 64 * iterations or steps % (64 * iterations) or per_character < 1:
+        raise ValueError("Use at least two iterations, whole rollouts and positive case counts.")
     shared = {
         key: value
         for key, value in sources[0]["config"].items()
@@ -122,10 +144,13 @@ def prepare_plan(output, initial=None, control=None, steps=None, per_character=N
         raise ValueError("Fixed controls must preserve the source training parameters.")
     seed = secrets.randbits(31)
     rng = np.random.RandomState(seed)
-    domains = {key: search_space()[key] for key in ("learning_rate", "entropy")}
+    domains = optimiser_space()
     members = {
         str(trial["seed"]): {
-            key: float(domain.sample(random_state=rng)) for key, domain in domains.items()
+            key: int(domain.sample(random_state=rng))
+            if key == "epochs"
+            else float(domain.sample(random_state=rng))
+            for key, domain in domains.items()
         }
         | {"initial_checkpoint": trial["checkpoint"]}
         for trial in sources
@@ -140,10 +165,11 @@ def prepare_plan(output, initial=None, control=None, steps=None, per_character=N
             "control": str(Path(control).resolve()) if control else None,
             "steps": steps,
             "per_character": per_character,
+            "iterations": iterations,
         },
         "target_steps": target,
-        "iterations": 4,
-        "steps_per_iteration": steps // 4,
+        "iterations": iterations,
+        "steps_per_iteration": steps // iterations,
         "search_seed": seed,
         "members": members,
         "cases": evaluation_plan("run", secrets.randbits(60), "test", 4096, per_character),
@@ -247,6 +273,7 @@ def fit_population(experiment, plan, resources, deadline):
                 lambda config: members[str(config["seed"])]["learning_rate"]
             ),
             "entropy": tune.sample_from(lambda config: members[str(config["seed"])]["entropy"]),
+            "epochs": tune.sample_from(lambda config: members[str(config["seed"])]["epochs"]),
             "executable": str(executable),
             "execution": execution.to_dict(),
             "steps_per_iteration": plan["steps_per_iteration"],
@@ -259,8 +286,11 @@ def fit_population(experiment, plan, resources, deadline):
             perturbation_interval=1,
             burn_in_period=completed + 1,
             synch=True,
-            hyperparam_mutations={key: search_space()[key] for key in ("learning_rate", "entropy")},
-            custom_explore_fn=bound_mutations,
+            hyperparam_mutations={
+                key: domain.categories if hasattr(domain, "categories") else domain
+                for key, domain in optimiser_space().items()
+            },
+            custom_explore_fn=bound_optimiser,
         )
         remaining = deadline - time.monotonic()
         if remaining < 5:
@@ -331,7 +361,16 @@ def summary(output, plan, stage, training=None, evaluation=None):
     return result
 
 
-def run(output, initial=None, control=None, steps=None, per_character=None, minutes=30, workers=0):
+def run(
+    output,
+    initial=None,
+    control=None,
+    steps=None,
+    per_character=None,
+    minutes=30,
+    workers=0,
+    iterations=None,
+):
     if not 0 < minutes <= 30:
         raise ValueError("Use a budget between zero and 30 minutes.")
     deadline = (
@@ -340,7 +379,7 @@ def run(output, initial=None, control=None, steps=None, per_character=None, minu
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     with FileLock(output / "run.lock", timeout=0):
-        plan = prepare_plan(output, initial, control, steps, per_character)
+        plan = prepare_plan(output, initial, control, steps, per_character, iterations)
         resources = budget().report(workers)
         experiment = output / "population"
         training = collect_training(experiment, plan)
@@ -427,6 +466,7 @@ if __name__ == "__main__":
     parser.add_argument("--control")
     parser.add_argument("--steps", type=int)
     parser.add_argument("--per-character", type=int)
+    parser.add_argument("--iterations", type=int)
     parser.add_argument("--minutes", type=float, default=30)
     parser.add_argument("--workers", type=int, default=0)
     result = run(**vars(parser.parse_args()))
