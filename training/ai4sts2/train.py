@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import random
 import tempfile
 import time
@@ -57,6 +58,42 @@ def bound_mutations(config):
                 math.nextafter(domain.upper, domain.lower), max(domain.lower, config[name])
             )
     return config
+
+
+def fit_or_recover(tuner, experiment_path, trainable):
+    try:
+        return tuner.fit(), False
+    except KeyboardInterrupt:
+        return tune.Tuner.restore(str(experiment_path), trainable=trainable).get_results(), True
+
+
+def pilot_report(results, scope, build, baseline, iterations, interrupted=False):
+    successful = [result for result in results if not result.error and result.checkpoint]
+    return {
+        "scope": scope,
+        "certifying": False,
+        "promoted": False,
+        "interrupted": interrupted,
+        "complete": bool(results)
+        and not interrupted
+        and len(successful) == len(results)
+        and all(result.metrics.get("training_iteration", 0) >= iterations for result in results),
+        "build": build,
+        "baseline": baseline,
+        "errors": [str(result.error) for result in results if result.error],
+        "trials": [
+            {
+                "path": result.path,
+                "config": result.config,
+                "win_rate": result.metrics.get("validation_win_rate"),
+                "mean_floor": result.metrics.get("validation_mean_floor"),
+                "selection_score": result.metrics.get("validation_selection_score"),
+                "random_baseline_comparison": result.metrics.get("random_baseline_comparison"),
+                "iterations": result.metrics.get("training_iteration"),
+            }
+            for result in successful
+        ],
+    }
 
 
 class PopulationMember(tune.Trainable):
@@ -287,6 +324,7 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
     write_json(ROOT / "artifacts/validation/pilot.json", report)
     executable = prepare_game()
     started = time.monotonic()
+    deadline = min(started + minutes * 60, float(os.environ.get("AI4STS2_DEADLINE", "inf")))
     execution = selected_execution(scope)
     if execution is None:
         calibrate(min(5, minutes / 3), scope)
@@ -294,7 +332,7 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
     if execution is None:
         raise RuntimeError("Execution calibration did not produce a compatible configuration.")
     baseline = random_baseline(
-        minutes=min(5, max(0.001, minutes - (time.monotonic() - started) / 60)),
+        minutes=min(5, max(0.001, (deadline - time.monotonic()) / 60)),
         scope=scope,
         max_steps=4096 if scope == "run" else 256,
     )
@@ -306,7 +344,7 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
             for episode in baseline["episodes"]
         ]
     }
-    remaining_seconds = minutes * 60 - (time.monotonic() - started)
+    remaining_seconds = deadline - time.monotonic() - 10
     if remaining_seconds <= 0:
         raise TimeoutError("The pilot budget was used by calibration and the random baseline.")
     if checkpoint:
@@ -320,6 +358,14 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
     )
     try:
         trainable = tune.with_resources(PopulationMember, {"cpu": 2})
+        experiment_path = (
+            Path(resume).resolve()
+            if resume
+            else ROOT / "artifacts/experiments" / time.strftime("pilot-%Y%m%d-%H%M%S")
+        )
+        remaining_seconds = deadline - time.monotonic() - 10
+        if remaining_seconds <= 0:
+            raise TimeoutError("The pilot has no training time remaining.")
         if resume:
             tuner = tune.Tuner.restore(str(Path(resume).resolve()), trainable=trainable)
         else:
@@ -342,7 +388,7 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
                     time_budget_s=remaining_seconds,
                 ),
                 run_config=tune.RunConfig(
-                    name=time.strftime("pilot-%Y%m%d-%H%M%S"),
+                    name=experiment_path.name,
                     storage_path=str(ROOT / "artifacts/experiments"),
                     stop={"training_iteration": iterations},
                     checkpoint_config=tune.CheckpointConfig(
@@ -362,34 +408,10 @@ def run(minutes=30, iterations=4, steps=128, resume=None, checkpoint=None, scope
                     "baseline": baseline_reference,
                 },
             )
-        results = tuner.fit()
-        successful = [result for result in results if not result.error and result.checkpoint]
-        report = {
-            "scope": scope,
-            "certifying": False,
-            "promoted": False,
-            "complete": len(successful) == len(results)
-            and all(
-                result.metrics.get("training_iteration", 0) >= iterations for result in results
-            ),
-            "build": fingerprint(scope),
-            "baseline": baseline,
-            "errors": [str(result.error) for result in results if result.error],
-            "trials": [
-                {
-                    "path": result.path,
-                    "config": result.config,
-                    "win_rate": result.metrics.get("validation_win_rate"),
-                    "mean_floor": result.metrics.get("validation_mean_floor"),
-                    "selection_score": result.metrics.get("validation_selection_score"),
-                    "random_baseline_comparison": result.metrics.get("random_baseline_comparison"),
-                    "iterations": result.metrics.get("training_iteration"),
-                }
-                for result in successful
-            ],
-        }
+        results, interrupted = fit_or_recover(tuner, experiment_path, trainable)
+        report = pilot_report(results, scope, fingerprint(scope), baseline, iterations, interrupted)
         write_json(ROOT / "artifacts/validation/pilot.json", report)
-        if report["errors"] or not successful:
+        if report["errors"] or (not report["trials"] and not interrupted):
             raise RuntimeError("Pilot failed. See artifacts/validation/pilot.json.")
         return report
     finally:

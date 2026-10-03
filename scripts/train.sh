@@ -14,6 +14,12 @@ print(math.ceil(args.minutes * 60))
 PY
 )
 ./scripts/build.sh
+AI4STS2_DEADLINE=$(python3 - "$ai4sts2_budget" <<'PY'
+import sys, time
+print(time.monotonic() + int(sys.argv[1]))
+PY
+)
+export AI4STS2_DEADLINE
 if command -v systemd-run >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
   exec systemd-run --user --scope --quiet --unit="ai4sts2-pilot-$$" \
     -p CPUQuota=200% -p MemoryHigh=3G -p MemoryMax=4G -p MemorySwapMax=0 -p RuntimeMaxSec=1800 \
