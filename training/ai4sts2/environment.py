@@ -13,7 +13,7 @@ from gymnasium import spaces
 from ai4sts2.encoding import ACTION_NODES, NODE_SIZE, STATE_NODES, tree
 from ai4sts2.execution import REFERENCE
 from ai4sts2.game import OfficialGame
-from ai4sts2.metrics import summarise
+from ai4sts2.metrics import COMBAT_GOALS, health_fraction, summarise
 from ai4sts2.policy import evaluation_action
 
 CHARACTERS = ("IRONCLAD", "SILENT", "REGENT", "NECROBINDER", "DEFECT")
@@ -21,7 +21,7 @@ MAX_ACTIONS = 128
 STATE_FEATURES = 512
 ACTION_FEATURES = 64
 SCHEMA = 4
-SCOPES = ("first_combat", "act1_elite", "act1", "run")
+SCOPES = ("first_combat", *COMBAT_GOALS, "act1", "run")
 VISIBLE_FIELDS = frozenset(
     "character ascension floor act screen player gold deck relics potions energy stars orbs turn "
     "hand draw discard exhaust creatures model type cost upgrades enchantment side hp max_hp "
@@ -122,8 +122,9 @@ def validate_ascension(ascension):
 
 def state_digest(state):
     visible = {key: state[key] for key in ("observation", "actions", "terminated", "victory")}
-    if "act1_elite_wins" in state:
-        visible["act1_elite_wins"] = state["act1_elite_wins"]
+    for field in ("act1_elite_wins", "act1_monster_wins"):
+        if field in state:
+            visible[field] = state[field]
     return hashlib.sha256(json.dumps(visible, sort_keys=True).encode()).hexdigest()
 
 
@@ -236,8 +237,9 @@ class Sts2Env(gym.Env):
         }
         self.state = self.game.request("reset", parameters)
         self.check_ascension(self.state)
-        if self.scope == "act1_elite" and self.elite_wins() != 0:
-            raise ValueError("A new run cannot contain an Act 1 elite victory.")
+        goal = COMBAT_GOALS.get(self.scope)
+        if goal and self.combat_wins(goal[0]) != 0:
+            raise ValueError(f"A new run cannot contain an Act 1 {goal[0]} victory.")
         self.boss_reached = self.state["observation"].get("room") == "Boss"
         self.journal = {
             "parameters": parameters,
@@ -274,8 +276,9 @@ class Sts2Env(gym.Env):
         )
 
     def task_succeeded(self):
-        if self.scope == "act1_elite":
-            return self.elite_wins() >= 1
+        goal = COMBAT_GOALS.get(self.scope)
+        if goal:
+            return self.combat_wins(goal[0]) >= goal[1]
         return bool(
             self.state["terminated"]
             and self.state["victory"]
@@ -284,16 +287,16 @@ class Sts2Env(gym.Env):
             and self.state["observation"]["act"] >= 1
         )
 
-    def elite_wins(self):
-        count = self.state.get("act1_elite_wins")
+    def combat_wins(self, kind):
+        count = self.state.get(f"act1_{kind}_wins")
         if type(count) is not int or count < 0:
-            raise ValueError("Official Act 1 elite victory count is missing or invalid.")
+            raise ValueError(f"Official Act 1 {kind} victory count is missing or invalid.")
         return count
 
     def task_finished(self):
         return bool(
             self.task_succeeded()
-            or self.scope == "act1_elite"
+            or self.scope in COMBAT_GOALS
             and self.state["observation"]["act"] >= 1
         )
 
@@ -324,6 +327,8 @@ class Sts2Env(gym.Env):
         truncated = not terminated and self.steps >= self.max_steps
         victory = bool(self.state["terminated"] and self.state["victory"])
         reward = float(1 if task_success or goal_success else -1) if terminated else 0.0
+        if self.scope == "act1_monsters" and task_success:
+            reward = health_fraction(self.state["observation"]["player"])
         info = {
             "scope": self.scope,
             "ascension": self.ascension,
@@ -340,8 +345,16 @@ class Sts2Env(gym.Env):
             "act": self.state["observation"].get("act"),
             "seed": self.journal["parameters"]["seed"],
         }
-        if "act1_elite_wins" in self.state or self.scope == "act1_elite":
-            info["act1_elite_wins"] = self.elite_wins()
+        goal = COMBAT_GOALS.get(self.scope)
+        for kind in ("elite", "monster"):
+            field = f"act1_{kind}_wins"
+            if field in self.state or goal and goal[0] == kind:
+                info[field] = self.combat_wins(kind)
+        if self.scope == "act1_monsters":
+            info |= {
+                "task_score": reward,
+                "max_hp": self.state["observation"]["player"]["max_hp"],
+            }
         if self.goal_floor is not None:
             info |= {"goal_floor": self.goal_floor, "goal_success": goal_success or victory}
         if terminated or truncated:

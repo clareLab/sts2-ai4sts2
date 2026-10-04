@@ -1,4 +1,18 @@
+import math
 import statistics
+
+COMBAT_GOALS = {"act1_elite": ("elite", 1), "act1_monsters": ("monster", 3)}
+
+
+def health_fraction(player):
+    hp, maximum = player["hp"], player["max_hp"]
+    if (
+        any(type(value) not in (int, float) or not math.isfinite(value) for value in (hp, maximum))
+        or not 0 <= hp <= maximum
+        or maximum <= 0
+    ):
+        raise ValueError("Invalid remaining health.")
+    return hp / maximum
 
 
 def progress(episodes):
@@ -24,12 +38,19 @@ def progress(episodes):
             raise ValueError("A truncated episode cannot be a task success.")
         if episode.get("scope") == "act1" and success != (episode["act"] >= 1):
             raise ValueError("Act 1 success requires entering Act 2.")
-        if "act1_elite_wins" in episode or episode.get("scope") == "act1_elite":
-            count = episode.get("act1_elite_wins")
-            if type(count) is not int or count < 0:
-                raise ValueError("Invalid Act 1 elite victory count.")
-            if episode.get("scope") == "act1_elite" and success != (count >= 1):
-                raise ValueError("Elite task success requires an Act 1 elite victory.")
+        goal = COMBAT_GOALS.get(episode.get("scope"))
+        for kind in ("elite", "monster"):
+            field = f"act1_{kind}_wins"
+            if field in episode or goal and goal[0] == kind:
+                count = episode.get(field)
+                if type(count) is not int or count < 0:
+                    raise ValueError(f"Invalid Act 1 {kind} victory count.")
+                if goal and goal[0] == kind and success != (count >= goal[1]):
+                    raise ValueError("Task success requires the specified combat victories.")
+        if episode.get("scope") == "act1_monsters":
+            score = health_fraction(episode) if success else 0.0 if episode["truncated"] else -1.0
+            if episode.get("task_score") != score:
+                raise ValueError("The task score does not match the combat outcome and health.")
     floors = [episode["floor"] for episode in episodes]
     deaths = [
         e["floor"]
@@ -69,6 +90,13 @@ def progress(episodes):
             "act1_elite_victories": sum(counts),
             "act1_elite_success_rate": sum(count >= 1 for count in counts) / len(counts),
         }
+    if result["scope"] == "act1_monsters":
+        result |= {
+            "mean_task_score": statistics.mean(e["task_score"] for e in episodes),
+            "mean_surviving_health": statistics.mean(
+                health_fraction(e) if e["task_success"] else 0.0 for e in episodes
+            ),
+        }
     return result
 
 
@@ -77,7 +105,9 @@ def summarise(episodes):
     eligible = summary["truncated_episodes"] == summary["curriculum_episodes"] == 0
     return summary | {
         "eligible": eligible,
-        "selection_score": summary["task_success_rate"] if eligible else -1.0,
+        "selection_score": (
+            summary.get("mean_task_score", summary["task_success_rate"]) if eligible else -1.0
+        ),
         "characters": {
             character: progress([e for e in episodes if e["character"] == character])
             for character in sorted({e["character"] for e in episodes})

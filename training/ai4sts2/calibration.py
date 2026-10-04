@@ -49,8 +49,9 @@ def signature(state):
     result = {
         key: state[key] for key in ("observation", "actions", "terminated", "victory", "audit")
     }
-    if "act1_elite_wins" in state:
-        result["act1_elite_wins"] = state["act1_elite_wins"]
+    for field in ("act1_elite_wins", "act1_monster_wins"):
+        if field in state:
+            result[field] = state[field]
     return result
 
 

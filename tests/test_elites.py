@@ -35,7 +35,7 @@ def test_elite_task_requires_a_confirmed_win_and_stops_before_another_action():
     assert report["eligible"] and report["selection_score"] == 1
     assert report["win_rate"] == 0 and report["act1_elite_success_rate"] == 1
     env.reset()
-    assert env.elite_wins() == 0 and not env.task_finished()
+    assert env.combat_wins("elite") == 0 and not env.task_finished()
     env.close()
 
 
@@ -88,7 +88,7 @@ def test_elite_results_are_replayed_but_do_not_change_policy_features():
     second.restore(saved)
     assert first.step(0)[1:] == second.step(0)[1:]
     second.restore(first.snapshot())
-    assert second.elite_wins() == 1
+    assert second.combat_wins("elite") == 1
     with pytest.raises(ValueError, match="Illegal"):
         second.step(0)
     original = state() | {"act1_elite_wins": 0, "audit": "test"}

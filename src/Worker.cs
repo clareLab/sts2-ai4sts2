@@ -30,7 +30,7 @@ internal static class Worker
     private static bool _poisoned;
     private static bool _combatEnded;
     private static bool _combatWon;
-    private static readonly HashSet<CombatRoom> Act1EliteWins = new(ReferenceEqualityComparer.Instance);
+    private static readonly HashSet<CombatRoom> Act1Wins = new(ReferenceEqualityComparer.Instance);
     private static string _scope = "run";
     private static Decision[] _decisions = [];
     private static SceneTree Tree => (SceneTree)Engine.GetMainLoop();
@@ -44,7 +44,7 @@ internal static class Worker
         CombatManager.Instance.CombatWon += room =>
         {
             _combatWon = true;
-            if (_run?.CurrentActIndex == 0 && room.RoomType == RoomType.Elite) Act1EliteWins.Add(room);
+            if (_run?.CurrentActIndex == 0) Act1Wins.Add(room);
         };
         CombatManager.Instance.CombatEnded += _ => _combatEnded = true;
         Tree.ProcessFrame += Tick;
@@ -136,7 +136,7 @@ internal static class Worker
         SaveManager.Instance.Progress.GetOrCreateCharacterStats(model.Id).TotalLosses = 100;
         _combatEnded = false;
         _combatWon = false;
-        Act1EliteWins.Clear();
+        Act1Wins.Clear();
         CardSelection.Reset();
         RoomDecisions.Reset();
         ScreenDecisions.Reset();
@@ -202,7 +202,7 @@ internal static class Worker
         timer.Restart();
         string? audit = AuditEnabled ? Audit.Capture(_run!) : null;
         _timings["audit_ms"] = timer.Elapsed.TotalMilliseconds;
-        return new { revision = _revision, observation, actions, terminated, victory, scope = _scope, act1_elite_wins = Act1EliteWins.Count, audit };
+        return new { revision = _revision, observation, actions, terminated, victory, scope = _scope, act1_elite_wins = Act1Wins.Count(room => room.RoomType == RoomType.Elite), act1_monster_wins = Act1Wins.Count(room => room.RoomType == RoomType.Monster), audit };
     }
 
     internal static async Task Frame()
