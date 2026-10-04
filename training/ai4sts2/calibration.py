@@ -46,7 +46,12 @@ def hardware():
 def signature(state):
     if not state.get("audit"):
         raise ValueError("Native audit fingerprint is required.")
-    return {key: state[key] for key in ("observation", "actions", "terminated", "victory", "audit")}
+    result = {
+        key: state[key] for key in ("observation", "actions", "terminated", "victory", "audit")
+    }
+    if "act1_elite_wins" in state:
+        result["act1_elite_wins"] = state["act1_elite_wins"]
+    return result
 
 
 def compare(expected, actual, step, diagnostic=None):

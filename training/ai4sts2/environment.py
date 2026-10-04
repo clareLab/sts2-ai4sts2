@@ -21,7 +21,7 @@ MAX_ACTIONS = 128
 STATE_FEATURES = 512
 ACTION_FEATURES = 64
 SCHEMA = 4
-SCOPES = ("first_combat", "act1", "run")
+SCOPES = ("first_combat", "act1_elite", "act1", "run")
 VISIBLE_FIELDS = frozenset(
     "character ascension floor act screen player gold deck relics potions energy stars orbs turn "
     "hand draw discard exhaust creatures model type cost upgrades enchantment side hp max_hp "
@@ -111,7 +111,7 @@ def seed_string(split, seed):
 def native_scope(scope):
     if scope not in SCOPES:
         raise ValueError("Unknown episode scope.")
-    return "run" if scope == "act1" else scope
+    return "first_combat" if scope == "first_combat" else "run"
 
 
 def validate_ascension(ascension):
@@ -122,6 +122,8 @@ def validate_ascension(ascension):
 
 def state_digest(state):
     visible = {key: state[key] for key in ("observation", "actions", "terminated", "victory")}
+    if "act1_elite_wins" in state:
+        visible["act1_elite_wins"] = state["act1_elite_wins"]
     return hashlib.sha256(json.dumps(visible, sort_keys=True).encode()).hexdigest()
 
 
@@ -234,6 +236,8 @@ class Sts2Env(gym.Env):
         }
         self.state = self.game.request("reset", parameters)
         self.check_ascension(self.state)
+        if self.scope == "act1_elite" and self.elite_wins() != 0:
+            raise ValueError("A new run cannot contain an Act 1 elite victory.")
         self.boss_reached = self.state["observation"].get("room") == "Boss"
         self.journal = {
             "parameters": parameters,
@@ -270,11 +274,26 @@ class Sts2Env(gym.Env):
         )
 
     def task_succeeded(self):
+        if self.scope == "act1_elite":
+            return self.elite_wins() >= 1
         return bool(
             self.state["terminated"]
             and self.state["victory"]
             or self.scope == "act1"
             and not self.state["terminated"]
+            and self.state["observation"]["act"] >= 1
+        )
+
+    def elite_wins(self):
+        count = self.state.get("act1_elite_wins")
+        if type(count) is not int or count < 0:
+            raise ValueError("Official Act 1 elite victory count is missing or invalid.")
+        return count
+
+    def task_finished(self):
+        return bool(
+            self.task_succeeded()
+            or self.scope == "act1_elite"
             and self.state["observation"]["act"] >= 1
         )
 
@@ -286,7 +305,7 @@ class Sts2Env(gym.Env):
             self.state is None
             or self.state["terminated"]
             or self.goal_reached()
-            or self.task_succeeded()
+            or self.task_finished()
             or self.steps >= self.max_steps
             or not 0 <= action < len(self.state["actions"])
         ):
@@ -301,7 +320,7 @@ class Sts2Env(gym.Env):
         self.journal["actions"].append({"action": action, "digest": state_digest(self.state)})
         goal_success = self.goal_reached()
         task_success = self.task_succeeded()
-        terminated = self.state["terminated"] or goal_success or task_success
+        terminated = self.state["terminated"] or goal_success or self.task_finished()
         truncated = not terminated and self.steps >= self.max_steps
         victory = bool(self.state["terminated"] and self.state["victory"])
         reward = float(1 if task_success or goal_success else -1) if terminated else 0.0
@@ -321,6 +340,8 @@ class Sts2Env(gym.Env):
             "act": self.state["observation"].get("act"),
             "seed": self.journal["parameters"]["seed"],
         }
+        if "act1_elite_wins" in self.state or self.scope == "act1_elite":
+            info["act1_elite_wins"] = self.elite_wins()
         if self.goal_floor is not None:
             info |= {"goal_floor": self.goal_floor, "goal_success": goal_success or victory}
         if terminated or truncated:

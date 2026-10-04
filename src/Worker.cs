@@ -6,7 +6,9 @@ using HarmonyLib;
 using MegaCrit.Sts2.Core.Assets;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Nodes;
+using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
 using MegaCrit.Sts2.Core.Saves;
 using MegaCrit.Sts2.Core.Settings;
@@ -28,6 +30,7 @@ internal static class Worker
     private static bool _poisoned;
     private static bool _combatEnded;
     private static bool _combatWon;
+    private static readonly HashSet<CombatRoom> Act1EliteWins = new(ReferenceEqualityComparer.Instance);
     private static string _scope = "run";
     private static Decision[] _decisions = [];
     private static SceneTree Tree => (SceneTree)Engine.GetMainLoop();
@@ -38,7 +41,11 @@ internal static class Worker
             throw new InvalidOperationException("An isolated AI4STS2 worker directory is required.");
         if (TestMode.IsOn) throw new InvalidOperationException("The worker requires normal game rules.");
         new Harmony("clareLab.ai4sts2.worker").PatchAll(typeof(Worker).Assembly);
-        CombatManager.Instance.CombatWon += _ => _combatWon = true;
+        CombatManager.Instance.CombatWon += room =>
+        {
+            _combatWon = true;
+            if (_run?.CurrentActIndex == 0 && room.RoomType == RoomType.Elite) Act1EliteWins.Add(room);
+        };
         CombatManager.Instance.CombatEnded += _ => _combatEnded = true;
         Tree.ProcessFrame += Tick;
         _ = Task.Run(async () =>
@@ -129,6 +136,7 @@ internal static class Worker
         SaveManager.Instance.Progress.GetOrCreateCharacterStats(model.Id).TotalLosses = 100;
         _combatEnded = false;
         _combatWon = false;
+        Act1EliteWins.Clear();
         CardSelection.Reset();
         RoomDecisions.Reset();
         ScreenDecisions.Reset();
@@ -194,7 +202,7 @@ internal static class Worker
         timer.Restart();
         string? audit = AuditEnabled ? Audit.Capture(_run!) : null;
         _timings["audit_ms"] = timer.Elapsed.TotalMilliseconds;
-        return new { revision = _revision, observation, actions, terminated, victory, scope = _scope, audit };
+        return new { revision = _revision, observation, actions, terminated, victory, scope = _scope, act1_elite_wins = Act1EliteWins.Count, audit };
     }
 
     internal static async Task Frame()

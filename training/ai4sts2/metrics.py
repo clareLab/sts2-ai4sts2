@@ -24,6 +24,12 @@ def progress(episodes):
             raise ValueError("A truncated episode cannot be a task success.")
         if episode.get("scope") == "act1" and success != (episode["act"] >= 1):
             raise ValueError("Act 1 success requires entering Act 2.")
+        if "act1_elite_wins" in episode or episode.get("scope") == "act1_elite":
+            count = episode.get("act1_elite_wins")
+            if type(count) is not int or count < 0:
+                raise ValueError("Invalid Act 1 elite victory count.")
+            if episode.get("scope") == "act1_elite" and success != (count >= 1):
+                raise ValueError("Elite task success requires an Act 1 elite victory.")
     floors = [episode["floor"] for episode in episodes]
     deaths = [
         e["floor"]
@@ -31,10 +37,11 @@ def progress(episodes):
         if not e.get("task_success", e["victory"])
         and not e["truncated"]
         and not e.get("goal_success", False)
+        and e.get("hp", 0) <= 0
     ]
     wins = sum(episode["victory"] for episode in episodes)
     successes = sum(e.get("task_success", e["victory"]) for e in episodes)
-    return {
+    result = {
         "scope": next(iter(scopes)),
         "ascension": next(iter(ascensions)),
         "episodes": len(episodes),
@@ -56,6 +63,13 @@ def progress(episodes):
             for act in range(max(3, max(e["act"] for e in episodes) + 1))
         },
     }
+    if all("act1_elite_wins" in e for e in episodes):
+        counts = [e["act1_elite_wins"] for e in episodes]
+        result |= {
+            "act1_elite_victories": sum(counts),
+            "act1_elite_success_rate": sum(count >= 1 for count in counts) / len(counts),
+        }
+    return result
 
 
 def summarise(episodes):

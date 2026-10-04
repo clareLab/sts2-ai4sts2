@@ -2,6 +2,8 @@ import argparse
 import json
 import time
 
+from ai4sts2.environment import SCOPES
+
 
 def main():
     parser = argparse.ArgumentParser(prog="ai4sts2")
@@ -14,7 +16,7 @@ def main():
     baseline.add_argument("--minutes", type=float, default=5)
     baseline.add_argument("--per-character", type=int, default=1)
     baseline.add_argument("--seed", type=int, default=0)
-    baseline.add_argument("--scope", choices=("run", "act1", "first_combat"), default="run")
+    baseline.add_argument("--scope", choices=SCOPES, default="run")
     baseline.add_argument("--steps", type=int, default=4096)
     baseline.add_argument("--refresh", action="store_true")
     selection = commands.add_parser("check-selection")
@@ -33,7 +35,7 @@ def main():
     pilot.add_argument("--minutes", type=float, default=30)
     pilot.add_argument("--iterations", type=int, default=4)
     pilot.add_argument("--steps", type=int, default=128)
-    pilot.add_argument("--scope", choices=("run", "act1", "first_combat"), default="run")
+    pilot.add_argument("--scope", choices=SCOPES, default="run")
     pilot.add_argument("--resume", help="Recover an interrupted Ray experiment.")
     pilot.add_argument("--checkpoint", help="Start another bounded pilot from a saved model.")
     pilot.add_argument("--initial-policy", help="Transfer weights into a fresh training task.")
@@ -55,7 +57,7 @@ def main():
     ablation.add_argument(
         "--workers", type=int, default=0, help="Concurrent trials; zero selects automatically."
     )
-    ablation.add_argument("--scope", choices=("run", "act1", "first_combat"), default="run")
+    ablation.add_argument("--scope", choices=SCOPES, default="run")
     for command in (calibration, baseline, pilot, ablation):
         command.add_argument("--ascension", type=int, choices=range(11), default=10)
     args = parser.parse_args()
