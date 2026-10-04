@@ -100,3 +100,56 @@ def test_concurrent_recovery_retains_every_failed_execution(monkeypatch, tmp_pat
     saved = json.loads(path.read_text())
     assert all("runtime_failure" in result for result in saved["results"][:2])
     assert saved["selected"] == candidates[2].to_dict()
+
+
+@pytest.mark.parametrize("changed", ["trainer", "game", "reference"])
+def test_refresh_uses_native_reference_only_when_game_and_reference_match(
+    monkeypatch, tmp_path, changed
+):
+    import hashlib
+    import json
+
+    import ai4sts2.calibration as calibration
+    from ai4sts2.environment import write_json
+
+    reference = tmp_path / "traces.json"
+    write_json(reference, {"cases": [["IRONCLAD", 0, "probe"]], "traces": [[]]})
+    build = {"game": "same", "trainer": "old"}
+    report = {
+        "scope": "run",
+        "hardware": {},
+        "build": build,
+        "reference": str(reference),
+        "reference_sha256": hashlib.sha256(reference.read_bytes()).hexdigest(),
+        "results": [{"valid": True, "seconds": 1, "execution": Execution().to_dict()}],
+    }
+    if changed == "reference":
+        reference.write_text("changed")
+    monkeypatch.setattr(calibration, "ROOT", tmp_path)
+    monkeypatch.setattr(calibration, "hardware", lambda: {})
+    monkeypatch.setattr(
+        calibration,
+        "fingerprint",
+        lambda *_: build | {"trainer": "new", **({"game": "new"} if changed == "game" else {})},
+    )
+    monkeypatch.setattr(calibration, "prepare_game", lambda: "game")
+    measured = []
+
+    def measure(*args):
+        measured.append(args)
+        return report["results"][0], []
+
+    monkeypatch.setattr(calibration, "measure", measure)
+    monkeypatch.setattr(calibration, "calibrate", lambda *_: "full-calibration")
+    write_json(tmp_path / "artifacts/runtime-a0.json", report)
+    result = calibration.ensure_execution(scope="act1", ascension=0)
+    if changed == "trainer":
+        assert len(measured) == 1 and result["build"]["trainer"] == "new"
+        assert (
+            json.loads((tmp_path / "artifacts/runtime-a0.json").read_text())["build"]
+            == result["build"]
+        )
+        calibration.ensure_execution(scope="act1", ascension=0)
+        assert len(measured) == 1
+    else:
+        assert result == "full-calibration" and not measured

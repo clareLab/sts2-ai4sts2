@@ -13,7 +13,7 @@ if not 0 < args.minutes <= 30:
 print(math.ceil(args.minutes * 60))
 PY
 )
-if [[ "$1" != evaluate && "$1" != curve ]]; then ./scripts/build.sh; fi
+if [[ "$1" != evaluate && "$1" != curve && "$1" != advance ]]; then ./scripts/build.sh; fi
 read -r AI4STS2_CPU_BUDGET AI4STS2_MEMORY_BUDGET < <(python3 training/ai4sts2/resources.py)
 export AI4STS2_CPU_BUDGET AI4STS2_MEMORY_BUDGET
 ai4sts2_cpu_quota=$(python3 -c 'import os; print(float(os.environ["AI4STS2_CPU_BUDGET"]) * 100)')
@@ -31,6 +31,9 @@ if [[ "$1" == evaluate ]]; then
 elif [[ "$1" == curve ]]; then
   shift
   ai4sts2_command=(python scripts/curve.py "$@")
+elif [[ "$1" == advance ]]; then
+  shift
+  ai4sts2_command=(python scripts/advance.py "$@")
 elif [[ "$1" == study ]]; then
   shift
   ai4sts2_command=(python scripts/study.py "$@")

@@ -1,4 +1,5 @@
 import collections
+import hashlib
 import json
 import os
 import platform
@@ -245,6 +246,40 @@ def cached_report(scope="first_combat", ascension=10):
     ):
         return None
     return report
+
+
+def ensure_execution(minutes=5, scope="first_combat", ascension=10):
+    if selected_execution(scope, ascension) is not None:
+        return cached_report(scope, ascension)
+    scope = native_scope(scope)
+    path = runtime_path(ascension)
+    previous = json.loads(path.read_text()) if path.is_file() else {}
+    build = fingerprint(scope, ascension)
+    reference = Path(previous.get("reference", ""))
+    if (
+        previous.get("scope") == scope
+        and previous.get("hardware") == hardware()
+        and {k: v for k, v in previous.get("build", {}).items() if k != "trainer"}
+        == {k: v for k, v in build.items() if k != "trainer"}
+        and reference.is_file()
+        and hashlib.sha256(reference.read_bytes()).hexdigest() == previous.get("reference_sha256")
+    ):
+        traces = json.loads(reference.read_text())
+        result, _ = measure(
+            prepare_game(),
+            Execution(**select_result(previous["results"])["execution"]),
+            traces["cases"],
+            time.monotonic() + minutes * 60,
+            traces["traces"],
+            scope,
+            ascension,
+        )
+        if not result["valid"]:
+            raise ValueError("The cached execution no longer matches its native reference.")
+        report = previous | {"build": build, "results": [result], "selected": result["execution"]}
+        write_json(path, report)
+        return report
+    return calibrate(minutes, scope, ascension)
 
 
 def selected_execution(scope="first_combat", ascension=10):

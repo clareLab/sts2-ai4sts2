@@ -370,6 +370,35 @@ class PopulationMember(tune.Trainable):
         self.replay_callback = None
         training_seconds = time.monotonic() - started
         training_profile = self.environment.drain_measurements()
+        measured_steps = self.sample_count
+        training_episodes = self.environment.drain_episodes()
+        metrics = {
+            "environment_steps": self.model.num_timesteps,
+            "policy_parameters": sum(
+                parameter.numel() for parameter in self.model.policy.parameters()
+            ),
+            "training_seconds": training_seconds,
+            "optimisation_seconds": self.model.optimisation_seconds,
+            "learning_diagnostics": self.model.drain_diagnostics(),
+            "auxiliary_updates": self.replay_updates,
+            "auxiliary_diagnostics": replay_diagnostics,
+            "evaluation_seconds": 0.0,
+            "training_profile": training_profile,
+            "evaluation_profile": {},
+            "sample_count": measured_steps,
+            "next_sample_count": self.sample_count,
+            "scope": self.scope,
+            "certifying": False,
+            "validation_performed": False,
+            "training_episodes": training_episodes,
+            "training_progress": summarise(training_episodes) if training_episodes else None,
+            "ongoing_episode_steps": self.environment.steps,
+            "training_signals": self.signals.report(),
+        }
+
+        self.evaluation = None
+        if not self.config.get("validate_each_iteration", True):
+            return metrics
         started = time.monotonic()
         if self.validation_environment is None:
             self.validation_environment = self.open_environment(training=False)
@@ -382,7 +411,6 @@ class PopulationMember(tune.Trainable):
         )
         evaluation_seconds = time.monotonic() - started
         evaluation_profile = self.validation_environment.drain_measurements()
-        measured_steps = self.sample_count
         if not self.config.get("fixed_steps", False):
             self.sample_count = next_sample_count(
                 training_seconds, evaluation_seconds, measured_steps, self.model.n_steps
@@ -391,8 +419,8 @@ class PopulationMember(tune.Trainable):
         write_json(Path(self.logdir) / "evaluation.json", result)
         if not result["eligible"]:
             raise RuntimeError("Validation was truncated; the candidate cannot be ranked.")
-        training_episodes = self.environment.drain_episodes()
-        return {
+        return metrics | {
+            "validation_performed": True,
             "validation_win_rate": result["win_rate"],
             "validation_task_success_rate": result["task_success_rate"],
             "validation_mean_floor": result["mean_floor"],
@@ -401,27 +429,10 @@ class PopulationMember(tune.Trainable):
             "validation_eligible": result["eligible"],
             "validation_characters": result["characters"],
             "evaluation_id": result["evaluation_id"],
-            "environment_steps": self.model.num_timesteps,
-            "policy_parameters": sum(
-                parameter.numel() for parameter in self.model.policy.parameters()
-            ),
-            "training_seconds": training_seconds,
-            "optimisation_seconds": self.model.optimisation_seconds,
-            "learning_diagnostics": self.model.drain_diagnostics(),
-            "auxiliary_updates": self.replay_updates,
-            "auxiliary_diagnostics": replay_diagnostics,
-            "evaluation_seconds": evaluation_seconds,
-            "training_profile": training_profile,
-            "evaluation_profile": evaluation_profile,
-            "sample_count": measured_steps,
-            "next_sample_count": self.sample_count,
-            "scope": self.scope,
-            "certifying": False,
             "validation_episodes": result["episodes"],
-            "training_episodes": training_episodes,
-            "training_progress": summarise(training_episodes) if training_episodes else None,
-            "ongoing_episode_steps": self.environment.steps,
-            "training_signals": self.signals.report(),
+            "evaluation_seconds": evaluation_seconds,
+            "evaluation_profile": evaluation_profile,
+            "next_sample_count": self.sample_count,
         }
 
     def save_checkpoint(self, checkpoint_dir):
@@ -454,6 +465,8 @@ class PopulationMember(tune.Trainable):
             (directory / "replay.pt").unlink(missing_ok=True)
         if self.evaluation is not None:
             write_json(directory / "evaluation.json", self.evaluation)
+        else:
+            (directory / "evaluation.json").unlink(missing_ok=True)
         return checkpoint_dir
 
     def load_checkpoint(self, checkpoint_dir):
