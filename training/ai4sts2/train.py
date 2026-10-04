@@ -253,7 +253,7 @@ class PopulationMember(tune.Trainable):
         if config.get("initial_checkpoint"):
             self.load_checkpoint(config["initial_checkpoint"])
 
-    def step(self):
+    def step(self, callback=None):
         with tempfile.TemporaryDirectory(prefix="recovery-", dir=self.logdir) as checkpoint:
             self.save_checkpoint(checkpoint)
             recovering = False
@@ -262,7 +262,7 @@ class PopulationMember(tune.Trainable):
                     if recovering:
                         self.environment = self.open_environment()
                         self.load_checkpoint(checkpoint)
-                    result = self.train_iteration()
+                    result = self.train_iteration(callback)
                     result |= {
                         "execution": self.execution.to_dict(),
                         "recovery_events": self.recoveries.copy(),
@@ -291,12 +291,14 @@ class PopulationMember(tune.Trainable):
             progress_scale=self.config.get("progress_scale", 0.0) if training else 0.0,
         )
 
-    def train_iteration(self):
+    def train_iteration(self, callback=None):
         self.environment.drain_measurements()
         self.model.optimisation_seconds = 0.0
         self.model.drain_diagnostics()
         started = time.monotonic()
-        self.model.learn(total_timesteps=self.sample_count, reset_num_timesteps=False)
+        self.model.learn(
+            total_timesteps=self.sample_count, reset_num_timesteps=False, callback=callback
+        )
         training_seconds = time.monotonic() - started
         training_profile = self.environment.drain_measurements()
         started = time.monotonic()

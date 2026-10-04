@@ -46,8 +46,10 @@ def test_failed_execution_is_persistently_excluded_and_retries_are_bounded(
     assert all("runtime_failure" in r for r in report["results"])
 
 
-def test_worker_recovery_restores_the_whole_training_iteration(monkeypatch, tmp_path):
+@pytest.mark.parametrize("snapshots", [False, True])
+def test_worker_recovery_restores_the_whole_training_iteration(monkeypatch, tmp_path, snapshots):
     import ai4sts2.train as training
+    from test_curve import curve
 
     baseline = member(monkeypatch)
     baseline._logdir = str(tmp_path / "baseline")
@@ -83,7 +85,13 @@ def test_worker_recovery_restores_the_whole_training_iteration(monkeypatch, tmp_
         lambda executable, seed, **kwargs: Sts2Env(seed=seed, worker_factory=FaultWorker, **kwargs),
     )
     monkeypatch.setattr(training, "quarantine_execution", lambda *_: REFERENCE)
-    result = recovered.step()
+    callback = (
+        curve.RolloutCheckpoints(recovered, tmp_path / "snapshots", "plan") if snapshots else None
+    )
+    result = recovered.step(callback)
+    if snapshots:
+        assert len(callback.saved) == 2
+        assert len(list((tmp_path / "snapshots").iterdir())) == 2
     assert FaultWorker.injected and len(result["recovery_events"]) == 1
     assert result["environment_steps"] == expected["environment_steps"] == 128
     assert result["validation_episodes"] == expected["validation_episodes"]
@@ -101,7 +109,7 @@ def test_logic_errors_do_not_trigger_retries(monkeypatch, tmp_path):
     retries = []
     monkeypatch.setattr(training, "quarantine_execution", lambda *args: retries.append(args))
 
-    def invalid():
+    def invalid(callback=None):
         raise ValueError("Invalid legal action set")
 
     candidate.train_iteration = invalid

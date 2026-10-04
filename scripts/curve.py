@@ -3,6 +3,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -12,6 +13,62 @@ from ai4sts2.game import ROOT, prepare_game
 from ai4sts2.resources import budget
 from ai4sts2.train import PopulationMember
 from filelock import FileLock
+from stable_baselines3.common.callbacks import BaseCallback
+
+
+class RolloutCheckpoints(BaseCallback):
+    def __init__(self, member, directory, identity):
+        super().__init__()
+        self.member = member
+        self.directory = Path(directory)
+        self.identity = identity
+        self.seconds = 0.0
+        self.saved = []
+
+    def _on_training_start(self):
+        self.last_steps = self.model.num_timesteps
+
+    def _on_step(self):
+        return True
+
+    def _on_rollout_start(self):
+        self.persist()
+
+    def _on_training_end(self):
+        self.persist()
+
+    def persist(self):
+        steps = self.model.num_timesteps
+        if steps <= self.last_steps:
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        target = self.directory / f"checkpoint_{steps:06}"
+        if target.exists():
+            saved = json.loads((target / "snapshot.json").read_text())
+            if saved["plan"] != self.identity or saved["files"] != checkpoint_files(target):
+                raise ValueError("Saved rollout checkpoint changed or belongs to another plan.")
+        else:
+            started = time.monotonic()
+            with tempfile.TemporaryDirectory(prefix="pending-", dir=self.directory) as temporary:
+                path = Path(temporary) / "checkpoint"
+                path.mkdir()
+                self.member.save_checkpoint(path)
+                (path / "evaluation.json").unlink(missing_ok=True)
+                write_json(
+                    path / "snapshot.json",
+                    {
+                        "plan": self.identity,
+                        "environment_steps": steps,
+                        "config": self.member.config,
+                        "files": checkpoint_files(path),
+                        "validated": False,
+                    },
+                )
+                path.rename(target)
+            self.seconds += time.monotonic() - started
+        if str(target.resolve()) not in self.saved:
+            self.saved.append(str(target.resolve()))
+        self.last_steps = steps
 
 
 def checkpoint_files(path):
@@ -131,7 +188,10 @@ def run_candidate(job):
             ):
                 return {"seed": source["seed"], "status": "budget"}
             member.sample_count = steps
-            metrics = member.step()
+            snapshots = RolloutCheckpoints(member, directory / "snapshots", identity)
+            metrics = member.step(snapshots)
+            metrics["checkpoint_seconds"] = snapshots.seconds
+            metrics["rollout_checkpoints"] = snapshots.saved
             metrics["concurrent_trials"] = parallelism
             if member.model.num_timesteps != target or not metrics["validation_eligible"]:
                 raise ValueError("The training stage did not finish cleanly.")

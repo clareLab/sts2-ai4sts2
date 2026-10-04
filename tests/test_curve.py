@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import json
 import time
@@ -7,6 +8,7 @@ import pytest
 import torch
 from ai4sts2.environment import write_json
 from test_checkpoint import member
+from test_continuation import long_member
 
 spec = importlib.util.spec_from_file_location(
     "curve", Path(__file__).resolve().parents[1] / "scripts/curve.py"
@@ -125,3 +127,68 @@ def test_forecast_accounts_for_contention_and_evaluation():
         curve.forecast_seconds(128, metrics | {"concurrent_trials": 0})
     with pytest.raises(ValueError, match="Invalid training timing"):
         curve.forecast_seconds(128, metrics | {"sample_count": 0})
+
+
+def test_rollout_snapshots_preserve_training_and_resume_after_an_update(monkeypatch, tmp_path):
+    candidate = long_member(monkeypatch, tmp_path / "donor")
+    candidate.config |= {"rnd_scale": 0.001, "curriculum_mix": 0.75}
+    candidate.signals.configure(candidate.config)
+    initial = tmp_path / "initial"
+    initial.mkdir()
+    candidate.save_checkpoint(initial)
+    candidate.model.learn(total_timesteps=192, reset_num_timesteps=False)
+    expected_policy = copy.deepcopy(candidate.model.policy.state_dict())
+    expected_optimizer = copy.deepcopy(candidate.model.policy.optimizer.state_dict())
+    expected_environment = candidate.environment.snapshot()
+    expected_signals = candidate.signals.snapshot()
+    candidate.load_checkpoint(initial)
+    candidate.evaluation = {"obsolete": True}
+    callback = curve.RolloutCheckpoints(candidate, tmp_path / "snapshots", "plan")
+    candidate.model.learn(total_timesteps=192, reset_num_timesteps=False, callback=callback)
+
+    def equivalent():
+        assert candidate.environment.snapshot() == expected_environment
+        assert candidate.signals.metrics == expected_signals["metrics"]
+        for key, weight in expected_signals["rnd"].items():
+            assert torch.equal(weight, candidate.signals.rnd.state_dict()[key])
+        for key, weight in expected_policy.items():
+            assert torch.equal(weight, candidate.model.policy.state_dict()[key])
+        actual = candidate.model.policy.optimizer.state_dict()
+        assert actual["param_groups"] == expected_optimizer["param_groups"]
+        for index, values in expected_optimizer["state"].items():
+            for key, value in values.items():
+                assert torch.equal(value, actual["state"][index][key])
+
+    try:
+        equivalent()
+        assert len(callback.saved) == 3
+        for steps in (64, 128, 192):
+            checkpoint = tmp_path / "snapshots" / f"checkpoint_{steps:06}"
+            saved = json.loads((checkpoint / "snapshot.json").read_text())
+            assert saved["environment_steps"] == steps and not saved["validated"]
+            assert saved["files"] == curve.checkpoint_files(checkpoint)
+            assert not (checkpoint / "evaluation.json").exists()
+            assert not (checkpoint / "result.json").exists()
+        candidate.load_checkpoint(tmp_path / "snapshots/checkpoint_000064")
+        assert candidate.model.num_timesteps == candidate.environment.steps == 64
+        candidate.model.learn(total_timesteps=128, reset_num_timesteps=False)
+        equivalent()
+    finally:
+        candidate.cleanup()
+
+
+def test_failed_rollout_save_never_publishes_a_partial_checkpoint(monkeypatch, tmp_path):
+    candidate = long_member(monkeypatch, tmp_path / "donor")
+    callback = curve.RolloutCheckpoints(candidate, tmp_path / "snapshots", "plan")
+
+    def fail(directory):
+        (Path(directory) / "policy.zip").write_bytes(b"partial")
+        raise OSError("Injected disk failure")
+
+    monkeypatch.setattr(candidate, "save_checkpoint", fail)
+    try:
+        with pytest.raises(OSError, match="disk failure"):
+            candidate.model.learn(total_timesteps=128, callback=callback)
+        assert list((tmp_path / "snapshots").iterdir()) == []
+    finally:
+        candidate.cleanup()
