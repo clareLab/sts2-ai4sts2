@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import secrets
+import statistics
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -14,7 +15,7 @@ import torch
 from ai4sts2.calibration import calibrate, selected_execution
 from ai4sts2.environment import Sts2Env, evaluation_plan, fingerprint, write_json
 from ai4sts2.game import ROOT, WorkerFailure, prepare_game
-from ai4sts2.metrics import compare_evaluations, summarise
+from ai4sts2.metrics import compare_evaluations, health_fraction, summarise
 from ai4sts2.policy import evaluation_action
 from ai4sts2.resources import budget
 from sb3_contrib import MaskablePPO
@@ -88,12 +89,13 @@ def episode(
     checkpoint=None,
     cancelled=None,
     deterministic=True,
+    split="test",
 ):
     with evaluation_requests(environment.game, deadline, cancelled):
         rng = np.random.default_rng(case["action_seed"])
         if resume is None:
             observation, _ = environment.reset(
-                seed=case["seed_index"], options={"character": case["character"], "split": "test"}
+                seed=case["seed_index"], options={"character": case["character"], "split": split}
             )
         else:
             if resume.get("deterministic", True) != deterministic:
@@ -104,6 +106,11 @@ def episode(
             environment.restore(resume["environment"])
             rng.bit_generator.state = resume["action_rng"]
             observation = environment.encode()
+        if environment.journal["parameters"]["seed"] != case["seed"]:
+            raise ValueError("The environment seed does not match the evaluation case.")
+        first_three = resume.get("first_three_monsters") if resume else None
+        if environment.state.get("act1_monster_wins", 0) >= 3 and first_three is None:
+            raise ValueError("The saved episode is missing its earlier combat health.")
         terminated = truncated = False
         while not (terminated or truncated):
             if checkpoint is not None:
@@ -112,12 +119,24 @@ def episode(
                         "environment": environment.snapshot(),
                         "action_rng": rng.bit_generator.state,
                         "deterministic": deterministic,
+                        "first_three_monsters": first_three,
                     }
                 )
             action = evaluation_action(
                 model, observation, environment.action_masks(), rng, deterministic
             )
             observation, _, terminated, truncated, info = environment.step(action)
+            if info.get("act1_monster_wins", 0) >= 3 and first_three is None:
+                player = environment.state["observation"]["player"]
+                health_fraction(player)
+                first_three = {
+                    "hp": player["hp"],
+                    "max_hp": player["max_hp"],
+                    "floor": info["floor"],
+                    "steps": info["steps"],
+                }
+        if "act1_monster_wins" in info:
+            info = info | {"first_three_monsters": first_three}
         environment.drain_episodes()
         return info | {
             "truncated": truncated,
@@ -125,6 +144,24 @@ def episode(
                 json.dumps(environment.journal, sort_keys=True).encode()
             ).hexdigest(),
         }
+
+
+def progression_key(report):
+    if report.get("scope") != "act1" or not report["complete"] or not report["eligible"]:
+        raise ValueError("Progression selection requires a complete Act 1 evaluation.")
+    rows = report["episodes"]
+    if not rows or any("first_three_monsters" not in row for row in rows):
+        raise ValueError("Progression selection requires recorded combat health.")
+    return (
+        report["task_successes"],
+        sum(row["act1_elite_wins"] >= 1 for row in rows),
+        statistics.mean(
+            health_fraction(row["first_three_monsters"])
+            if row["first_three_monsters"] is not None
+            else -1.0
+            for row in rows
+        ),
+    )
 
 
 def aggregate(plan, records):
@@ -172,6 +209,7 @@ def run(
     workers=0,
     auto_calibrate=False,
     policy_modes=("deterministic",),
+    split="test",
 ):
     if not 0 < minutes <= 30:
         raise ValueError("Use a budget between zero and 30 minutes.")
@@ -187,8 +225,16 @@ def run(
     models = candidates(study, build, policy_modes)
     manifest = output / "plan.json"
     previous = json.loads(manifest.read_text()) if manifest.exists() else None
-    seed = previous["cases"][0]["seed_index"] if previous else secrets.randbits(60)
-    plan = evaluation_plan(scope, seed, "test", 4096, per_character, ascension) | {
+    if split not in {"validation", "test"}:
+        raise ValueError("Use validation or test evaluation seeds.")
+    seed = (
+        previous["cases"][0]["seed_index"]
+        if previous
+        else 0
+        if split == "validation"
+        else secrets.randbits(60)
+    )
+    plan = evaluation_plan(scope, seed, split, 4096, per_character, ascension) | {
         "build": build,
         "candidates": models,
         "evaluator": digest(__file__),
@@ -282,6 +328,7 @@ def run(
                 checkpoint,
                 stopped.is_set,
                 candidate.get("policy_mode", "deterministic") == "deterministic",
+                split,
             )
             record.pop("resume", None)
             record.pop("pending", None)
@@ -349,6 +396,7 @@ if __name__ == "__main__":
     parser.add_argument("--minutes", type=float, default=25)
     parser.add_argument("--per-character", type=int, default=4)
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--split", choices=("validation", "test"), default="test")
     parser.add_argument(
         "--policy-modes",
         nargs="+",
@@ -363,6 +411,7 @@ if __name__ == "__main__":
         args.per_character,
         args.workers,
         policy_modes=args.policy_modes,
+        split=args.split,
     )
     print(json.dumps({"complete": result["complete"], "eligible": result["eligible"]}))
     if not result["eligible"]:

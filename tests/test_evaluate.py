@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from ai4sts2.environment import Sts2Env, evaluate, evaluation_plan
 from ai4sts2.execution import Execution
+from ai4sts2.metrics import summarise
 from ai4sts2.resources import GIB, Budget
 from test_environment import FakeWorker
 
@@ -205,11 +206,19 @@ def test_paused_cases_are_resumed_but_completed_cases_are_not_repeated(suite, mo
     paused = []
 
     def pause_once(
-        model, environment, case, deadline, resume, checkpoint, cancelled, deterministic
+        model, environment, case, deadline, resume, checkpoint, cancelled, deterministic, split
     ):
         if paused:
             return original(
-                model, environment, case, deadline, resume, checkpoint, cancelled, deterministic
+                model,
+                environment,
+                case,
+                deadline,
+                resume,
+                checkpoint,
+                cancelled,
+                deterministic,
+                split,
             )
 
         def stop(snapshot):
@@ -218,7 +227,9 @@ def test_paused_cases_are_resumed_but_completed_cases_are_not_repeated(suite, mo
                 paused.append(case)
                 raise holdout.EvaluationPaused()
 
-        return original(model, environment, case, deadline, resume, stop, cancelled, deterministic)
+        return original(
+            model, environment, case, deadline, resume, stop, cancelled, deterministic, split
+        )
 
     monkeypatch.setattr(holdout, "episode", pause_once)
     first = holdout.run(study, output, per_character=1, workers=1)
@@ -281,3 +292,108 @@ def test_cancellation_interrupts_replay_and_restores_request_handler():
         )
     assert len(target.game.calls) == 2
     assert target.game.request == original
+
+
+class MilestoneWorker(FakeWorker):
+    def request(self, method, parameters):
+        result = super().request(method, parameters)
+        finished = self.count >= 5
+        result |= {
+            "terminated": False,
+            "victory": False,
+            "actions": [{"kind": "play"}, {"kind": "end_turn"}],
+            "act1_monster_wins": min(self.count, 3),
+            "act1_elite_wins": int(self.count >= 4),
+        }
+        result["observation"] |= {
+            "act": int(finished),
+            "floor": self.count,
+            "player": {"hp": 80 - 10 * self.count, "max_hp": 100},
+        }
+        return result
+
+
+def test_combat_health_is_measured_without_changing_full_act_actions():
+    first = Sts2Env(worker_factory=MilestoneWorker, scope="act1")
+    second = Sts2Env(worker_factory=MilestoneWorker, scope="act1")
+    case = evaluation_plan("act1", split="test")["cases"][0]
+    expected = evaluate(None, first, split="test")["episodes"][0]
+    actual = holdout.episode(None, second, case, time.monotonic() + 10)
+    assert actual.pop("first_three_monsters") == {"hp": 50, "max_hp": 100, "floor": 3, "steps": 3}
+    assert actual == expected and actual["hp"] == 30 and actual["task_success"]
+    assert second.game.calls == first.game.calls[:6]
+
+
+def test_resumed_evaluation_keeps_earlier_health_and_rejects_missing_measurement():
+    case = evaluation_plan("act1", split="test")["cases"][0]
+    first = Sts2Env(worker_factory=MilestoneWorker, scope="act1")
+    snapshots = []
+
+    def pause(snapshot):
+        snapshots.append(copy.deepcopy(snapshot))
+        if len(snapshot["environment"]["journal"]["actions"]) == 4:
+            raise holdout.EvaluationPaused()
+
+    with pytest.raises(holdout.EvaluationPaused):
+        holdout.episode(None, first, case, time.monotonic() + 10, checkpoint=pause)
+    second = Sts2Env(worker_factory=MilestoneWorker, scope="act1")
+    result = holdout.episode(None, second, case, time.monotonic() + 10, snapshots[-1])
+    assert result["first_three_monsters"]["hp"] == 50 and result["hp"] == 30
+    third = Sts2Env(worker_factory=MilestoneWorker, scope="act1")
+    with pytest.raises(ValueError, match="earlier combat health"):
+        holdout.episode(
+            None,
+            third,
+            case,
+            time.monotonic() + 10,
+            snapshots[-1] | {"first_three_monsters": None},
+        )
+    assert third.steps == 4
+
+
+def test_validation_expansion_preserves_existing_cases_and_separates_test_seeds(suite):
+    study, output, environments = suite
+    result = holdout.run(study, output, per_character=2, split="validation")
+    plan = json.loads((output / "plan.json").read_text())
+    expected = evaluation_plan("first_combat", split="validation", max_steps=4096)
+    assert plan["cases"][:5] == expected["cases"]
+    assert result["complete"] and len(result["trials"][0]["episodes"]) == 10
+    assert {
+        parameters["seed"]
+        for env in environments
+        for method, parameters in env.game.calls
+        if method == "reset"
+    } == {case["seed"] for case in plan["cases"]}
+    count = len(environments)
+    with pytest.raises(ValueError, match="plan"):
+        holdout.run(study, output, per_character=2, split="test")
+    assert len(environments) == count
+
+
+def test_progression_priority_cannot_trade_act1_success_for_health_or_elites():
+    base = {
+        "scope": "act1",
+        "ascension": 0,
+        "floor": 8,
+        "act": 0,
+        "character": "IRONCLAD",
+        "victory": False,
+        "task_success": False,
+        "truncated": False,
+        "act1_elite_wins": 0,
+        "act1_monster_wins": 3,
+        "first_three_monsters": {"hp": 10, "max_hp": 100},
+    }
+
+    def report(row):
+        return summarise([row]) | {"episodes": [row], "complete": True}
+
+    act = report(base | {"act": 1, "task_success": True})
+    elite = report(base | {"act1_elite_wins": 1})
+    health = report(base | {"first_three_monsters": {"hp": 100, "max_hp": 100}})
+    failure = report(base | {"first_three_monsters": None, "act1_monster_wins": 2})
+    assert holdout.progression_key(act) > holdout.progression_key(elite)
+    assert holdout.progression_key(elite) > holdout.progression_key(health)
+    assert holdout.progression_key(health) > holdout.progression_key(failure)
+    with pytest.raises(ValueError, match="complete Act 1"):
+        holdout.progression_key(act | {"complete": False})
