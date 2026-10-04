@@ -20,4 +20,7 @@ class Execution:
 
 
 REFERENCE = Execution(pause_idle=False)
-CANDIDATES = (Execution(fps=0, non_interactive=True, pause_idle=False, reuse_process=True),)
+CANDIDATES = tuple(
+    Execution(fps=0, non_interactive=True, pause_idle=False, reuse_process=reuse)
+    for reuse in (True, False)
+)

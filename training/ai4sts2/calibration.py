@@ -5,6 +5,7 @@ import os
 import platform
 import random
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from filelock import FileLock
@@ -249,8 +250,11 @@ def cached_report(scope="first_combat", ascension=10):
 
 
 def ensure_execution(minutes=5, scope="first_combat", ascension=10):
-    if selected_execution(scope, ascension) is not None:
-        return cached_report(scope, ascension)
+    try:
+        if selected_execution(scope, ascension) is not None:
+            return cached_report(scope, ascension)
+    except ValueError:
+        pass
     scope = native_scope(scope)
     path = runtime_path(ascension)
     previous = json.loads(path.read_text()) if path.is_file() else {}
@@ -265,19 +269,45 @@ def ensure_execution(minutes=5, scope="first_combat", ascension=10):
         and hashlib.sha256(reference.read_bytes()).hexdigest() == previous.get("reference_sha256")
     ):
         traces = json.loads(reference.read_text())
-        result, _ = measure(
-            prepare_game(),
-            Execution(**select_result(previous["results"])["execution"]),
-            traces["cases"],
-            time.monotonic() + minutes * 60,
-            traces["traces"],
-            scope,
-            ascension,
-        )
-        if not result["valid"]:
-            raise ValueError("The cached execution no longer matches its native reference.")
-        report = previous | {"build": build, "results": [result], "selected": result["execution"]}
+        deadline = time.monotonic() + minutes * 60
+        executable = prepare_game()
+        results = [result for result in previous["results"] if "runtime_failure" in result]
+        excluded = [result["execution"] for result in results]
+        candidates = []
+        for result in previous["results"]:
+            if result.get("valid"):
+                execution = Execution(**result["execution"])
+                candidates.append(execution)
+                if execution.reuse_process:
+                    candidates.append(replace(execution, reuse_process=False))
+        seen = []
+        for execution in candidates:
+            if execution in seen or execution.to_dict() in excluded:
+                continue
+            seen.append(execution)
+            if deadline - time.monotonic() < 10:
+                break
+            try:
+                result, _ = measure(
+                    executable,
+                    execution,
+                    traces["cases"],
+                    deadline,
+                    traces["traces"],
+                    scope,
+                    ascension,
+                )
+            except (RuntimeError, ValueError, TimeoutError) as error:
+                result = {"execution": execution.to_dict(), "valid": False, "error": str(error)}
+            results.append(result)
+        try:
+            selected = select_result(results)["execution"]
+        except ValueError:
+            selected = None
+        report = previous | {"build": build, "results": results, "selected": selected}
         write_json(path, report)
+        if selected is None:
+            raise ValueError("No execution configuration matched its native reference.")
         return report
     return calibrate(minutes, scope, ascension)
 

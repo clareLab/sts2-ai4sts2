@@ -153,3 +153,107 @@ def test_refresh_uses_native_reference_only_when_game_and_reference_match(
         assert len(measured) == 1
     else:
         assert result == "full-calibration" and not measured
+
+
+@pytest.mark.parametrize("failure", [None, "calibration", "runtime"])
+def test_refresh_retains_audited_process_fallback_and_quarantine(monkeypatch, tmp_path, failure):
+    import hashlib
+    import json
+    from dataclasses import replace
+
+    import ai4sts2.calibration as calibration
+    from ai4sts2.environment import write_json
+    from ai4sts2.game import WorkerFailure
+
+    reference = tmp_path / "traces.json"
+    traces = {"cases": [["IRONCLAD", 0, "probe"]], "traces": [[{"state": "reference"}]]}
+    write_json(reference, traces)
+    fast = Execution(fps=0, non_interactive=True, pause_idle=False, reuse_process=True)
+    isolated = replace(fast, reuse_process=False)
+    build = {"game": "same", "trainer": "current"}
+    path = tmp_path / "artifacts/runtime-a0.json"
+    report = {
+        "scope": "run",
+        "hardware": {},
+        "build": build if failure == "runtime" else build | {"trainer": "old"},
+        "reference": str(reference),
+        "reference_sha256": hashlib.sha256(reference.read_bytes()).hexdigest(),
+        "results": [
+            {"valid": True, "seconds": 1, "execution": fast.to_dict()}
+            | ({"runtime_failure": "crashed"} if failure == "runtime" else {})
+        ],
+    }
+    write_json(path, report)
+    monkeypatch.setattr(calibration, "ROOT", tmp_path)
+    monkeypatch.setattr(calibration, "hardware", lambda: {})
+    monkeypatch.setattr(calibration, "fingerprint", lambda *_: build)
+    monkeypatch.setattr(calibration, "prepare_game", lambda: "game")
+    measured = []
+
+    def measure(executable, execution, cases, deadline, expected, scope, ascension):
+        assert executable == "game" and cases == traces["cases"] and expected == traces["traces"]
+        assert scope == "run" and ascension == 0
+        measured.append(execution)
+        if failure == "calibration" and execution == fast:
+            raise WorkerFailure("process failed")
+        return {
+            "valid": True,
+            "seconds": 1 if execution == fast else 2,
+            "execution": execution.to_dict(),
+        }, []
+
+    monkeypatch.setattr(calibration, "measure", measure)
+    result = calibration.ensure_execution(scope="act1", ascension=0)
+    assert measured == ([isolated] if failure == "runtime" else [fast, isolated])
+    assert result["selected"] == (fast if failure is None else isolated).to_dict()
+    if failure is None:
+        assert calibration.quarantine_execution(fast, WorkerFailure("crashed"), "act1", 0) == (
+            isolated
+        )
+    elif failure == "runtime":
+        assert result["results"][0]["runtime_failure"] == "crashed"
+    saved = json.loads(path.read_text())
+    assert saved["selected"] == isolated.to_dict()
+    assert calibration.ensure_execution(scope="act1", ascension=0) == saved
+    assert len(measured) == (1 if failure == "runtime" else 2)
+
+
+def test_exhausted_execution_fallback_does_not_retry_quarantined_processes(monkeypatch, tmp_path):
+    import hashlib
+
+    import ai4sts2.calibration as calibration
+    from ai4sts2.environment import write_json
+
+    reference = tmp_path / "traces.json"
+    write_json(reference, {"cases": [], "traces": []})
+    build = {"game": "same", "trainer": "current"}
+    write_json(
+        tmp_path / "artifacts/runtime-a0.json",
+        {
+            "scope": "run",
+            "hardware": {},
+            "build": build,
+            "reference": str(reference),
+            "reference_sha256": hashlib.sha256(reference.read_bytes()).hexdigest(),
+            "results": [
+                {
+                    "execution": execution.to_dict(),
+                    "valid": True,
+                    "seconds": 1,
+                    "runtime_failure": "crashed",
+                }
+                for execution in (Execution(reuse_process=True), Execution())
+            ],
+        },
+    )
+    monkeypatch.setattr(calibration, "ROOT", tmp_path)
+    monkeypatch.setattr(calibration, "hardware", lambda: {})
+    monkeypatch.setattr(calibration, "fingerprint", lambda *_: build)
+    monkeypatch.setattr(calibration, "prepare_game", lambda: "game")
+
+    def measure(*args):
+        pytest.fail("Quarantined execution was retried.")
+
+    monkeypatch.setattr(calibration, "measure", measure)
+    with pytest.raises(ValueError, match="No execution configuration"):
+        calibration.ensure_execution(scope="act1", ascension=0)
