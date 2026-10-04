@@ -240,24 +240,33 @@ def validate(output, plan, current, deadline, workers):
         split="validation",
     )
     if result["eligible"]:
-        best = max(
-            range(len(trials)), key=lambda index: holdout.progression_key(result["trials"][index])
-        )
+        save_selection(output, plan, trials, result)
+
+    return result | {"cached_episodes": reused}
+
+
+def save_selection(output, plan, trials, result):
+    if not result["complete"] or not result["eligible"]:
+        raise ValueError("Model selection requires a complete eligible validation panel.")
+    best = max(
+        range(len(trials)), key=lambda index: holdout.progression_key(result["trials"][index])
+    )
+    for filename, index in (("selection.json", best), ("continuation.json", 1)):
         write_json(
-            output / "continuation.json",
+            output / filename,
             {
                 "complete": True,
-                "build": build,
-                "trials": [trials[best] | {"variant": "control"}],
+                "build": plan["request"]["build"],
+                "trials": [trials[index] | {"variant": "control"}],
                 "validation_panel": plan["validation_panel"],
-                "selected_validation": result["trials"][best],
+                "selected_validation": result["trials"][index],
                 "evaluation_runner": holdout.digest(holdout.__file__),
+                "selected_by_validation": index == best,
                 "selected_for_training_only": True,
                 "certifying": False,
                 "promoted": False,
             },
         )
-    return result | {"cached_episodes": reused}
 
 
 def run(initial, output, steps=8192, minutes=30, per_character=2, transfer=False, workers=0):

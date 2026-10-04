@@ -151,3 +151,62 @@ def test_reference_cache_requires_identical_weights_and_validation_panel(tmp_pat
     assert advance.cache_reference(tmp_path, plan, candidate) == 0
     record = json.loads(next((tmp_path / "episodes").glob("*.json")).read_text())
     assert record["plan"] == advance.identity(panel)
+
+
+@pytest.mark.parametrize("winner", [0, 1])
+def test_training_continues_forward_when_validation_selects_an_earlier_checkpoint(
+    monkeypatch, tmp_path, winner
+):
+    trials = [{"checkpoint": "earlier"}, {"checkpoint": "latest"}]
+    reports = [{"rank": int(index == winner)} for index in range(2)]
+    plan = {"request": {"build": {}}, "validation_panel": {"split": "validation"}}
+    monkeypatch.setattr(holdout, "progression_key", lambda report: report["rank"])
+    result = {"complete": True, "eligible": True, "trials": reports}
+    advance.save_selection(tmp_path, plan, trials, result)
+    selected = json.loads((tmp_path / "selection.json").read_text())
+    continuation = json.loads((tmp_path / "continuation.json").read_text())
+    assert selected["trials"][0]["checkpoint"] == trials[winner]["checkpoint"]
+    assert continuation["trials"][0]["checkpoint"] == "latest"
+    assert continuation["selected_validation"] == reports[1]
+    assert continuation["selected_by_validation"] == (winner == 1)
+    with pytest.raises(ValueError, match="complete eligible"):
+        advance.save_selection(tmp_path, plan, trials, result | {"eligible": False})
+
+
+def test_interrupted_round_resumes_from_the_last_atomic_checkpoint(frozen, monkeypatch):
+    path, output, source = frozen
+    plan = advance.prepare(output, path, 1024, 2, False)
+    monkeypatch.setattr(advance, "prepare_game", lambda: "fake")
+    import ai4sts2.train as training
+
+    monkeypatch.setattr(training, "fingerprint", lambda *_: source["build"])
+    persist = advance.persist
+
+    def interrupt(*args, **kwargs):
+        saved = persist(*args, **kwargs)
+        if saved["environment_steps"] == 576:
+            raise InterruptedError("Interrupted after an atomic checkpoint")
+        return saved
+
+    monkeypatch.setattr(advance, "persist", interrupt)
+    with pytest.raises(InterruptedError):
+        advance.train(output, plan, time.monotonic() + 300)
+    monkeypatch.setattr(advance, "persist", persist)
+    resumed = advance.train(output, plan, time.monotonic() + 300)
+    direct = output / "direct"
+    direct.mkdir()
+    uninterrupted = advance.train(direct, plan, time.monotonic() + 300)
+    models = [
+        training.TimedPPO.load(Path(row["checkpoint"]) / "policy.zip")
+        for row in (resumed, uninterrupted)
+    ]
+    for name, value in models[0].policy.state_dict().items():
+        assert torch.equal(value, models[1].policy.state_dict()[name])
+    optimisers = [model.policy.optimizer.state_dict() for model in models]
+    assert optimisers[0]["param_groups"] == optimisers[1]["param_groups"]
+    for index, values in optimisers[0]["state"].items():
+        for name, value in values.items():
+            assert torch.equal(value, optimisers[1]["state"][index][name])
+    assert json.loads((Path(resumed["checkpoint"]) / "environment.json").read_text()) == json.loads(
+        (Path(uninterrupted["checkpoint"]) / "environment.json").read_text()
+    )
