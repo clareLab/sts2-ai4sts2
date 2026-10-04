@@ -15,12 +15,11 @@ from sb3_contrib import MaskablePPO
 from stable_baselines3.common.utils import FloatSchedule
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from ai4sts2.baseline import run as random_baseline
 from ai4sts2.calibration import calibrate, quarantine_execution, selected_execution
 from ai4sts2.environment import SCOPES, Sts2Env, evaluate, fingerprint, write_json
 from ai4sts2.execution import Execution
 from ai4sts2.game import ROOT, WorkerFailure, prepare_game
-from ai4sts2.metrics import compare_evaluations, summarise
+from ai4sts2.metrics import summarise
 from ai4sts2.policy import SharedActionPolicy
 from ai4sts2.resources import TRIAL_MEMORY, budget
 from ai4sts2.signals import TrainingSignals
@@ -175,7 +174,7 @@ def fit_or_recover(tuner, experiment_path, trainable):
         return tune.Tuner.restore(str(experiment_path), trainable=trainable).get_results(), True
 
 
-def pilot_report(results, scope, build, baseline, iterations, interrupted=False):
+def pilot_report(results, scope, build, iterations, interrupted=False):
     successful = [result for result in results if not result.error and result.checkpoint]
     return {
         "scope": scope,
@@ -187,7 +186,6 @@ def pilot_report(results, scope, build, baseline, iterations, interrupted=False)
         and len(successful) == len(results)
         and all(result.metrics.get("training_iteration", 0) >= iterations for result in results),
         "build": build,
-        "baseline": baseline,
         "errors": [str(result.error) for result in results if result.error],
         "trials": [
             {
@@ -198,7 +196,6 @@ def pilot_report(results, scope, build, baseline, iterations, interrupted=False)
                 "task_success_rate": result.metrics.get("validation_task_success_rate"),
                 "mean_floor": result.metrics.get("validation_mean_floor"),
                 "selection_score": result.metrics.get("validation_selection_score"),
-                "random_baseline_comparison": result.metrics.get("random_baseline_comparison"),
                 "iterations": result.metrics.get("training_iteration"),
                 "training_signals": result.metrics.get("training_signals"),
                 "environment_steps": result.metrics.get("environment_steps"),
@@ -264,10 +261,14 @@ class PopulationMember(tune.Trainable):
     def initialise_policy(self, checkpoint_dir):
         directory = Path(checkpoint_dir)
         build = json.loads((directory / "build.json").read_text())
-        if {k: v for k, v in build.items() if k not in {"trainer", "scope", "ascension"}} != {
-            k: v for k, v in self.build.items() if k not in {"trainer", "scope", "ascension"}
+        if {
+            k: v for k, v in build.items() if k not in {"trainer", "mod", "scope", "ascension"}
+        } != {
+            k: v for k, v in self.build.items() if k not in {"trainer", "mod", "scope", "ascension"}
         }:
-            raise ValueError("Policy transfer requires matching game, bridge and observations.")
+            raise ValueError(
+                "Policy transfer requires matching game, dependencies and observation schema."
+            )
         python_rng, numpy_rng = random.getstate(), np.random.get_state()
         try:
             with torch.random.fork_rng(devices=[]):
@@ -363,11 +364,6 @@ class PopulationMember(tune.Trainable):
             "validation_eligible": result["eligible"],
             "validation_characters": result["characters"],
             "evaluation_id": result["evaluation_id"],
-            "random_baseline_comparison": (
-                compare_evaluations(result, self.config["baseline"])
-                if self.config.get("baseline")
-                else None
-            ),
             "environment_steps": self.model.num_timesteps,
             "policy_parameters": sum(
                 parameter.numel() for parameter in self.model.policy.parameters()
@@ -546,25 +542,9 @@ def run(
         execution = selected_execution(scope, ascension)
     if execution is None:
         raise RuntimeError("Execution calibration did not produce a compatible configuration.")
-    baseline = random_baseline(
-        minutes=min(5, max(0.001, (deadline - time.monotonic()) / 60)),
-        scope=scope,
-        ascension=ascension,
-        max_steps=256 if scope == "first_combat" else 4096,
-    )
-    if not baseline["eligible"]:
-        raise RuntimeError("Random baseline did not finish every evaluation case.")
-    baseline_reference = {
-        key: baseline[key] for key in ("evaluation_id", "wins", "task_successes", "eligible")
-    } | {
-        "episodes": [
-            {key: episode[key] for key in ("character", "seed", "floor")}
-            for episode in baseline["episodes"]
-        ]
-    }
     remaining_seconds = deadline - time.monotonic() - 10
     if remaining_seconds <= 0:
-        raise TimeoutError("The pilot budget was used by calibration and the random baseline.")
+        raise TimeoutError("The pilot budget was used by calibration.")
     if checkpoint:
         checkpoint = str(Path(checkpoint).resolve())
     ray.init(
@@ -634,12 +614,11 @@ def run(
                     "execution": execution.to_dict(),
                     "scope": scope,
                     "ascension": ascension,
-                    "baseline": baseline_reference,
                 },
             )
         results, interrupted = fit_or_recover(tuner, experiment_path, trainable)
         report = pilot_report(
-            results, scope, fingerprint(scope, ascension), baseline, iterations, interrupted
+            results, scope, fingerprint(scope, ascension), iterations, interrupted
         )
         report["experiment"] = experiment
         report["resources"] = resources

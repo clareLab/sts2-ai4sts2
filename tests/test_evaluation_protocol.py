@@ -1,5 +1,4 @@
 import copy
-import json
 import time
 
 import numpy as np
@@ -21,7 +20,7 @@ class ChoiceWorker(FakeWorker):
         return result
 
 
-def test_random_baseline_is_uniform_includes_skip_and_does_not_change_training_rng():
+def test_diagnostic_random_actions_are_uniform_includes_skip_and_does_not_change_training_rng():
     environment = Sts2Env(worker_factory=ChoiceWorker, seed=12)
     rng = copy.deepcopy(environment.rng.bit_generator.state)
     np.random.seed(73)
@@ -44,7 +43,7 @@ def test_random_baseline_is_uniform_includes_skip_and_does_not_change_training_r
     environment.close()
 
 
-def test_random_baseline_replays_the_same_cases_and_trajectories():
+def test_diagnostic_random_actions_replay_the_same_cases_and_trajectories():
     first = Sts2Env(worker_factory=FakeWorker, seed=0)
     second = Sts2Env(worker_factory=FakeWorker, seed=999)
     result = evaluate(None, first, per_character=2)
@@ -87,41 +86,3 @@ def test_expired_evaluation_budget_cannot_submit_an_action():
     assert environment.game.calls == []
     assert environment.max_steps == 17
     environment.close()
-
-
-def test_baseline_cache_rejects_build_or_case_changes_and_keeps_partial_failures(
-    monkeypatch, tmp_path
-):
-    import ai4sts2.baseline as baseline
-
-    workers = []
-
-    def open_environment(*args, **kwargs):
-        environment = Sts2Env(worker_factory=FakeWorker, **kwargs)
-        workers.append(environment.game)
-        return environment
-
-    monkeypatch.setattr(baseline, "ROOT", tmp_path)
-    monkeypatch.setattr(baseline, "fingerprint", lambda *_: {"game": "test"})
-    monkeypatch.setattr(baseline, "selected_execution", lambda *_: None)
-    monkeypatch.setattr(baseline, "prepare_game", lambda: None)
-    monkeypatch.setattr(baseline, "Sts2Env", open_environment)
-    first = baseline.run()
-    assert baseline.run() == first
-    assert len(workers) == 1 and workers[0].closed
-    baseline.run(seed=1)
-    assert len(workers) == 2
-    monkeypatch.setattr(baseline, "fingerprint", lambda *_: {"game": "changed"})
-    baseline.run(seed=1)
-    assert len(workers) == 3
-
-    def fail(*args, **kwargs):
-        raise RuntimeError("Injected failure")
-
-    monkeypatch.setattr(baseline, "evaluate", fail)
-    with pytest.raises(RuntimeError, match="Injected"):
-        baseline.run(refresh=True)
-    saved = json.loads((tmp_path / "artifacts/validation/random-baseline-run-a10.json").read_text())
-    assert not saved["complete"] and not saved["eligible"]
-    assert saved["error"] == "Injected failure"
-    assert workers[-1].closed

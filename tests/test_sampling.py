@@ -101,10 +101,10 @@ def test_candidate_modes_share_weights_but_have_distinct_cache_identities(tmp_pa
         "trials": [{"checkpoint": str(tmp_path), "variant": "control", "seed": 7}],
     }
     models = holdout.candidates(study, study["build"], ("deterministic", "sampled"))
-    assert len(models) == 3
-    assert len({model["name"] for model in models}) == 3
-    assert models[1]["sha256"] == models[2]["sha256"]
-    assert models[1]["checkpoint"] == models[2]["checkpoint"]
+    assert len(models) == 2
+    assert len({model["name"] for model in models}) == 2
+    assert models[0]["sha256"] == models[1]["sha256"]
+    assert models[0]["checkpoint"] == models[1]["checkpoint"]
     assert json.dumps(models) != json.dumps(holdout.candidates(study, study["build"]))
     for modes in ((), ("sampled", "sampled"), ("invalid",)):
         with pytest.raises(ValueError, match="policy modes"):

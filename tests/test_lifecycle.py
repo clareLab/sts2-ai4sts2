@@ -1,6 +1,7 @@
 import io
 import json
 import queue
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -76,3 +77,15 @@ def test_failed_action_does_not_restart_or_retry_the_episode(worker):
     assert len(opened) == 1 and closed == [0]
     records = [json.loads(value) for value in game.journal.getvalue().splitlines()]
     assert [record["method"] for record in records] == ["hello", "reset", "step"]
+
+
+def test_verified_reuse_keeps_process_and_resets_each_episode(worker):
+    game, opened, closed = worker
+    game._launch["execution"] = replace(game._launch["execution"], reuse_process=True)
+    for seed in ("first", "second"):
+        assert game.request("reset", {"seed": seed})["worker"] == 0
+        assert game.request("step", {"action": 0})["worker"] == 0
+    assert len(opened) == 1 and not closed
+    measurements = game.drain_measurements()
+    assert measurements["reset"]["restart_ms"] == 0
+    assert measurements["reset"]["calls"] == 2

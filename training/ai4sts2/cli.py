@@ -12,13 +12,6 @@ def main():
     calibration = commands.add_parser("calibrate")
     calibration.add_argument("--minutes", type=float, default=5)
     calibration.add_argument("--scope", choices=("run", "first_combat"), default="first_combat")
-    baseline = commands.add_parser("baseline")
-    baseline.add_argument("--minutes", type=float, default=5)
-    baseline.add_argument("--per-character", type=int, default=1)
-    baseline.add_argument("--seed", type=int, default=0)
-    baseline.add_argument("--scope", choices=SCOPES, default="run")
-    baseline.add_argument("--steps", type=int, default=4096)
-    baseline.add_argument("--refresh", action="store_true")
     selection = commands.add_parser("check-selection")
     selection.add_argument("--minutes", type=float, default=5)
     runs = commands.add_parser("check-run")
@@ -58,25 +51,10 @@ def main():
         "--workers", type=int, default=0, help="Concurrent trials; zero selects automatically."
     )
     ablation.add_argument("--scope", choices=SCOPES, default="run")
-    for command in (calibration, baseline, pilot, ablation):
+    for command in (calibration, pilot, ablation):
         command.add_argument("--ascension", type=int, choices=range(11), default=10)
     args = parser.parse_args()
-    if args.command == "baseline":
-        from ai4sts2.baseline import run
-
-        result = run(
-            args.minutes,
-            args.per_character,
-            args.seed,
-            args.scope,
-            args.steps,
-            args.refresh,
-            args.ascension,
-        )
-        print(json.dumps(result, indent=2))
-        if not result["eligible"]:
-            raise SystemExit(1)
-    elif args.command == "check-run":
+    if args.command == "check-run":
         from ai4sts2.runcheck import check
 
         result = check(

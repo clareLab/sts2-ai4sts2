@@ -44,15 +44,15 @@ def test_interrupted_report_keeps_candidate_metrics_without_claiming_completion(
             "validation_selection_score": 7.2 / 8.2,
         },
     )
-    report = pilot_report([result], "run", {"game": "test"}, {}, 2, interrupted=True)
+    report = pilot_report([result], "run", {"game": "test"}, 2, interrupted=True)
     assert not report["complete"] and report["interrupted"]
     assert not report["certifying"] and not report["promoted"]
     assert report["trials"][0]["mean_floor"] == 7.2
     assert report["trials"][0]["checkpoint"] == "saved"
     assert report["errors"] == []
-    assert pilot_report([result], "run", {}, {}, 2)["complete"]
-    assert not pilot_report([result], "run", {}, {}, 3)["complete"]
-    assert not pilot_report([], "run", {}, {}, 2)["complete"]
+    assert pilot_report([result], "run", {}, 2)["complete"]
+    assert not pilot_report([result], "run", {}, 3)["complete"]
+    assert not pilot_report([], "run", {}, 2)["complete"]
 
 
 def test_ablation_changes_one_factor_and_uses_identical_initialisation():

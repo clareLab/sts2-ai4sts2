@@ -35,7 +35,7 @@ def candidates(study, build, policy_modes=("deterministic",)):
         raise ValueError("Use distinct deterministic or sampled policy modes.")
     if not study["complete"] or not study["trials"] or study["build"] != build:
         raise ValueError("A complete study with the current build is required.")
-    result = [{"name": "random", "variant": "random", "checkpoint": None, "sha256": None}]
+    result = []
     for trial in study["trials"]:
         checkpoint = Path(trial["checkpoint"]).resolve()
         if json.loads((checkpoint / "build.json").read_text()) != build:
@@ -188,11 +188,13 @@ def aggregate(plan, records):
                 "errors": [row["error"] for row in rows if row and "error" in row],
             }
         )
-    baseline = reports[0]
-    if baseline["eligible"]:
+    reference = reports[0]
+    if reference["eligible"]:
         for report in reports[1:]:
             if report["eligible"]:
-                report["random_baseline_comparison"] = compare_evaluations(report, baseline)
+                report["reference_comparison"] = {"name": reference["name"]} | compare_evaluations(
+                    report, reference
+                )
     return {
         "complete": all(report["complete"] for report in reports),
         "eligible": all(report["eligible"] for report in reports),
@@ -301,10 +303,8 @@ def run(
             if not hasattr(local, "models"):
                 local.models = {}
             if candidate["name"] not in local.models:
-                local.models[candidate["name"]] = (
-                    MaskablePPO.load(Path(candidate["checkpoint"]) / "policy.zip", device="cpu")
-                    if candidate["checkpoint"]
-                    else None
+                local.models[candidate["name"]] = MaskablePPO.load(
+                    Path(candidate["checkpoint"]) / "policy.zip", device="cpu"
                 )
             if getattr(local, "environment", None) is None:
                 local.environment = Sts2Env(

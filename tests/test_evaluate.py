@@ -30,7 +30,10 @@ def suite(monkeypatch, tmp_path):
             {
                 "complete": True,
                 "build": {"game": "test"},
-                "trials": [{"checkpoint": str(checkpoint), "variant": "control", "seed": 7}],
+                "trials": [
+                    {"checkpoint": str(checkpoint), "variant": "control", "seed": 7},
+                    {"checkpoint": str(checkpoint), "variant": "candidate", "seed": 8},
+                ],
             }
         )
     )
@@ -80,13 +83,15 @@ def test_policy_uses_deterministic_legal_actions():
 def test_parallel_evaluation_reuses_completed_cases_and_closes_workers(suite):
     study, output, environments = suite
     result = holdout.run(study, output, per_character=1)
+    assert {trial["variant"] for trial in result["trials"]} == {"control", "candidate"}
     assert result["complete"] and result["eligible"]
     assert not result["certifying"] and not result["promoted"]
     assert 1 <= len(environments) <= 2
     assert all(environment.game.closed for environment in environments)
     assert len(list((output / "episodes").glob("*.json"))) == 10
     model = result["trials"][1]
-    assert model["random_baseline_comparison"]["mean_floor_difference"] == 0
+    assert model["reference_comparison"]["name"] == "control-7"
+    assert model["reference_comparison"]["mean_floor_difference"] == 0
     count = len(environments)
     assert holdout.run(study, output, per_character=1)["trials"] == result["trials"]
     assert len(environments) == count
@@ -175,7 +180,7 @@ def test_evaluation_switches_encoding_without_restarting_game(suite, monkeypatch
     monkeypatch.setattr(holdout.MaskablePPO, "load", lambda *_args, **_kwargs: Policy())
     result = holdout.run(study, output, per_character=1, workers=1)
     assert result["complete"] and result["eligible"]
-    assert len(observed) == 20
+    assert len(observed) == 40
     assert len(environments) == 1
     assert environments[0].game.closed
 
@@ -236,7 +241,7 @@ def test_paused_cases_are_resumed_but_completed_cases_are_not_repeated(suite, mo
     assert not first["complete"]
     assert sum(len(trial["episodes"]) for trial in first["trials"]) == 9
     assert all(not trial["errors"] for trial in first["trials"])
-    saved = json.loads((output / "episodes/0000-random.json").read_text())
+    saved = json.loads((output / "episodes/0000-control-7.json").read_text())
     assert len(saved["resume"]["environment"]["journal"]["actions"]) == 2
     files = {path: path.read_bytes() for path in (output / "episodes").glob("*.json")}
     second = holdout.run(study, output, per_character=1, workers=1)
@@ -244,7 +249,7 @@ def test_paused_cases_are_resumed_but_completed_cases_are_not_repeated(suite, mo
     assert all(environment.game.closed for environment in environments)
     assert len(environments[-1].game.calls) == 5
     assert sum(path.read_bytes() != data for path, data in files.items()) == 1
-    final = json.loads((output / "episodes/0000-random.json").read_text())
+    final = json.loads((output / "episodes/0000-control-7.json").read_text())
     assert "resume" not in final and "pending" not in final
 
 

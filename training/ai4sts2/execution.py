@@ -9,6 +9,7 @@ class Execution:
     non_interactive: bool = False
     fixed_fps: int = 0
     pause_idle: bool = True
+    reuse_process: bool = False
 
     def __post_init__(self):
         if self.fps < 0 or self.settle_frames < 1 or self.step_frames < 1 or self.fixed_fps < 0:
@@ -19,4 +20,4 @@ class Execution:
 
 
 REFERENCE = Execution(pause_idle=False)
-CANDIDATES = (Execution(fps=240),)
+CANDIDATES = (Execution(fps=0, non_interactive=True, pause_idle=False, reuse_process=True),)

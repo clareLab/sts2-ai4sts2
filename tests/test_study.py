@@ -320,7 +320,7 @@ def test_completed_training_is_reused_and_invalid_evaluation_is_failed(
                 "mean_floor": 3,
                 "episodes": [{"floor": 3, "act": 0, "victory": False}],
             }
-            for variant in ("random", "fixed", "pbt")
+            for variant in ("fixed", "pbt")
         ],
     }
     monkeypatch.setattr(study.holdout, "run", lambda *_args, **_kwargs: evaluation)

@@ -134,7 +134,7 @@ def test_policy_transfer_keeps_weights_and_fresh_task_state(monkeypatch, tmp_pat
     donor.model.learn(64)
     donor.save_checkpoint(tmp_path)
     receiver = member(monkeypatch, policy="shared")
-    receiver.build |= {"scope": "act1", "trainer": "new", "ascension": 0}
+    receiver.build |= {"scope": "act1", "trainer": "new", "mod": "telemetry-update", "ascension": 0}
     rng = random.getstate(), np.random.get_state(), torch.get_rng_state().clone()
     environment = copy.deepcopy(receiver.environment.snapshot())
     receiver.initialise_policy(tmp_path)
@@ -154,9 +154,10 @@ def test_policy_transfer_keeps_weights_and_fresh_task_state(monkeypatch, tmp_pat
         other.initialise_policy(tmp_path)
     other.cleanup()
     build = json.loads((tmp_path / "build.json").read_text())
-    (tmp_path / "build.json").write_text(json.dumps(build | {"schema": 2}))
-    with pytest.raises(ValueError, match="matching"):
-        receiver.initialise_policy(tmp_path)
+    for field in ("schema", "game", "dependencies"):
+        (tmp_path / "build.json").write_text(json.dumps(build | {field: "changed"}))
+        with pytest.raises(ValueError, match="matching"):
+            receiver.initialise_policy(tmp_path)
     donor.cleanup()
     receiver.cleanup()
 

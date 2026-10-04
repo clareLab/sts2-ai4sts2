@@ -327,7 +327,7 @@ def fit_population(experiment, plan, resources, deadline):
 def summary(output, plan, stage, training=None, evaluation=None):
     groups = {}
     if evaluation and evaluation["eligible"]:
-        for variant in ("random", "fixed", "pbt"):
+        for variant in ("fixed", "pbt"):
             members = [trial for trial in evaluation["trials"] if trial["variant"] == variant]
             episodes = [episode for trial in members for episode in trial["episodes"]]
             groups[variant] = {

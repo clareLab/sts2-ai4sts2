@@ -170,7 +170,7 @@ class OfficialGame:
         started = time.perf_counter()
         restart_ms = 0.0
         if method == "reset":
-            if getattr(self, "_has_episode", False):
+            if getattr(self, "_has_episode", False) and not self._launch["execution"].reuse_process:
                 self.close()
                 self._open(**self._launch)
                 restart_ms = (time.perf_counter() - started) * 1000
