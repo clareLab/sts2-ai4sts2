@@ -118,3 +118,86 @@ def test_torchrl_replay_increases_successful_legal_action_probability():
         assert len(buffer) == 8 and model.num_timesteps == 0
     finally:
         environment.close()
+
+
+@pytest.mark.parametrize("updates", [0, 1, 4])
+def test_replay_runs_after_each_ppo_update_and_never_before_it(updates):
+    from ai4sts2.environment import Sts2Env
+    from ai4sts2.policy import SharedActionPolicy
+    from ai4sts2.replay import SelfImitationCallback
+    from sb3_contrib import MaskablePPO
+    from tensordict import TensorDict
+    from test_environment import FakeWorker
+    from torchrl.data import TensorDictReplayBuffer, TensorStorage
+
+    torch.set_num_threads(1)
+    environment = Sts2Env(worker_factory=FakeWorker)
+    try:
+        model = MaskablePPO(
+            SharedActionPolicy, environment, n_steps=8, batch_size=8, n_epochs=1, seed=7
+        )
+        observation, _ = environment.reset(seed=11)
+        data = TensorDict(
+            {
+                "observation": TensorDict(
+                    {key: torch.tensor(value)[None] for key, value in observation.items()},
+                    batch_size=[1],
+                ),
+                "action": torch.zeros(1, dtype=torch.long),
+                "action_mask": torch.tensor(environment.action_masks())[None],
+                "return": torch.ones(1),
+            },
+            batch_size=[1],
+        )
+        generator = torch.Generator().manual_seed(7)
+        buffer = TensorDictReplayBuffer(
+            storage=TensorStorage(data), batch_size=8, generator=generator
+        )
+        callback = SelfImitationCallback(buffer, updates, 0.01)
+        rng_before = generator.get_state().clone()
+        model.learn(total_timesteps=24, callback=callback)
+        assert model.num_timesteps == 24 and model._n_updates == 3
+        assert len(callback.diagnostics) == updates * 3
+        assert [row["ppo_updates"] for row in callback.diagnostics] == [
+            count for count in (1, 2, 3) for _ in range(updates)
+        ]
+        assert [row["environment_steps"] for row in callback.diagnostics] == [
+            count for count in (8, 16, 24) for _ in range(updates)
+        ]
+        if not updates:
+            assert torch.equal(generator.get_state(), rng_before)
+        model.learn(total_timesteps=8, reset_num_timesteps=False, callback=callback)
+        assert len(callback.diagnostics) == updates * 4
+        if updates:
+            assert callback.diagnostics[-1]["ppo_updates"] == 4
+    finally:
+        environment.close()
+
+
+@pytest.mark.parametrize("updates", [-1, 0.5, True])
+def test_invalid_replay_update_counts_are_rejected(updates):
+    from ai4sts2.replay import SelfImitationCallback
+
+    with pytest.raises(ValueError):
+        SelfImitationCallback(None, updates, 0.01)
+
+
+def test_interrupted_rollout_does_not_replay_without_a_ppo_update():
+    from ai4sts2.environment import Sts2Env
+    from ai4sts2.replay import SelfImitationCallback
+    from sb3_contrib import MaskablePPO
+    from test_environment import FakeWorker
+
+    class Stop(SelfImitationCallback):
+        def _on_step(self):
+            return False
+
+    environment = Sts2Env(worker_factory=FakeWorker)
+    try:
+        model = MaskablePPO("MultiInputPolicy", environment, n_steps=8, batch_size=8)
+        callback = Stop(None, 1, 0.01)
+        model.learn(total_timesteps=8, callback=callback)
+        assert model.num_timesteps == 1 and model._n_updates == 0
+        assert callback.diagnostics == []
+    finally:
+        environment.close()

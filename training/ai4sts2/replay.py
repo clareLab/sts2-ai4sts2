@@ -2,6 +2,7 @@ import math
 
 import numpy as np
 import torch
+from stable_baselines3.common.callbacks import BaseCallback
 
 
 def episode_returns(rewards, discount):
@@ -40,3 +41,58 @@ def self_imitation_loss(values, log_probabilities, returns, value_coefficient=0.
         "value_loss": value_loss.detach(),
         "positive_advantage_fraction": (advantage > 0).float().mean().detach(),
     }
+
+
+class SelfImitationCallback(BaseCallback):
+    def __init__(self, buffer, updates, value_coefficient):
+        super().__init__()
+        if isinstance(updates, bool) or not isinstance(updates, int) or updates < 0:
+            raise ValueError("Use a non-negative integer replay update count.")
+        if not math.isfinite(value_coefficient) or value_coefficient < 0:
+            raise ValueError("Use a finite non-negative value coefficient.")
+        self.buffer = buffer
+        self.updates = updates
+        self.value_coefficient = value_coefficient
+        self.diagnostics = []
+
+    def _on_training_start(self):
+        self.previous_updates = self.model._n_updates
+
+    def _on_step(self):
+        return True
+
+    def _on_rollout_start(self):
+        self.update()
+
+    def _on_training_end(self):
+        self.update()
+
+    def update(self):
+        if self.model._n_updates == self.previous_updates:
+            return
+        self.previous_updates = self.model._n_updates
+        policy = self.model.policy
+        policy.set_training_mode(True)
+        for _ in range(self.updates):
+            batch = self.buffer.sample().to(self.model.device)
+            values, log_probabilities, _ = policy.evaluate_actions(
+                dict(batch["observation"]), batch["action"], action_masks=batch["action_mask"]
+            )
+            loss, metrics = self_imitation_loss(
+                values.flatten(), log_probabilities, batch["return"], self.value_coefficient
+            )
+            policy.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            norm = torch.nn.utils.clip_grad_norm_(
+                policy.parameters(), self.model.max_grad_norm, error_if_nonfinite=True
+            )
+            policy.optimizer.step()
+            self.diagnostics.append(
+                {
+                    "environment_steps": self.model.num_timesteps,
+                    "ppo_updates": self.model._n_updates,
+                    "loss": float(loss.detach()),
+                    "gradient_norm": float(norm),
+                    **{key: float(value) for key, value in metrics.items()},
+                }
+            )
