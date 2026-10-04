@@ -95,8 +95,8 @@ def next_sample_count(training_seconds, evaluation_seconds, steps, rollout_size)
     return max(rollout_size, min(2048, math.ceil(estimate / rollout_size) * rollout_size))
 
 
-def search_space():
-    return {
+def search_space(policy="flat"):
+    parameters = {
         "learning_rate": tune.loguniform(1e-5, 3e-3),
         "entropy": tune.loguniform(1e-5, 0.1),
         "gamma": tune.uniform(0.95, 1.0),
@@ -107,10 +107,13 @@ def search_space():
         "curriculum_mix": tune.choice([0.0, 0.25, 0.5, 0.75, 0.95]),
         "curriculum_alpha": tune.loguniform(0.02, 0.3),
     }
+    if policy == "shared":
+        parameters["temperature"] = tune.loguniform(0.1, 1.0)
+    return parameters
 
 
 def bound_mutations(config):
-    for name, domain in search_space().items():
+    for name, domain in search_space(config.get("policy", "flat")).items():
         if hasattr(domain, "lower"):
             config[name] = min(
                 math.nextafter(domain.upper, domain.lower), max(domain.lower, config[name])
@@ -120,10 +123,10 @@ def bound_mutations(config):
     return config
 
 
-def mutation_space():
+def mutation_space(policy="flat"):
     return {
         name: domain.categories if hasattr(domain, "categories") else domain
-        for name, domain in search_space().items()
+        for name, domain in search_space(policy).items()
     }
 
 
@@ -589,16 +592,18 @@ def run(
                     mode="max",
                     perturbation_interval=2,
                     burn_in_period=2,
-                    hyperparam_mutations=mutation_space(),
+                    hyperparam_mutations=mutation_space(policy),
                     custom_explore_fn=bound_mutations,
                     synch=False,
                 )
-                parameters = search_space() | {
+                parameters = search_space(policy) | {
                     "seed": tune.randint(1, 2**30),
                     "policy": policy,
                     "width": width,
                     "encoding": encoding,
                 }
+                if policy == "shared":
+                    parameters["temperature"] = 0.5
             tuner = tune.Tuner(
                 trainable,
                 tune_config=tune.TuneConfig(

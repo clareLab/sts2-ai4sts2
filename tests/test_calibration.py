@@ -54,6 +54,20 @@ def test_pbt_mutations_remain_within_valid_parameter_domains():
         assert domain.is_valid(result[key])
 
 
+def test_shared_policy_temperature_is_mutable_without_changing_legacy_policies():
+    from ai4sts2.train import mutation_space
+
+    assert "temperature" not in search_space()
+    assert "temperature" not in mutation_space()
+    for value in (-2.0, 0.5, 3.0):
+        config = {name: domain.sample() for name, domain in search_space("shared").items()}
+        config |= {"policy": "shared", "temperature": value}
+        bounded = bound_mutations(config)
+        assert mutation_space("shared")["temperature"].is_valid(bounded["temperature"])
+        if value == 0.5:
+            assert bounded["temperature"] == value
+
+
 def test_concurrent_recovery_retains_every_failed_execution(monkeypatch, tmp_path):
     import json
     from concurrent.futures import ThreadPoolExecutor
