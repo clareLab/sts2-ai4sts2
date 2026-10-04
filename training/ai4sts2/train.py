@@ -1,3 +1,4 @@
+import gc
 import hashlib
 import json
 import math
@@ -645,6 +646,7 @@ class PopulationMember(tune.Trainable):
         if self.replay_callback is not None:
             self.replay_callback.buffer = self.replay_buffer
         collector.records.clear()
+        gc.collect()
 
     def reset_config(self, new_config):
         self.cleanup()

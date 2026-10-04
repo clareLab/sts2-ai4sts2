@@ -217,6 +217,24 @@ def test_capacity_is_checked_before_loading_episode_arrays(replay_corpus):
         replay_dataset(replay_corpus, {"game": "test", "schema": 1}, 1, capacity=1)
 
 
+def test_refresh_releases_previous_tensor_storage(collector_member):
+    import gc
+    import weakref
+
+    candidate = collector_member
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(2):
+            previous = weakref.ref(candidate.replay_buffer.storage)
+            candidate.step()
+            assert previous() is None
+    finally:
+        if enabled:
+            gc.enable()
+        gc.collect()
+
+
 def test_native_failure_rewinds_collection_with_the_training_checkpoint(
     collector_member, monkeypatch, tmp_path
 ):
