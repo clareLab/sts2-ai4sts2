@@ -34,7 +34,7 @@ def verify_trial(trial, build):
         raise ValueError("The source checkpoint has changed.")
 
 
-def prepare(output, initial, steps, per_character, transfer, compare_replay=False):
+def prepare(output, initial, steps, per_character, transfer, compare_replay=False, incumbent=None):
     if steps < 64 or steps % 64 or per_character < 1:
         raise ValueError("Use positive whole rollouts and positive evaluation case counts.")
     initial = Path(initial).resolve()
@@ -60,6 +60,14 @@ def prepare(output, initial, steps, per_character, transfer, compare_replay=Fals
         raise ValueError("The game, bridge, dependencies and observation schema must match.")
     if source["build"] != build and not transfer:
         raise ValueError("Trainer changed; use --transfer for weights with a fresh optimiser.")
+    if incumbent is not None and transfer:
+        raise ValueError("An incumbent requires checkpoint continuation without policy transfer.")
+    reference = load(incumbent) if incumbent is not None else source.get("incumbent", source)
+    if transfer:
+        reference = source
+    elif not reference["complete"] or len(reference["trials"]) != 1 or reference["build"] != build:
+        raise ValueError("The incumbent requires one complete model with the current build.")
+    verify_trial(reference["trials"][0], reference["build"])
     request = {
         "initial": str(initial),
         "source_sha256": holdout.digest(initial),
@@ -67,6 +75,7 @@ def prepare(output, initial, steps, per_character, transfer, compare_replay=Fals
         "per_character": per_character,
         "transfer": transfer,
         "compare_replay": compare_replay,
+        "incumbent_sha256": identity(reference),
         "build": build,
         "runner": {
             name: holdout.digest(Path(__file__).with_name(name))
@@ -87,14 +96,18 @@ def prepare(output, initial, steps, per_character, transfer, compare_replay=Fals
         per_character,
         build["ascension"],
     )
-    if source.get("validation_panel") is not None and source["validation_panel"] != panel:
+    if any(
+        document.get("validation_panel") is not None and document["validation_panel"] != panel
+        for document in (source, reference)
+    ):
         raise ValueError("Keep the frozen development panel unchanged.")
     plan = {
         "request": request,
         "source": trial,
         "source_build": source["build"],
-        "cached_validation": source.get("selected_validation")
-        if not transfer and source.get("evaluation_runner") == holdout.digest(holdout.__file__)
+        "incumbent": reference["trials"][0] if not transfer else None,
+        "cached_validation": reference.get("selected_validation")
+        if not transfer and reference.get("evaluation_runner") == holdout.digest(holdout.__file__)
         else None,
         "validation_panel": panel,
         "training_seed": secrets.randbits(31) if transfer else trial["seed"],
@@ -252,6 +265,8 @@ def cache_reference(output, plan, candidate):
         not cached["complete"]
         or not cached["eligible"]
         or cached["sha256"] != candidate["sha256"]
+        or cached.get("policy_mode", "deterministic")
+        != candidate.get("policy_mode", "deterministic")
         or cached["evaluation_id"] != plan["validation_panel"]["evaluation_id"]
         or len(cached["episodes"]) != len(plan["validation_panel"]["cases"])
     ):
@@ -276,7 +291,7 @@ def validate(output, plan, current, deadline, workers):
     current = current if isinstance(current, list) else [current]
     reference = load(training_jobs(output, plan)[0][0] / "reference.json")
     if not plan["request"]["transfer"]:
-        reference = plan["source"]
+        reference = plan["incumbent"]
     trials = [reference | {"variant": "reference"}, *current]
     build = plan["request"]["build"]
     comparison = {"complete": True, "build": build, "trials": trials}
@@ -319,22 +334,23 @@ def save_selection(output, plan, trials, result):
     continuation = max(
         range(1, len(trials)), key=lambda index: holdout.progression_key(result["trials"][index])
     )
-    for filename, index in (("selection.json", best), ("continuation.json", continuation)):
-        write_json(
-            output / filename,
-            {
-                "complete": True,
-                "build": plan["request"]["build"],
-                "trials": [trials[index] | {"variant": "control"}],
-                "validation_panel": plan["validation_panel"],
-                "selected_validation": result["trials"][index],
-                "evaluation_runner": holdout.digest(holdout.__file__),
-                "selected_by_validation": index == best,
-                "selected_for_training_only": True,
-                "certifying": False,
-                "promoted": False,
-            },
-        )
+    documents = [
+        {
+            "complete": True,
+            "build": plan["request"]["build"],
+            "trials": [trials[index] | {"variant": "control"}],
+            "validation_panel": plan["validation_panel"],
+            "selected_validation": result["trials"][index],
+            "evaluation_runner": holdout.digest(holdout.__file__),
+            "selected_by_validation": index == best,
+            "selected_for_training_only": True,
+            "certifying": False,
+            "promoted": False,
+        }
+        for index in (best, continuation)
+    ]
+    write_json(output / "selection.json", documents[0])
+    write_json(output / "continuation.json", documents[1] | {"incumbent": documents[0]})
 
 
 def run(
@@ -346,6 +362,7 @@ def run(
     transfer=False,
     workers=0,
     compare_replay=False,
+    incumbent=None,
 ):
     if not 0 < minutes <= 30:
         raise ValueError("Use a budget between zero and 30 minutes.")
@@ -354,7 +371,7 @@ def run(
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     with FileLock(output / "run.lock", timeout=0):
-        plan = prepare(output, initial, steps, per_character, transfer, compare_replay)
+        plan = prepare(output, initial, steps, per_character, transfer, compare_replay, incumbent)
         resources = budget().report(workers)
         report = {"complete": False, "build": plan["request"]["build"], "resources": resources}
         try:
@@ -405,6 +422,7 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--transfer", action="store_true")
     parser.add_argument("--compare-replay", action="store_true")
+    parser.add_argument("--incumbent")
     result = run(**vars(parser.parse_args()))
     print(json.dumps({"complete": result["complete"], "seconds": result["seconds"]}), flush=True)
     if not result["complete"]:

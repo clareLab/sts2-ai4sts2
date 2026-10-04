@@ -148,6 +148,7 @@ def test_reference_cache_requires_identical_weights_and_validation_panel(tmp_pat
     plan = {"cached_validation": cached, "validation_panel": panel}
     assert advance.cache_reference(tmp_path, plan, candidate) == 5
     assert advance.cache_reference(tmp_path, plan, candidate | {"sha256": "different"}) == 0
+    assert advance.cache_reference(tmp_path, plan, candidate | {"policy_mode": "sampled"}) == 0
     cached["evaluation_id"] = "test-panel"
     assert advance.cache_reference(tmp_path, plan, candidate) == 0
     record = json.loads(next((tmp_path / "episodes").glob("*.json")).read_text())
@@ -170,6 +171,7 @@ def test_training_continues_forward_when_validation_selects_an_earlier_checkpoin
     assert continuation["trials"][0]["checkpoint"] == "latest"
     assert continuation["selected_validation"] == reports[1]
     assert continuation["selected_by_validation"] == (winner == 1)
+    assert continuation["incumbent"] == selected
     with pytest.raises(ValueError, match="complete eligible"):
         advance.save_selection(tmp_path, plan, trials, result | {"eligible": False})
 
@@ -298,6 +300,85 @@ def test_comparison_keeps_incumbent_and_selects_a_trained_continuation(
     continuation = json.loads((tmp_path / "continuation.json").read_text())
     assert selected["trials"][0]["checkpoint"] == trials[winner]["checkpoint"]
     assert continuation["trials"][0]["checkpoint"] == ("online" if winner == 2 else "fixed")
+    assert continuation["incumbent"] == selected
+
+
+def test_later_round_keeps_global_incumbent_and_reuses_its_validation(frozen, monkeypatch):
+    import ai4sts2.train as training
+
+    path, output, source = frozen
+    monkeypatch.setattr(advance, "prepare_game", lambda: "fake")
+    monkeypatch.setattr(training, "fingerprint", lambda *_: source["build"])
+    monkeypatch.setattr(holdout, "progression_key", lambda report: report["rank"])
+    plan = advance.prepare(output, path, 64, 2, False)
+    first = advance.train(output, plan, time.monotonic() + 300)
+    original = source["trials"][0]
+    report = {
+        "complete": True,
+        "eligible": True,
+        "rank": 1,
+        "sha256": holdout.digest(Path(original["checkpoint"]) / "policy.zip"),
+        "evaluation_id": plan["validation_panel"]["evaluation_id"],
+        "episodes": [
+            {"character": case["character"], "seed": case["seed"]}
+            for case in plan["validation_panel"]["cases"]
+        ],
+    }
+    advance.save_selection(
+        output,
+        plan,
+        [original, first],
+        {"complete": True, "eligible": True, "trials": [report, report | {"rank": 0}]},
+    )
+    next_output = output / "next"
+    next_output.mkdir()
+    next_plan = advance.prepare(next_output, output / "continuation.json", 64, 2, False)
+    assert next_plan["source"]["checkpoint"] == first["checkpoint"]
+    assert next_plan["incumbent"]["checkpoint"] == original["checkpoint"]
+    assert next_plan["cached_validation"] == report
+    assert next_plan["training_seed"] == plan["training_seed"]
+    assert next_plan["target_steps"] == first["environment_steps"] + 64
+    second = advance.train(next_output, next_plan, time.monotonic() + 300)
+
+    def evaluate(study_path, directory, *args, **kwargs):
+        comparison = json.loads(Path(study_path).read_text())
+        assert [trial["checkpoint"] for trial in comparison["trials"]] == [
+            original["checkpoint"],
+            second["checkpoint"],
+        ]
+        assert len(list((directory / "episodes").glob("*.json"))) == 10
+        return {"complete": True, "eligible": True, "trials": [report, report | {"rank": 0}]}
+
+    monkeypatch.setattr(holdout, "run", evaluate)
+    result = advance.validate(next_output, next_plan, second, time.monotonic() + 300, 2)
+    assert result["cached_episodes"] == 10
+    continuation = json.loads((next_output / "continuation.json").read_text())
+    assert continuation["trials"][0]["checkpoint"] == second["checkpoint"]
+    assert continuation["incumbent"]["trials"][0]["checkpoint"] == original["checkpoint"]
+    assert "incumbent" not in continuation["incumbent"]
+
+
+def test_external_incumbent_requires_same_build_panel_and_frozen_source(frozen):
+    path, output, source = frozen
+    reference = output / "incumbent.json"
+    write_json(reference, source)
+    plan = advance.prepare(output, path, 64, 2, False, incumbent=reference)
+    assert plan["incumbent"] == source["trials"][0]
+    with pytest.raises(ValueError, match="without policy transfer"):
+        advance.prepare(output, path, 64, 2, True, incumbent=reference)
+    changed = copy.deepcopy(source)
+    changed["build"]["trainer"] = "old"
+    write_json(reference, changed)
+    with pytest.raises(ValueError, match="current build"):
+        advance.prepare(output, path, 64, 2, False, incumbent=reference)
+    changed = source | {"validation_panel": {"split": "test"}}
+    write_json(reference, changed)
+    with pytest.raises(ValueError, match="different request"):
+        advance.prepare(output, path, 64, 2, False, incumbent=reference)
+    other = output / "other"
+    other.mkdir()
+    with pytest.raises(ValueError, match="panel unchanged"):
+        advance.prepare(other, path, 64, 2, False, incumbent=reference)
 
 
 def test_parallel_round_uses_isolated_processes_and_shared_budget(monkeypatch, tmp_path):
