@@ -214,6 +214,8 @@ class PopulationMember(tune.Trainable):
         policy = config.get("policy", "flat")
         if policy not in {"flat", "shared"}:
             raise ValueError("Unknown policy architecture.")
+        if policy != "shared" and config.get("temperature", 1.0) != 1.0:
+            raise ValueError("Sampling temperature requires the shared policy.")
         encoding = config.get("encoding", "hash")
         if encoding not in {"hash", "tree"} or (encoding == "tree" and policy != "shared"):
             raise ValueError("Structured observations require the shared policy.")
@@ -246,7 +248,11 @@ class PopulationMember(tune.Trainable):
             gae_lambda=config.get("gae_lambda", 0.95),
             clip_range=config.get("clip_range", 0.2),
             policy_kwargs=(
-                {"width": config.get("width", 64), "encoding": encoding}
+                {
+                    "width": config.get("width", 64),
+                    "encoding": encoding,
+                    "temperature": config.get("temperature", 1.0),
+                }
                 if policy == "shared"
                 else {"net_arch": {"pi": [64], "vf": [64]}}
             ),
@@ -341,6 +347,7 @@ class PopulationMember(tune.Trainable):
         result = evaluate(
             self.model,
             self.validation_environment,
+            seed=self.config.get("validation_seed", 0),
             max_steps=self.validation_environment.max_steps,
         )
         evaluation_seconds = time.monotonic() - started
@@ -452,6 +459,12 @@ class PopulationMember(tune.Trainable):
             raise ValueError("Checkpoint policy architecture does not match the configuration.")
         if getattr(self.model.policy, "encoding", "hash") != config.get("encoding", "hash"):
             raise ValueError("Checkpoint observation encoding does not match the configuration.")
+        temperature = config.get("temperature", 1.0)
+        if actual == "shared":
+            self.model.policy.temperature = temperature
+            self.model.policy_kwargs["temperature"] = temperature
+        elif temperature != 1.0:
+            raise ValueError("Sampling temperature requires the shared policy.")
         self.signals.configure(config)
         self.model.learning_rate = config["learning_rate"]
         self.model.lr_schedule = FloatSchedule(config["learning_rate"])

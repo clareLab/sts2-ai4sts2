@@ -84,3 +84,50 @@ def test_scoring_uses_both_state_and_action_content():
     tensors = policy.obs_to_tensor(empty)[0]
     assert torch.isfinite(policy.predict_values(tensors)).all()
     environment.close()
+
+
+@pytest.mark.parametrize("temperature", [0.1, 0.5, 1.0, 2.0])
+def test_temperature_preserves_masks_values_and_on_policy_probabilities(temperature):
+    torch.set_num_threads(1)
+    torch.manual_seed(71)
+    environment = Sts2Env(worker_factory=FakeWorker)
+    policy = SharedActionPolicy(
+        environment.observation_space, environment.action_space, lambda _: 0.001
+    )
+    observations, masks = sample()
+    tensors = policy.obs_to_tensor(observations)[0]
+    with torch.no_grad():
+        original = policy.get_distribution(tensors, action_masks=masks)
+        logits = original.distribution.logits.clone()
+        values = policy.predict_values(tensors)
+        policy.temperature = temperature
+        distribution = policy.get_distribution(tensors, action_masks=masks)
+        expected = torch.softmax(
+            (logits / temperature).masked_fill(~torch.tensor(masks), -torch.inf), dim=-1
+        )
+        torch.testing.assert_close(distribution.distribution.probs, expected)
+        assert torch.all(distribution.distribution.probs[~masks] == 0)
+        torch.testing.assert_close(policy.predict_values(tensors), values, rtol=0, atol=0)
+        actions, _, rollout_log_prob = policy(tensors, action_masks=masks)
+    _, update_log_prob, entropy = policy.evaluate_actions(tensors, actions, action_masks=masks)
+    torch.testing.assert_close(update_log_prob, rollout_log_prob, rtol=0, atol=0)
+    torch.testing.assert_close(
+        (update_log_prob - rollout_log_prob).exp(), torch.ones_like(update_log_prob)
+    )
+    (-update_log_prob.mean() - 0.01 * entropy.mean()).backward()
+    assert torch.isfinite(policy.action_net[0].weight.grad).all()
+    assert policy.action_net[0].weight.grad.abs().sum() > 0
+    environment.close()
+
+
+@pytest.mark.parametrize("temperature", [0, -1, float("nan"), float("inf")])
+def test_temperature_rejects_invalid_values(temperature):
+    environment = Sts2Env(worker_factory=FakeWorker)
+    with pytest.raises(ValueError, match="temperature"):
+        SharedActionPolicy(
+            environment.observation_space,
+            environment.action_space,
+            lambda _: 0.001,
+            temperature=temperature,
+        )
+    environment.close()

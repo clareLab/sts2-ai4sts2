@@ -148,6 +148,22 @@ def test_snapshot_is_independent_and_never_exposes_seed_to_features():
     environment.close()
 
 
+def test_training_validation_uses_the_predeclared_seed_panel(monkeypatch, tmp_path):
+    from ai4sts2.environment import evaluation_plan
+
+    candidate = long_member(monkeypatch, tmp_path)
+    try:
+        candidate.config |= {"validation_seed": 812349}
+        candidate.sample_count = 64
+        result = candidate.step()
+        expected = evaluation_plan(
+            candidate.scope, 812349, max_steps=candidate.validation_environment.max_steps
+        )
+        assert result["evaluation_id"] == expected["evaluation_id"]
+    finally:
+        candidate.cleanup()
+
+
 def test_evaluation_cannot_clear_training_observation(monkeypatch, tmp_path):
     candidate = long_member(monkeypatch, tmp_path)
     candidate.model.learn(total_timesteps=64)

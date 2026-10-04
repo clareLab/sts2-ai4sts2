@@ -87,22 +87,39 @@ class SharedCategorical(MaskableCategoricalDistribution):
 
 
 class SharedActionPolicy(MaskableMultiInputActorCriticPolicy):
-    def __init__(self, *args, width=64, encoding="hash", **kwargs):
+    def __init__(self, *args, width=64, encoding="hash", temperature=1.0, **kwargs):
         if not isinstance(width, int) or width < 1:
             raise ValueError("Use a positive network width.")
         self.width = width
         if encoding not in {"hash", "tree"}:
             raise ValueError("Unknown observation encoding.")
         self.encoding = encoding
+        self.temperature = temperature
         kwargs["features_extractor_class"] = TreeFeatures if encoding == "tree" else ActionFeatures
         super().__init__(*args, **kwargs)
+
+    @property
+    def temperature(self):
+        return self._temperature
+
+    @temperature.setter
+    def temperature(self, value):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("Use a finite positive sampling temperature.")
+        self._temperature = float(value)
 
     def _build_mlp_extractor(self):
         self.mlp_extractor = ActionNetwork(self.features_extractor, self.width).to(self.device)
         self.action_dist = SharedCategorical(self.action_space.n)
 
+    def _get_action_dist_from_latent(self, latent_pi):
+        return self.action_dist.proba_distribution(
+            action_logits=self.action_net(latent_pi) / self.temperature
+        )
+
     def _get_constructor_parameters(self):
         return super()._get_constructor_parameters() | {
             "width": self.width,
             "encoding": self.encoding,
+            "temperature": self.temperature,
         }

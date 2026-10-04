@@ -121,3 +121,38 @@ def test_structured_member_resumes_optimizer_and_unfinished_episode(monkeypatch,
     finally:
         for instance in (donor, receiver, incompatible):
             instance.cleanup()
+
+
+def test_temperature_mutation_survives_model_and_policy_serialisation(monkeypatch, tmp_path):
+    from ai4sts2.policy import SharedActionPolicy
+    from sb3_contrib import MaskablePPO
+    from test_policy import probabilities, sample
+
+    donor = member(monkeypatch, policy="shared")
+    receiver = member(monkeypatch, policy="shared")
+    try:
+        donor.config |= {"temperature": 0.5}
+        donor.apply_parameters(donor.config)
+        donor.model.learn(64)
+        donor.save_checkpoint(tmp_path)
+        receiver.config |= {"temperature": 0.2}
+        receiver.load_checkpoint(tmp_path)
+        assert receiver.model.policy.temperature == 0.2
+        for name, value in donor.model.policy.state_dict().items():
+            torch.testing.assert_close(
+                receiver.model.policy.state_dict()[name], value, rtol=0, atol=0
+            )
+        observations, masks = sample()
+        expected, _ = probabilities(receiver.model.policy, observations, masks)
+        receiver.model.save(tmp_path / "mutated.zip")
+        receiver.model.policy.save(tmp_path / "policy.pt")
+        restored = MaskablePPO.load(tmp_path / "mutated.zip", device="cpu")
+        standalone = SharedActionPolicy.load(tmp_path / "policy.pt", device="cpu")
+        for policy in (restored.policy, standalone):
+            assert policy.temperature == 0.2
+            torch.testing.assert_close(
+                probabilities(policy, observations, masks)[0], expected, rtol=0, atol=0
+            )
+    finally:
+        donor.cleanup()
+        receiver.cleanup()
