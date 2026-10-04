@@ -7,14 +7,18 @@ from ai4sts2.execution import REFERENCE
 from ai4sts2.game import ROOT, prepare_game
 
 
-def run(minutes=5, per_character=1, seed=0, scope="run", max_steps=4096, refresh=False):
+def run(
+    minutes=5, per_character=1, seed=0, scope="run", max_steps=4096, refresh=False, ascension=10
+):
     if not 0 < minutes <= 30:
         raise ValueError("Use a budget between zero and 30 minutes.")
     if scope not in SCOPES:
         raise ValueError("Unknown episode scope.")
-    plan = evaluation_plan(scope, seed=seed, max_steps=max_steps, per_character=per_character)
-    build = fingerprint(scope)
-    path = ROOT / f"artifacts/validation/random-baseline-{scope}.json"
+    plan = evaluation_plan(
+        scope, seed=seed, max_steps=max_steps, per_character=per_character, ascension=ascension
+    )
+    build = fingerprint(scope, ascension)
+    path = ROOT / f"artifacts/validation/random-baseline-{scope}-a{ascension}.json"
     if not refresh and path.is_file():
         cached = json.loads(path.read_text())
         if (
@@ -26,7 +30,7 @@ def run(minutes=5, per_character=1, seed=0, scope="run", max_steps=4096, refresh
             return cached
     started = time.monotonic()
     deadline = started + minutes * 60
-    execution = selected_execution(scope) or REFERENCE
+    execution = selected_execution(scope, ascension) or REFERENCE
     report = plan | {
         "build": build,
         "policy": "uniform_random",
@@ -56,7 +60,13 @@ def run(minutes=5, per_character=1, seed=0, scope="run", max_steps=4096, refresh
         )
 
     try:
-        environment = Sts2Env(prepare_game(), scope=scope, execution=execution, max_steps=max_steps)
+        environment = Sts2Env(
+            prepare_game(),
+            scope=scope,
+            execution=execution,
+            max_steps=max_steps,
+            ascension=ascension,
+        )
         evaluate(
             None,
             environment,

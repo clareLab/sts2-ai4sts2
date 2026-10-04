@@ -61,7 +61,7 @@ def test_concurrent_recovery_retains_every_failed_execution(monkeypatch, tmp_pat
     import ai4sts2.calibration as calibration
     from ai4sts2.environment import write_json
 
-    path = tmp_path / "artifacts/runtime.json"
+    path = tmp_path / "artifacts/runtime-a10.json"
     candidates = [Execution(fps=fps) for fps in (60, 120, 240)]
     write_json(
         path,
@@ -73,7 +73,7 @@ def test_concurrent_recovery_retains_every_failed_execution(monkeypatch, tmp_pat
         },
     )
     monkeypatch.setattr(calibration, "ROOT", tmp_path)
-    monkeypatch.setattr(calibration, "cached_report", lambda _: json.loads(path.read_text()))
+    monkeypatch.setattr(calibration, "cached_report", lambda *_: json.loads(path.read_text()))
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(
             pool.map(

@@ -121,7 +121,7 @@ def test_baseline_cache_rejects_build_or_case_changes_and_keeps_partial_failures
     monkeypatch.setattr(baseline, "evaluate", fail)
     with pytest.raises(RuntimeError, match="Injected"):
         baseline.run(refresh=True)
-    saved = json.loads((tmp_path / "artifacts/validation/random-baseline-run.json").read_text())
+    saved = json.loads((tmp_path / "artifacts/validation/random-baseline-run-a10.json").read_text())
     assert not saved["complete"] and not saved["eligible"]
     assert saved["error"] == "Injected failure"
     assert workers[-1].closed

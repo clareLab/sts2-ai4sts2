@@ -9,13 +9,12 @@ from ai4sts2.environment import Sts2Env, evaluate, evaluation_plan
 from ai4sts2.metrics import summarise
 from ai4sts2.signals import TrainingSignals
 from test_checkpoint import member
-from test_environment import FakeWorker, state
+from test_environment import FakeWorker
 
 
 class ActWorker(FakeWorker):
     def request(self, method, parameters):
-        super().request(method, parameters)
-        result = state()
+        result = super().request(method, parameters)
         result["observation"] |= {
             "floor": (0, 8, 17, 18)[self.count],
             "act": int(self.count == 3),
@@ -131,13 +130,16 @@ def test_metrics_reject_mixed_tasks_and_unearned_success():
 
 def test_policy_transfer_keeps_weights_and_fresh_task_state(monkeypatch, tmp_path):
     donor = member(monkeypatch, policy="shared")
+    donor.build |= {"ascension": 10}
     donor.model.learn(64)
     donor.save_checkpoint(tmp_path)
     receiver = member(monkeypatch, policy="shared")
-    receiver.build |= {"scope": "act1", "trainer": "new"}
+    receiver.build |= {"scope": "act1", "trainer": "new", "ascension": 0}
     rng = random.getstate(), np.random.get_state(), torch.get_rng_state().clone()
     environment = copy.deepcopy(receiver.environment.snapshot())
     receiver.initialise_policy(tmp_path)
+    with pytest.raises(ValueError, match="do not match"):
+        receiver.load_checkpoint(tmp_path)
     assert receiver.model.num_timesteps == 0
     assert receiver.model.policy.optimizer.state_dict()["state"] == {}
     assert receiver.environment.snapshot() == environment
@@ -159,12 +161,13 @@ def test_policy_transfer_keeps_weights_and_fresh_task_state(monkeypatch, tmp_pat
     receiver.cleanup()
 
 
-def test_holdout_runner_uses_the_study_task(monkeypatch, tmp_path):
+@pytest.mark.parametrize("ascension", [0, 10])
+def test_holdout_runner_uses_the_study_task(monkeypatch, tmp_path, ascension):
     from ai4sts2.execution import Execution
     from ai4sts2.resources import GIB, Budget
     from test_evaluate import holdout
 
-    build = {"game": "test", "scope": "act1"}
+    build = {"game": "test", "scope": "act1", "ascension": ascension}
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     (checkpoint / "build.json").write_text(json.dumps(build))
@@ -179,7 +182,7 @@ def test_holdout_runner_uses_the_study_task(monkeypatch, tmp_path):
             }
         )
     )
-    monkeypatch.setattr(holdout, "fingerprint", lambda scope: build | {"scope": scope})
+    monkeypatch.setattr(holdout, "fingerprint", lambda scope, *_: build | {"scope": scope})
     monkeypatch.setattr(holdout, "budget", lambda: Budget(2, 8 * GIB))
     monkeypatch.setattr(holdout, "prepare_game", lambda: None)
     monkeypatch.setattr(holdout, "selected_execution", lambda *_: Execution())
@@ -190,6 +193,7 @@ def test_holdout_runner_uses_the_study_task(monkeypatch, tmp_path):
     report = holdout.run(study, tmp_path / "holdout", per_character=1)
     assert report["complete"] and report["eligible"]
     for trial in report["trials"]:
+        assert trial["ascension"] == ascension
         assert trial["scope"] == "act1" and trial["task_successes"] == 5
         assert trial["wins"] == 0
 
@@ -200,11 +204,11 @@ def test_act1_shares_native_calibration_without_sharing_task_identity(monkeypatc
 
     scopes = []
 
-    def fingerprint(scope):
+    def fingerprint(scope, ascension=10):
         scopes.append(scope)
         return {"scope": scope}
 
-    runtime = tmp_path / "artifacts/runtime.json"
+    runtime = tmp_path / "artifacts/runtime-a10.json"
     runtime.parent.mkdir()
     runtime.write_text(
         json.dumps(

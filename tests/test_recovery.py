@@ -22,7 +22,7 @@ def test_failed_execution_is_persistently_excluded_and_retries_are_bounded(
     monkeypatch.setattr(calibration, "hardware", lambda: {"cpu": "test"})
     fast = Execution(fps=0, fixed_fps=60, settle_frames=1, step_frames=1)
     write_json(
-        tmp_path / "artifacts/runtime.json",
+        tmp_path / "artifacts/runtime-a10.json",
         {
             "build": {"game": "test"},
             "hardware": {"cpu": "test"},
@@ -41,7 +41,7 @@ def test_failed_execution_is_persistently_excluded_and_retries_are_bounded(
         quarantine_execution(REFERENCE, WorkerFailure(reason))
     with pytest.raises(ValueError, match="No validated"):
         selected_execution()
-    report = json.loads((tmp_path / "artifacts/runtime.json").read_text())
+    report = json.loads((tmp_path / "artifacts/runtime-a10.json").read_text())
     assert report["selected"] is None
     assert all("runtime_failure" in r for r in report["results"])
 

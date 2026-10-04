@@ -56,12 +56,20 @@ def main():
         "--workers", type=int, default=0, help="Concurrent trials; zero selects automatically."
     )
     ablation.add_argument("--scope", choices=("run", "act1", "first_combat"), default="run")
+    for command in (calibration, baseline, pilot, ablation):
+        command.add_argument("--ascension", type=int, choices=range(11), default=10)
     args = parser.parse_args()
     if args.command == "baseline":
         from ai4sts2.baseline import run
 
         result = run(
-            args.minutes, args.per_character, args.seed, args.scope, args.steps, args.refresh
+            args.minutes,
+            args.per_character,
+            args.seed,
+            args.scope,
+            args.steps,
+            args.refresh,
+            args.ascension,
         )
         print(json.dumps(result, indent=2))
         if not result["eligible"]:
@@ -87,7 +95,7 @@ def main():
     elif args.command == "calibrate":
         from ai4sts2.calibration import calibrate
 
-        print(json.dumps(calibrate(args.minutes, args.scope), indent=2))
+        print(json.dumps(calibrate(args.minutes, args.scope, args.ascension), indent=2))
     elif args.command in {"pilot", "ablate"}:
         from ai4sts2.train import run
 
@@ -116,6 +124,7 @@ def main():
                     getattr(args, "width", 64),
                     getattr(args, "encoding", "hash"),
                     getattr(args, "initial_policy", None),
+                    args.ascension,
                 ),
                 indent=2,
             )

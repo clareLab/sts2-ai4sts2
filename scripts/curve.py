@@ -260,7 +260,7 @@ def run(study_path, output, targets=(1536, 3072), variant="control", minutes=20,
     output.mkdir(parents=True, exist_ok=True)
     with FileLock(output / "run.lock", timeout=0):
         study = json.loads(Path(study_path).read_text())
-        build = fingerprint(study["build"].get("scope", "run"))
+        build = fingerprint(study["build"].get("scope", "run"), study["build"].get("ascension", 10))
         inputs = sources(study, variant, build)
         targets = list(targets)
         if targets != sorted(set(targets)) or not targets or any(target % 64 for target in targets):

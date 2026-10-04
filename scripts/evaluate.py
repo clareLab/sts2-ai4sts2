@@ -182,12 +182,13 @@ def run(
     resources = budget().report(workers)
     study = json.loads(Path(study_path).read_text())
     scope = study["build"].get("scope", "run")
-    build = fingerprint(scope)
+    ascension = study["build"].get("ascension", 10)
+    build = fingerprint(scope, ascension)
     models = candidates(study, build, policy_modes)
     manifest = output / "plan.json"
     previous = json.loads(manifest.read_text()) if manifest.exists() else None
     seed = previous["cases"][0]["seed_index"] if previous else secrets.randbits(60)
-    plan = evaluation_plan(scope, seed, "test", 4096, per_character) | {
+    plan = evaluation_plan(scope, seed, "test", 4096, per_character, ascension) | {
         "build": build,
         "candidates": models,
         "evaluator": digest(__file__),
@@ -219,13 +220,13 @@ def run(
                 pending.append((key, case, candidate, path))
     execution = executable = None
     if pending and time.monotonic() < deadline:
-        execution = selected_execution(scope)
+        execution = selected_execution(scope, ascension)
         if execution is None and auto_calibrate:
             if deadline - time.monotonic() < 30:
                 deadline = time.monotonic()
             else:
-                calibrate(min(5, (deadline - time.monotonic()) / 60), scope)
-                execution = selected_execution(scope)
+                calibrate(min(5, (deadline - time.monotonic()) / 60), scope, ascension)
+                execution = selected_execution(scope, ascension)
         if execution is None and time.monotonic() < deadline:
             raise ValueError("A matching execution calibration is required.")
         if execution is not None:
@@ -260,7 +261,11 @@ def run(
                 )
             if getattr(local, "environment", None) is None:
                 local.environment = Sts2Env(
-                    executable, execution=execution, scope=scope, max_steps=4096
+                    executable,
+                    execution=execution,
+                    scope=scope,
+                    max_steps=4096,
+                    ascension=ascension,
                 )
                 with lock:
                     environments.append(local.environment)

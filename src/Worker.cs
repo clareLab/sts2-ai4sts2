@@ -114,6 +114,8 @@ internal static class Worker
         string seed = parameters.GetProperty("seed").GetString()!;
         _scope = parameters.GetProperty("scope").GetString()!;
         if (_scope is not ("run" or "first_combat")) throw new ArgumentException("Unknown episode scope.");
+        int ascension = parameters.TryGetProperty("ascension", out var level) ? level.GetInt32() : 10;
+        if (ascension is < 0 or > 10) throw new ArgumentOutOfRangeException(nameof(ascension));
         if (_run != null)
         {
             await NGame.Instance!.ReturnToMainMenu();
@@ -132,7 +134,7 @@ internal static class Worker
         ScreenDecisions.Reset();
         _decisions = [];
         _revision++;
-        _run = await NGame.Instance!.StartNewSingleplayerRun(model, false, ActModel.GetDefaultList(), [], seed, GameMode.Standard, 10);
+        _run = await NGame.Instance!.StartNewSingleplayerRun(model, false, ActModel.GetDefaultList(), [], seed, GameMode.Standard, ascension);
         await RunFixture.Apply(_run);
         return await Observe();
     }

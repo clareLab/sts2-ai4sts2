@@ -14,6 +14,7 @@ from ai4sts2.environment import (
     native_scope,
     probe_action,
     seed_string,
+    validate_ascension,
     write_json,
 )
 from ai4sts2.execution import CANDIDATES, REFERENCE, Execution
@@ -59,12 +60,22 @@ def compare(expected, actual, step, diagnostic=None):
             raise ValueError(f"Divergence at step {step}: {key}")
 
 
-def trace(game, character, seed, policy, deadline, expected=None, scope="first_combat"):
+def trace(
+    game, character, seed, policy, deadline, expected=None, scope="first_combat", ascension=10
+):
+    validate_ascension(ascension)
     game.timeout = min(75, max(0.01, deadline - time.monotonic()))
     state = game.request(
         "reset",
-        {"character": character, "seed": seed_string("calibration", seed), "scope": scope},
+        {
+            "character": character,
+            "seed": seed_string("calibration", seed),
+            "scope": scope,
+            "ascension": ascension,
+        },
     )
+    if state["observation"].get("ascension") != ascension:
+        raise ValueError("Official game ascension does not match calibration.")
     rng = random.Random(seed)
     frames = []
     coverage = collections.Counter()
@@ -113,7 +124,9 @@ def trace(game, character, seed, policy, deadline, expected=None, scope="first_c
     return frames
 
 
-def measure(executable, execution, cases, deadline, references=None, scope="first_combat"):
+def measure(
+    executable, execution, cases, deadline, references=None, scope="first_combat", ascension=10
+):
     started = time.monotonic()
     traces = []
     remaining = deadline - started
@@ -135,6 +148,7 @@ def measure(executable, execution, cases, deadline, references=None, scope="firs
                     deadline,
                     None if references is None else references[index],
                     scope,
+                    ascension,
                 )
             )
         elapsed = time.monotonic() - measured
@@ -159,27 +173,36 @@ def select_result(results):
     return min(valid, key=lambda result: result["seconds"])
 
 
-def calibrate(minutes=5, scope="first_combat"):
+def runtime_path(ascension):
+    return ROOT / f"artifacts/runtime-a{validate_ascension(ascension)}.json"
+
+
+def calibrate(minutes=5, scope="first_combat", ascension=10):
     if not 0 < minutes <= 30:
         raise ValueError("Use a budget between zero and 30 minutes.")
     scope = native_scope(scope)
     deadline = time.monotonic() + minutes * 60
-    build = fingerprint(scope)
+    build = fingerprint(scope, ascension)
     executable = prepare_game()
     cases = [(hero, index, "probe") for index, hero in enumerate(CHARACTERS)]
     if scope == "first_combat":
         cases += [("IRONCLAD", 11, "loss"), ("REGENT", 21, "random"), ("SILENT", 22, "random")]
-    baseline, references = measure(executable, REFERENCE, cases, deadline, scope=scope)
+    baseline, references = measure(
+        executable, REFERENCE, cases, deadline, scope=scope, ascension=ascension
+    )
     results = [baseline]
     write_json(
-        ROOT / "artifacts/validation/reference-traces.json", {"cases": cases, "traces": references}
+        ROOT / f"artifacts/validation/reference-traces-a{ascension}.json",
+        {"ascension": ascension, "cases": cases, "traces": references},
     )
     print(json.dumps({"calibration": baseline}), flush=True)
     for execution in CANDIDATES:
         if deadline - time.monotonic() < 10:
             break
         try:
-            result, _ = measure(executable, execution, cases, deadline, references, scope)
+            result, _ = measure(
+                executable, execution, cases, deadline, references, scope, ascension
+            )
         except (RuntimeError, ValueError, TimeoutError) as error:
             result = {"execution": execution.to_dict(), "valid": False, "error": str(error)}
         results.append(result)
@@ -199,18 +222,18 @@ def calibrate(minutes=5, scope="first_combat"):
             "full_run": scope == "run" and baseline["completed"] == len(cases),
         },
     }
-    write_json(ROOT / "artifacts/runtime.json", report)
+    write_json(runtime_path(ascension), report)
     return report
 
 
-def cached_report(scope="first_combat"):
+def cached_report(scope="first_combat", ascension=10):
     scope = native_scope(scope)
-    path = ROOT / "artifacts/runtime.json"
+    path = runtime_path(ascension)
     if not path.is_file():
         return None
     report = json.loads(path.read_text())
     if (
-        report.get("build") != fingerprint(scope)
+        report.get("build") != fingerprint(scope, ascension)
         or report.get("hardware") != hardware()
         or report.get("scope") != scope
     ):
@@ -218,20 +241,20 @@ def cached_report(scope="first_combat"):
     return report
 
 
-def selected_execution(scope="first_combat"):
-    report = cached_report(scope)
+def selected_execution(scope="first_combat", ascension=10):
+    report = cached_report(scope, ascension)
     if report is None:
         return None
     return Execution(**select_result(report["results"])["execution"])
 
 
-def quarantine_execution(execution, error, scope="first_combat"):
-    with FileLock(ROOT / "artifacts/runtime.lock", timeout=30):
-        return quarantine_locked(execution, error, scope)
+def quarantine_execution(execution, error, scope="first_combat", ascension=10):
+    with FileLock(runtime_path(ascension).with_suffix(".lock"), timeout=30):
+        return quarantine_locked(execution, error, scope, ascension)
 
 
-def quarantine_locked(execution, error, scope):
-    report = cached_report(scope)
+def quarantine_locked(execution, error, scope, ascension):
+    report = cached_report(scope, ascension)
     if report is None:
         raise RuntimeError(
             "No compatible execution calibration is available for recovery."
@@ -246,7 +269,7 @@ def quarantine_locked(execution, error, scope):
     except ValueError:
         selected = None
     report["selected"] = selected
-    write_json(ROOT / "artifacts/runtime.json", report)
+    write_json(runtime_path(ascension), report)
     if selected is None:
         raise RuntimeError(
             "All calibrated execution configurations failed; training stopped."

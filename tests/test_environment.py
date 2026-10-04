@@ -9,6 +9,7 @@ def state(terminated=False, victory=False):
     return {
         "revision": 1,
         "observation": {
+            "ascension": 10,
             "floor": 2,
             "act": 0,
             "player": {"hp": 50, "max_hp": 80},
@@ -34,9 +35,12 @@ class FakeWorker:
         self.calls.append((method, parameters))
         if method == "reset":
             self.count = 0
+            self.ascension = parameters.get("ascension", 10)
         else:
             self.count += 1
-        return state(self.count >= 4, self.count >= 4)
+        result = state(self.count >= 4, self.count >= 4)
+        result["observation"]["ascension"] = self.ascension
+        return result
 
     def close(self):
         self.closed = True

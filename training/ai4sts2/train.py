@@ -221,10 +221,13 @@ class PopulationMember(tune.Trainable):
         if encoding not in {"hash", "tree"} or (encoding == "tree" and policy != "shared"):
             raise ValueError("Structured observations require the shared policy.")
         self.scope = config.get("scope", "run")
-        self.build = fingerprint(self.scope)
+        self.ascension = config.get("ascension", 10)
+        self.build = fingerprint(self.scope, self.ascension)
         self.recoveries = []
         self.signals = TrainingSignals(config["seed"], config)
-        self.execution = selected_execution(self.scope) or Execution(**config.get("execution", {}))
+        self.execution = selected_execution(self.scope, self.ascension) or Execution(
+            **config.get("execution", {})
+        )
         self.validation_environment = None
         self.environment = None
         while self.environment is None:
@@ -261,8 +264,8 @@ class PopulationMember(tune.Trainable):
     def initialise_policy(self, checkpoint_dir):
         directory = Path(checkpoint_dir)
         build = json.loads((directory / "build.json").read_text())
-        if {k: v for k, v in build.items() if k not in {"trainer", "scope"}} != {
-            k: v for k, v in self.build.items() if k not in {"trainer", "scope"}
+        if {k: v for k, v in build.items() if k not in {"trainer", "scope", "ascension"}} != {
+            k: v for k, v in self.build.items() if k not in {"trainer", "scope", "ascension"}
         }:
             raise ValueError("Policy transfer requires matching game, bridge and observations.")
         python_rng, numpy_rng = random.getstate(), np.random.get_state()
@@ -304,7 +307,7 @@ class PopulationMember(tune.Trainable):
 
     def avoid_failed_execution(self, error):
         self.recoveries.append({"execution": self.execution.to_dict(), "error": str(error)[:2048]})
-        self.execution = quarantine_execution(self.execution, error, self.scope)
+        self.execution = quarantine_execution(self.execution, error, self.scope, self.ascension)
 
     def open_environment(self, training=True):
         return Sts2Env(
@@ -312,6 +315,7 @@ class PopulationMember(tune.Trainable):
             seed=self.config["seed"],
             execution=self.execution,
             scope=self.scope,
+            ascension=self.ascension,
             max_steps=256 if self.scope == "first_combat" else 4096,
             signals=self.signals if training else None,
             encoding=self.config.get("encoding", "hash"),
@@ -495,6 +499,7 @@ def run(
     width=64,
     encoding="hash",
     initial_policy=None,
+    ascension=10,
 ):
     if not 0 < minutes <= 30:
         raise ValueError("This pilot supports a budget of at most 30 minutes.")
@@ -525,7 +530,7 @@ def run(
         "certifying": False,
         "promoted": False,
         "complete": False,
-        "build": fingerprint(scope),
+        "build": fingerprint(scope, ascension),
         "errors": [],
         "trials": [],
         "experiment": experiment,
@@ -535,15 +540,16 @@ def run(
     executable = prepare_game()
     started = time.monotonic()
     deadline = min(started + minutes * 60, float(os.environ.get("AI4STS2_DEADLINE", "inf")))
-    execution = selected_execution(scope)
+    execution = selected_execution(scope, ascension)
     if execution is None:
-        calibrate(min(5, minutes / 3), scope)
-        execution = selected_execution(scope)
+        calibrate(min(5, minutes / 3), scope, ascension)
+        execution = selected_execution(scope, ascension)
     if execution is None:
         raise RuntimeError("Execution calibration did not produce a compatible configuration.")
     baseline = random_baseline(
         minutes=min(5, max(0.001, (deadline - time.monotonic()) / 60)),
         scope=scope,
+        ascension=ascension,
         max_steps=256 if scope == "first_combat" else 4096,
     )
     if not baseline["eligible"]:
@@ -627,11 +633,14 @@ def run(
                     "initial_policy": initial_policy,
                     "execution": execution.to_dict(),
                     "scope": scope,
+                    "ascension": ascension,
                     "baseline": baseline_reference,
                 },
             )
         results, interrupted = fit_or_recover(tuner, experiment_path, trainable)
-        report = pilot_report(results, scope, fingerprint(scope), baseline, iterations, interrupted)
+        report = pilot_report(
+            results, scope, fingerprint(scope, ascension), baseline, iterations, interrupted
+        )
         report["experiment"] = experiment
         report["resources"] = resources
         write_json(report_path, report)

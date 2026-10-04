@@ -114,6 +114,12 @@ def native_scope(scope):
     return "run" if scope == "act1" else scope
 
 
+def validate_ascension(ascension):
+    if type(ascension) is not int or not 0 <= ascension <= 10:
+        raise ValueError("Ascension must be an integer between 0 and 10.")
+    return ascension
+
+
 def state_digest(state):
     visible = {key: state[key] for key in ("observation", "actions", "terminated", "victory")}
     return hashlib.sha256(json.dumps(visible, sort_keys=True).encode()).hexdigest()
@@ -143,9 +149,11 @@ class Sts2Env(gym.Env):
         encoding="hash",
         discount=0.99,
         progress_scale=0.0,
+        ascension=10,
     ):
         super().__init__()
         native_scope(scope)
+        self.ascension = validate_ascension(ascension)
         if signals is not None and signals.goal() is not None and scope != "run":
             raise ValueError("Floor curricula require full-run scope.")
         self.configure_reward(discount, progress_scale)
@@ -222,8 +230,10 @@ class Sts2Env(gym.Env):
             "character": self.character,
             "seed": seed_string(split, episode_seed),
             "scope": native_scope(self.scope),
+            "ascension": self.ascension,
         }
         self.state = self.game.request("reset", parameters)
+        self.check_ascension(self.state)
         self.boss_reached = self.state["observation"].get("room") == "Boss"
         self.journal = {
             "parameters": parameters,
@@ -233,7 +243,15 @@ class Sts2Env(gym.Env):
         self.steps = 0
         if self.signals is not None:
             self.signals.reset(self.state)
-        return self.encode(), {"scope": self.scope, "character": self.character}
+        return self.encode(), {
+            "scope": self.scope,
+            "ascension": self.ascension,
+            "character": self.character,
+        }
+
+    def check_ascension(self, state):
+        if validate_ascension(state["observation"].get("ascension")) != self.ascension:
+            raise ValueError("Official game ascension does not match the requested task.")
 
     def encode(self):
         started = time.perf_counter()
@@ -277,6 +295,7 @@ class Sts2Env(gym.Env):
         self.state = self.game.request(
             "step", {"revision": self.state["revision"], "action": action}
         )
+        self.check_ascension(self.state)
         self.boss_reached |= self.state["observation"].get("room") == "Boss"
         self.steps += 1
         self.journal["actions"].append({"action": action, "digest": state_digest(self.state)})
@@ -288,6 +307,7 @@ class Sts2Env(gym.Env):
         reward = float(1 if task_success or goal_success else -1) if terminated else 0.0
         info = {
             "scope": self.scope,
+            "ascension": self.ascension,
             "character": self.character,
             "victory": victory,
             "task_success": task_success,
@@ -322,6 +342,7 @@ class Sts2Env(gym.Env):
         return copy.deepcopy(
             {
                 "scope": self.scope,
+                "ascension": self.ascension,
                 "encoding": self.encoding,
                 "max_steps": self.max_steps,
                 "reward": {"discount": self.discount, "progress_scale": self.progress_scale},
@@ -335,6 +356,8 @@ class Sts2Env(gym.Env):
         )
 
     def restore(self, snapshot):
+        if validate_ascension(snapshot.get("ascension", 10)) != self.ascension:
+            raise ValueError("Checkpoint ascension does not match.")
         if snapshot["scope"] != self.scope or snapshot["max_steps"] != self.max_steps:
             raise ValueError("Checkpoint episode scope or step limit does not match.")
         if snapshot.get("encoding", "hash") != self.encoding:
@@ -343,12 +366,15 @@ class Sts2Env(gym.Env):
         self.goal_floor = snapshot.get("goal_floor")
         self.boss_reached = snapshot.get("boss_reached", False)
         journal = snapshot["journal"]
+        if journal is not None and journal["parameters"].get("ascension", 10) != self.ascension:
+            raise ValueError("Checkpoint journal ascension does not match.")
         if journal is None:
             self.state = None
             self.character = None
             self.steps = 0
         else:
             state = self.game.request("reset", journal["parameters"])
+            self.check_ascension(state)
             if state_digest(state) != journal["initial"]:
                 raise ValueError("Checkpoint replay diverged at reset.")
             for index, entry in enumerate(journal["actions"]):
@@ -389,8 +415,11 @@ def probe_action(actions):
     return 0
 
 
-def evaluation_plan(scope, seed=0, split="validation", max_steps=256, per_character=1):
+def evaluation_plan(
+    scope, seed=0, split="validation", max_steps=256, per_character=1, ascension=10
+):
     native_scope(scope)
+    validate_ascension(ascension)
     if per_character < 1 or max_steps < 1:
         raise ValueError("Use positive episode and step counts.")
     cases = []
@@ -408,7 +437,13 @@ def evaluation_plan(scope, seed=0, split="validation", max_steps=256, per_charac
                     "action_seed": int(action_seed, 16),
                 }
             )
-    plan = {"scope": scope, "split": split, "max_steps": max_steps, "cases": cases}
+    plan = {
+        "scope": scope,
+        "ascension": ascension,
+        "split": split,
+        "max_steps": max_steps,
+        "cases": cases,
+    }
     return plan | {
         "evaluation_id": hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
     }
@@ -425,7 +460,9 @@ def evaluate(
     on_episode=None,
     deterministic=True,
 ):
-    plan = evaluation_plan(environment.scope, seed, split, max_steps, per_character)
+    plan = evaluation_plan(
+        environment.scope, seed, split, max_steps, per_character, environment.ascension
+    )
     results = []
     previous_limit = environment.max_steps
     previous_timeout = getattr(environment.game, "timeout", None)
@@ -490,9 +527,11 @@ def evaluate(
     return report()
 
 
-def fingerprint(scope="first_combat"):
+def fingerprint(scope="first_combat", ascension=10):
     from ai4sts2.game import ROOT, game_path
 
+    native_scope(scope)
+    validate_ascension(ascension)
     hashes = {}
     for key, path in {
         "game": game_path() / "data_sts2_linuxbsd_x86_64/sts2.dll",
@@ -506,7 +545,7 @@ def fingerprint(scope="first_combat"):
         source_hash.update(path.name.encode())
         source_hash.update(path.read_bytes())
     hashes["trainer"] = source_hash.hexdigest()
-    return hashes | {"schema": SCHEMA, "scope": scope, "ascension": 10}
+    return hashes | {"schema": SCHEMA, "scope": scope, "ascension": ascension}
 
 
 def write_json(path, value):

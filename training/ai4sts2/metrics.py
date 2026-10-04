@@ -7,6 +7,11 @@ def progress(episodes):
     scopes = {episode.get("scope", "run") for episode in episodes}
     if len(scopes) != 1:
         raise ValueError("Episode scopes do not match.")
+    ascensions = {episode.get("ascension", 10) for episode in episodes}
+    if len(ascensions) != 1 or any(
+        type(level) is not int or not 0 <= level <= 10 for level in ascensions
+    ):
+        raise ValueError("Episode ascensions do not match or are invalid.")
     for episode in episodes:
         for field in ("floor", "act"):
             value = episode[field]
@@ -31,6 +36,7 @@ def progress(episodes):
     successes = sum(e.get("task_success", e["victory"]) for e in episodes)
     return {
         "scope": next(iter(scopes)),
+        "ascension": next(iter(ascensions)),
         "episodes": len(episodes),
         "wins": wins,
         "win_rate": wins / len(episodes),
