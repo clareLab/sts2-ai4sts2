@@ -136,11 +136,12 @@ def train(output, plan, deadline):
         return current
     executable = prepare_game()
     transfer = current is None and plan["request"]["transfer"]
-    config = plan["source"]["config"] | {
+    config = (current or plan["source"])["config"] | {
         "seed": plan["training_seed"],
         "executable": str(executable),
         "fixed_steps": True,
         "validate_each_iteration": False,
+        "collect_replay": bool(plan["source"]["config"].get("replay_corpus")),
         "initial_checkpoint": None if transfer else (current or plan["source"])["checkpoint"],
         "initial_policy": plan["source"]["checkpoint"] if transfer else None,
     }

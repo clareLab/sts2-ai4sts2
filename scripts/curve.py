@@ -84,9 +84,10 @@ def checkpoint_files(path):
     for name in names:
         with (Path(path) / name).open("rb") as stream:
             result[name] = hashlib.file_digest(stream, "sha256").hexdigest()
-    if (Path(path) / "replay.pt").exists():
-        with (Path(path) / "replay.pt").open("rb") as stream:
-            result["replay.pt"] = hashlib.file_digest(stream, "sha256").hexdigest()
+    for name in ("replay.pt", "recording.pt"):
+        if (Path(path) / name).exists():
+            with (Path(path) / name).open("rb") as stream:
+                result[name] = hashlib.file_digest(stream, "sha256").hexdigest()
     return result
 
 

@@ -243,6 +243,8 @@ class Sts2Env(gym.Env):
         self.boss_reached = self.state["observation"].get("room") == "Boss"
         self.journal = {
             "parameters": parameters,
+            "seed_index": int(episode_seed),
+            "split": split,
             "initial": state_digest(self.state),
             "actions": [],
         }
@@ -344,6 +346,8 @@ class Sts2Env(gym.Env):
             "floor": self.state["observation"].get("floor"),
             "act": self.state["observation"].get("act"),
             "seed": self.journal["parameters"]["seed"],
+            "seed_index": self.journal.get("seed_index"),
+            "split": self.journal.get("split"),
         }
         goal = COMBAT_GOALS.get(self.scope)
         for kind in ("elite", "monster"):
