@@ -382,3 +382,56 @@ def test_disabling_replay_preserves_sampler_and_allows_reenabling(
         assert torch.equal(before, candidate.replay_generator.get_state())
     finally:
         candidate.cleanup()
+
+
+@pytest.mark.parametrize("updates", [0, 1, 4])
+def test_replay_restores_inference_mode_before_collecting_actions(
+    monkeypatch, tmp_path, replay_corpus, updates
+):
+    from test_checkpoint import member
+
+    candidate = member(monkeypatch, policy="shared")
+    candidate._logdir = str(tmp_path)
+    candidate.config |= {
+        "replay_corpus": str(replay_corpus),
+        "replay_updates": updates,
+        "fixed_steps": True,
+    }
+    candidate.apply_parameters(candidate.config)
+    candidate.sample_count = 128
+    forward = candidate.model.policy.forward
+    observed = []
+
+    def sample(*args, **kwargs):
+        observed.append(candidate.model.policy.training)
+        return forward(*args, **kwargs)
+
+    monkeypatch.setattr(candidate.model.policy, "forward", sample)
+    try:
+        candidate.step()
+        assert len(observed) == 128 and not any(observed)
+    finally:
+        candidate.cleanup()
+
+
+def test_failed_replay_update_restores_the_original_policy_mode():
+    from types import SimpleNamespace
+
+    from ai4sts2.replay import SelfImitationCallback
+
+    class BrokenBuffer:
+        def sample(self):
+            raise RuntimeError("Replay read failed.")
+
+    class Policy(torch.nn.Linear):
+        def set_training_mode(self, mode):
+            self.train(mode)
+
+    policy = Policy(1, 1)
+    policy.eval()
+    callback = SelfImitationCallback(BrokenBuffer(), 1, 0.01)
+    callback.model = SimpleNamespace(policy=policy, _n_updates=1)
+    callback.previous_updates = 0
+    with pytest.raises(RuntimeError, match="Replay read failed"):
+        callback.update()
+    assert not policy.training

@@ -150,27 +150,31 @@ class SelfImitationCallback(BaseCallback):
             return
         self.previous_updates = self.model._n_updates
         policy = self.model.policy
+        training = policy.training
         policy.set_training_mode(True)
-        for _ in range(self.updates):
-            batch = self.buffer.sample().to(self.model.device)
-            values, log_probabilities, _ = policy.evaluate_actions(
-                dict(batch["observation"]), batch["action"], action_masks=batch["action_mask"]
-            )
-            loss, metrics = self_imitation_loss(
-                values.flatten(), log_probabilities, batch["return"], self.value_coefficient
-            )
-            policy.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            norm = torch.nn.utils.clip_grad_norm_(
-                policy.parameters(), self.model.max_grad_norm, error_if_nonfinite=True
-            )
-            policy.optimizer.step()
-            self.diagnostics.append(
-                {
-                    "environment_steps": self.model.num_timesteps,
-                    "ppo_updates": self.model._n_updates,
-                    "loss": float(loss.detach()),
-                    "gradient_norm": float(norm),
-                    **{key: float(value) for key, value in metrics.items()},
-                }
-            )
+        try:
+            for _ in range(self.updates):
+                batch = self.buffer.sample().to(self.model.device)
+                values, log_probabilities, _ = policy.evaluate_actions(
+                    dict(batch["observation"]), batch["action"], action_masks=batch["action_mask"]
+                )
+                loss, metrics = self_imitation_loss(
+                    values.flatten(), log_probabilities, batch["return"], self.value_coefficient
+                )
+                policy.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                norm = torch.nn.utils.clip_grad_norm_(
+                    policy.parameters(), self.model.max_grad_norm, error_if_nonfinite=True
+                )
+                policy.optimizer.step()
+                self.diagnostics.append(
+                    {
+                        "environment_steps": self.model.num_timesteps,
+                        "ppo_updates": self.model._n_updates,
+                        "loss": float(loss.detach()),
+                        "gradient_norm": float(norm),
+                        **{key: float(value) for key, value in metrics.items()},
+                    }
+                )
+        finally:
+            policy.set_training_mode(training)

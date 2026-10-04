@@ -17,7 +17,7 @@ if [[ "$1" != evaluate && "$1" != curve ]]; then ./scripts/build.sh; fi
 read -r AI4STS2_CPU_BUDGET AI4STS2_MEMORY_BUDGET < <(python3 training/ai4sts2/resources.py)
 export AI4STS2_CPU_BUDGET AI4STS2_MEMORY_BUDGET
 ai4sts2_cpu_quota=$(python3 -c 'import os; print(float(os.environ["AI4STS2_CPU_BUDGET"]) * 100)')
-ai4sts2_memory_high=$((AI4STS2_MEMORY_BUDGET * 3 / 4))
+ai4sts2_memory_high=$((AI4STS2_MEMORY_BUDGET * 7 / 8))
 AI4STS2_DEADLINE=$(python3 - "$ai4sts2_budget" <<'PY'
 import sys, time
 print(time.monotonic() + int(sys.argv[1]))
