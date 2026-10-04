@@ -259,18 +259,33 @@ def training_totals(output, plan):
     return totals
 
 
-def cache_reference(output, plan, candidate):
+def reference_cache_valid(plan, candidate):
     cached = plan.get("cached_validation")
-    if cached is None or (
-        not cached["complete"]
-        or not cached["eligible"]
-        or cached["sha256"] != candidate["sha256"]
-        or cached.get("policy_mode", "deterministic")
-        != candidate.get("policy_mode", "deterministic")
-        or cached["evaluation_id"] != plan["validation_panel"]["evaluation_id"]
-        or len(cached["episodes"]) != len(plan["validation_panel"]["cases"])
-    ):
+    return (
+        cached is not None
+        and cached["complete"]
+        and cached["eligible"]
+        and cached["sha256"] == candidate["sha256"]
+        and cached.get("policy_mode", "deterministic")
+        == candidate.get("policy_mode", "deterministic")
+        and cached["evaluation_id"] == plan["validation_panel"]["evaluation_id"]
+        and len(cached["episodes"]) == len(plan["validation_panel"]["cases"])
+    )
+
+
+def validation_reserve(plan, seconds):
+    models = 3 if plan["request"].get("compare_replay") else 2
+    reference = plan.get("incumbent")
+    reused = reference is not None and reference_cache_valid(
+        plan, {"sha256": holdout.digest(Path(reference["checkpoint"]) / "policy.zip")}
+    )
+    return max(180, seconds * 0.3 * (models - int(reused)) / models)
+
+
+def cache_reference(output, plan, candidate):
+    if not reference_cache_valid(plan, candidate):
         return 0
+    cached = plan["cached_validation"]
     frozen = load(output / "plan.json")
     for index, (case, episode) in enumerate(zip(frozen["cases"], cached["episodes"], strict=True)):
         if episode["character"] != case["character"] or episode["seed"] != case["seed"]:
@@ -383,7 +398,7 @@ def run(
             )
             report["calibration_seconds"] = time.monotonic() - phase_started
             phase_started = time.monotonic()
-            reserve = max(180, (deadline - started) * 0.3)
+            reserve = validation_reserve(plan, deadline - started)
             current = train_round(output, plan, deadline - reserve, resources["concurrent_trials"])
             report["training_seconds"] = time.monotonic() - phase_started
             gc.collect()

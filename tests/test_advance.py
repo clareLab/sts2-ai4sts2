@@ -333,6 +333,11 @@ def test_later_round_keeps_global_incumbent_and_reuses_its_validation(frozen, mo
     next_output = output / "next"
     next_output.mkdir()
     next_plan = advance.prepare(next_output, output / "continuation.json", 64, 2, False)
+    assert advance.validation_reserve(next_plan, 1800) == 270
+    assert advance.validation_reserve(next_plan, 600) == 180
+    assert advance.validation_reserve(next_plan | {"cached_validation": None}, 1800) == 540
+    invalid_cache = report | {"sha256": "changed"}
+    assert advance.validation_reserve(next_plan | {"cached_validation": invalid_cache}, 1800) == 540
     assert next_plan["source"]["checkpoint"] == first["checkpoint"]
     assert next_plan["incumbent"]["checkpoint"] == original["checkpoint"]
     assert next_plan["cached_validation"] == report
