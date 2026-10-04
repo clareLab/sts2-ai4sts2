@@ -31,6 +31,9 @@ internal static class Worker
     private static bool _combatEnded;
     private static bool _combatWon;
     private static readonly HashSet<CombatRoom> Act1Wins = new(ReferenceEqualityComparer.Instance);
+    private sealed record CombatHealth(int Before, int After);
+    private static readonly Dictionary<CombatRoom, int> CombatEntryHp = new(ReferenceEqualityComparer.Instance);
+    private static readonly List<CombatHealth> MonsterHealth = [];
     private static string _scope = "run";
     private static Decision[] _decisions = [];
     private static SceneTree Tree => (SceneTree)Engine.GetMainLoop();
@@ -41,10 +44,19 @@ internal static class Worker
             throw new InvalidOperationException("An isolated AI4STS2 worker directory is required.");
         if (TestMode.IsOn) throw new InvalidOperationException("The worker requires normal game rules.");
         new Harmony("clareLab.ai4sts2.worker").PatchAll(typeof(Worker).Assembly);
+        CombatManager.Instance.CombatSetUp += state =>
+        {
+            if (state.RunState.CurrentActIndex == 0 && state.RunState.CurrentRoom is CombatRoom { RoomType: RoomType.Monster } room && MonsterHealth.Count < 3)
+                CombatEntryHp.TryAdd(room, state.Players.Single().Creature.CurrentHp);
+        };
         CombatManager.Instance.CombatWon += room =>
         {
             _combatWon = true;
-            if (_run?.CurrentActIndex == 0) Act1Wins.Add(room);
+            if (_run?.CurrentActIndex == 0 && Act1Wins.Add(room) && room.RoomType == RoomType.Monster && MonsterHealth.Count < 3)
+            {
+                if (!CombatEntryHp.Remove(room, out int before)) throw new InvalidOperationException("Combat entry health was not recorded.");
+                MonsterHealth.Add(new(before, _run.Players.Single().Creature.CurrentHp));
+            }
         };
         CombatManager.Instance.CombatEnded += _ => _combatEnded = true;
         Tree.ProcessFrame += Tick;
@@ -137,6 +149,8 @@ internal static class Worker
         _combatEnded = false;
         _combatWon = false;
         Act1Wins.Clear();
+        CombatEntryHp.Clear();
+        MonsterHealth.Clear();
         CardSelection.Reset();
         RoomDecisions.Reset();
         ScreenDecisions.Reset();
@@ -202,7 +216,7 @@ internal static class Worker
         timer.Restart();
         string? audit = AuditEnabled ? Audit.Capture(_run!) : null;
         _timings["audit_ms"] = timer.Elapsed.TotalMilliseconds;
-        return new { revision = _revision, observation, actions, terminated, victory, scope = _scope, act1_elite_wins = Act1Wins.Count(room => room.RoomType == RoomType.Elite), act1_monster_wins = Act1Wins.Count(room => room.RoomType == RoomType.Monster), audit };
+        return new { revision = _revision, observation, actions, terminated, victory, scope = _scope, act1_elite_wins = Act1Wins.Count(room => room.RoomType == RoomType.Elite), act1_monster_wins = Act1Wins.Count(room => room.RoomType == RoomType.Monster), act1_monster_health = MonsterHealth.ToArray(), audit };
     }
 
     internal static async Task Frame()

@@ -13,7 +13,7 @@ from gymnasium import spaces
 from ai4sts2.encoding import ACTION_NODES, NODE_SIZE, STATE_NODES, tree
 from ai4sts2.execution import REFERENCE
 from ai4sts2.game import OfficialGame
-from ai4sts2.metrics import COMBAT_GOALS, health_fraction, summarise
+from ai4sts2.metrics import COMBAT_GOALS, health_retention, summarise
 from ai4sts2.policy import evaluation_action
 
 CHARACTERS = ("IRONCLAD", "SILENT", "REGENT", "NECROBINDER", "DEFECT")
@@ -122,7 +122,7 @@ def validate_ascension(ascension):
 
 def state_digest(state):
     visible = {key: state[key] for key in ("observation", "actions", "terminated", "victory")}
-    for field in ("act1_elite_wins", "act1_monster_wins"):
+    for field in ("act1_elite_wins", "act1_monster_wins", "act1_monster_health"):
         if field in state:
             visible[field] = state[field]
     return hashlib.sha256(json.dumps(visible, sort_keys=True).encode()).hexdigest()
@@ -328,7 +328,7 @@ class Sts2Env(gym.Env):
         victory = bool(self.state["terminated"] and self.state["victory"])
         reward = float(1 if task_success or goal_success else -1) if terminated else 0.0
         if self.scope == "act1_monsters" and task_success:
-            reward = health_fraction(self.state["observation"]["player"])
+            reward = health_retention(self.state)
         info = {
             "scope": self.scope,
             "ascension": self.ascension,
@@ -355,6 +355,8 @@ class Sts2Env(gym.Env):
                 "task_score": reward,
                 "max_hp": self.state["observation"]["player"]["max_hp"],
             }
+        if "act1_monster_health" in self.state:
+            info["act1_monster_health"] = copy.deepcopy(self.state["act1_monster_health"])
         if self.goal_floor is not None:
             info |= {"goal_floor": self.goal_floor, "goal_success": goal_success or victory}
         if terminated or truncated:

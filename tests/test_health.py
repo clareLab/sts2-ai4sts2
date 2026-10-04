@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from ai4sts2.calibration import signature
 from ai4sts2.environment import Sts2Env, encode, evaluate, evaluation_plan, state_digest
-from ai4sts2.metrics import health_fraction, summarise
+from ai4sts2.metrics import health_retention, summarise
 from test_environment import FakeWorker
 
 
@@ -17,6 +17,7 @@ class MonsterWorker(FakeWorker):
             "actions": [{"kind": "play"}],
             "act1_elite_wins": int(self.count > 0),
             "act1_monster_wins": max(0, self.count - 1),
+            "act1_monster_health": [{"before": 100, "after": 25}] * min(3, max(0, self.count - 1)),
         }
         result["observation"] |= {"room": "Monster", "floor": 4 + self.count, "act": 0}
         result["observation"]["player"] = {"hp": 25, "max_hp": 100}
@@ -80,7 +81,11 @@ def test_health_quality_is_ranked_and_failed_runs_remain_in_the_score():
     assert report["complete"] and report["eligible"] and report["task_successes"] == 5
     assert report["selection_score"] == 0.25
     row = report["episodes"][0]
-    better = row | {"hp": 75, "task_score": 0.75}
+    better = row | {
+        "hp": 75,
+        "task_score": 0.75,
+        "act1_monster_health": [{"before": 100, "after": 75}] * 3,
+    }
     assert summarise([better])["selection_score"] > summarise([row])["selection_score"]
     failure = row | {
         "hp": 0,
@@ -92,7 +97,7 @@ def test_health_quality_is_ranked_and_failed_runs_remain_in_the_score():
     assert mixed["selection_score"] == -0.125
     assert mixed["task_success_rate"] == 0.5 and mixed["mean_surviving_health"] == 0.375
     with pytest.raises(ValueError, match="score"):
-        summarise([row | {"hp": 75}])
+        summarise([row | {"act1_monster_health": better["act1_monster_health"]}])
     with pytest.raises(ValueError, match="requires"):
         summarise([row | {"act1_monster_wins": 2}])
     env.close()
@@ -112,6 +117,12 @@ def test_monster_counter_is_replayed_and_excluded_from_policy_features():
     assert signature(original) != signature(changed)
     for key, value in encode(original).items():
         np.testing.assert_array_equal(value, encode(changed)[key])
+    changed = copy.deepcopy(original)
+    changed["act1_monster_health"][0]["after"] = 26
+    assert state_digest(original) != state_digest(changed)
+    assert signature(original) != signature(changed)
+    for key, value in encode(original).items():
+        np.testing.assert_array_equal(value, encode(changed)[key])
     assert (
         len({evaluation_plan(s)["evaluation_id"] for s in ("act1_monsters", "act1_elite", "act1")})
         == 3
@@ -120,7 +131,39 @@ def test_monster_counter_is_replayed_and_excluded_from_policy_features():
     second.close()
 
 
-@pytest.mark.parametrize("hp,maximum", [(float("nan"), 80), (81, 80), (-1, 80), (0, 0), (True, 80)])
-def test_invalid_health_is_rejected(hp, maximum):
-    with pytest.raises(ValueError, match="health"):
-        health_fraction({"hp": hp, "max_hp": maximum})
+@pytest.mark.parametrize(
+    "before,after", [(0, 30), (-1, 20), (80, -1), (True, 80), (80, float("nan")), (None, 30)]
+)
+def test_invalid_combat_health_is_rejected(before, after):
+    with pytest.raises(ValueError, match="combat health"):
+        health_retention({"act1_monster_health": [{"before": before, "after": after}] * 3})
+
+
+def test_each_battle_uses_its_own_entry_health_and_equal_weight():
+    battles = [
+        {"before": 80, "after": 72},
+        {"before": 50, "after": 40},
+        {"before": 100, "after": 100},
+    ]
+    assert health_retention({"act1_monster_health": battles}) == pytest.approx(0.9)
+    assert health_retention({"act1_monster_health": [{"before": 40, "after": 60}] * 3}) == 1.5
+    for records in (None, [], battles[:2], battles * 2):
+        with pytest.raises(ValueError, match="Three combat"):
+            health_retention({"act1_monster_health": records})
+
+
+def test_intervening_health_changes_do_not_change_combat_reward():
+    class InterveningWorker(MonsterWorker):
+        def request(self, method, parameters):
+            result = super().request(method, parameters)
+            result["observation"]["player"] = {"hp": 90, "max_hp": 120}
+            return result
+
+    for worker in (MonsterWorker, InterveningWorker):
+        env = Sts2Env(scope="act1_monsters", worker_factory=worker)
+        env.reset()
+        for _ in range(4):
+            _, reward, terminated, _, info = env.step(0)
+        assert terminated and reward == 0.25
+        assert info["act1_monster_health"] == [{"before": 100, "after": 25}] * 3
+        env.close()

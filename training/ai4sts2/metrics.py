@@ -4,15 +4,22 @@ import statistics
 COMBAT_GOALS = {"act1_elite": ("elite", 1), "act1_monsters": ("monster", 3)}
 
 
-def health_fraction(player):
-    hp, maximum = player["hp"], player["max_hp"]
-    if (
-        any(type(value) not in (int, float) or not math.isfinite(value) for value in (hp, maximum))
-        or not 0 <= hp <= maximum
-        or maximum <= 0
-    ):
-        raise ValueError("Invalid remaining health.")
-    return hp / maximum
+def health_retention(episode):
+    battles = episode.get("act1_monster_health")
+    if not isinstance(battles, list) or len(battles) != 3:
+        raise ValueError("Three combat health records are required.")
+    for battle in battles:
+        before, after = battle.get("before"), battle.get("after")
+        if (
+            any(
+                type(value) not in (int, float) or not math.isfinite(value)
+                for value in (before, after)
+            )
+            or before <= 0
+            or after < 0
+        ):
+            raise ValueError("Invalid combat health.")
+    return statistics.mean(battle["after"] / battle["before"] for battle in battles)
 
 
 def progress(episodes):
@@ -48,7 +55,7 @@ def progress(episodes):
                 if goal and goal[0] == kind and success != (count >= goal[1]):
                     raise ValueError("Task success requires the specified combat victories.")
         if episode.get("scope") == "act1_monsters":
-            score = health_fraction(episode) if success else 0.0 if episode["truncated"] else -1.0
+            score = health_retention(episode) if success else 0.0 if episode["truncated"] else -1.0
             if episode.get("task_score") != score:
                 raise ValueError("The task score does not match the combat outcome and health.")
     floors = [episode["floor"] for episode in episodes]
@@ -94,7 +101,7 @@ def progress(episodes):
         result |= {
             "mean_task_score": statistics.mean(e["task_score"] for e in episodes),
             "mean_surviving_health": statistics.mean(
-                health_fraction(e) if e["task_success"] else 0.0 for e in episodes
+                health_retention(e) if e["task_success"] else 0.0 for e in episodes
             ),
         }
     return result

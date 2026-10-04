@@ -303,9 +303,13 @@ class MilestoneWorker(FakeWorker):
             "victory": False,
             "actions": [{"kind": "play"}, {"kind": "end_turn"}],
             "act1_monster_wins": min(self.count, 3),
+            "act1_monster_health": [
+                {"before": 80 - 10 * i, "after": 70 - 10 * i} for i in range(min(self.count, 3))
+            ],
             "act1_elite_wins": int(self.count >= 4),
         }
         result["observation"] |= {
+            "room": "Monster",
             "act": int(finished),
             "floor": self.count,
             "player": {"hp": 80 - 10 * self.count, "max_hp": 100},
@@ -319,7 +323,13 @@ def test_combat_health_is_measured_without_changing_full_act_actions():
     case = evaluation_plan("act1", split="test")["cases"][0]
     expected = evaluate(None, first, split="test")["episodes"][0]
     actual = holdout.episode(None, second, case, time.monotonic() + 10)
-    assert actual.pop("first_three_monsters") == {"hp": 50, "max_hp": 100, "floor": 3, "steps": 3}
+    assert actual.pop("first_three_monsters") == {
+        "hp": 50,
+        "max_hp": 100,
+        "act1_monster_health": [{"before": 80 - 10 * i, "after": 70 - 10 * i} for i in range(3)],
+        "floor": 3,
+        "steps": 3,
+    }
     assert actual == expected and actual["hp"] == 30 and actual["task_success"]
     assert second.game.calls == first.game.calls[:6]
 
@@ -382,7 +392,11 @@ def test_progression_priority_cannot_trade_act1_success_for_health_or_elites():
         "truncated": False,
         "act1_elite_wins": 0,
         "act1_monster_wins": 3,
-        "first_three_monsters": {"hp": 10, "max_hp": 100},
+        "first_three_monsters": {
+            "hp": 10,
+            "max_hp": 100,
+            "act1_monster_health": [{"before": 80, "after": 10}] * 3,
+        },
     }
 
     def report(row):
@@ -390,10 +404,30 @@ def test_progression_priority_cannot_trade_act1_success_for_health_or_elites():
 
     act = report(base | {"act": 1, "task_success": True})
     elite = report(base | {"act1_elite_wins": 1})
-    health = report(base | {"first_three_monsters": {"hp": 100, "max_hp": 100}})
+    health = report(
+        base
+        | {
+            "first_three_monsters": {
+                "hp": 100,
+                "max_hp": 100,
+                "act1_monster_health": [{"before": 80, "after": 100}] * 3,
+            }
+        }
+    )
     failure = report(base | {"first_three_monsters": None, "act1_monster_wins": 2})
     assert holdout.progression_key(act) > holdout.progression_key(elite)
     assert holdout.progression_key(elite) > holdout.progression_key(health)
     assert holdout.progression_key(health) > holdout.progression_key(failure)
     with pytest.raises(ValueError, match="complete Act 1"):
         holdout.progression_key(act | {"complete": False})
+
+
+def test_retention_allows_healing_above_initial_health():
+    assert (
+        holdout.health_retention({"act1_monster_health": [{"before": 40, "after": 60}] * 3}) == 1.5
+    )
+    for initial in (None, 0, -1, float("nan"), True):
+        with pytest.raises(ValueError, match="combat health"):
+            holdout.health_retention(
+                {"act1_monster_health": [{"before": initial, "after": 60}] * 3}
+            )

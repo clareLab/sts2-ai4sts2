@@ -15,7 +15,7 @@ import torch
 from ai4sts2.calibration import calibrate, selected_execution
 from ai4sts2.environment import Sts2Env, evaluation_plan, fingerprint, write_json
 from ai4sts2.game import ROOT, WorkerFailure, prepare_game
-from ai4sts2.metrics import compare_evaluations, health_fraction, summarise
+from ai4sts2.metrics import compare_evaluations, health_retention, summarise
 from ai4sts2.policy import evaluation_action
 from ai4sts2.resources import budget
 from sb3_contrib import MaskablePPO
@@ -128,13 +128,14 @@ def episode(
             observation, _, terminated, truncated, info = environment.step(action)
             if info.get("act1_monster_wins", 0) >= 3 and first_three is None:
                 player = environment.state["observation"]["player"]
-                health_fraction(player)
                 first_three = {
                     "hp": player["hp"],
                     "max_hp": player["max_hp"],
+                    "act1_monster_health": info["act1_monster_health"],
                     "floor": info["floor"],
                     "steps": info["steps"],
                 }
+                health_retention(first_three)
         if "act1_monster_wins" in info:
             info = info | {"first_three_monsters": first_three}
         environment.drain_episodes()
@@ -156,7 +157,7 @@ def progression_key(report):
         report["task_successes"],
         sum(row["act1_elite_wins"] >= 1 for row in rows),
         statistics.mean(
-            health_fraction(row["first_three_monsters"])
+            health_retention(row["first_three_monsters"])
             if row["first_three_monsters"] is not None
             else -1.0
             for row in rows
