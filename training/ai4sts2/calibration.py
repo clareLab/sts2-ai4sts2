@@ -8,7 +8,14 @@ from pathlib import Path
 
 from filelock import FileLock
 
-from ai4sts2.environment import CHARACTERS, fingerprint, probe_action, seed_string, write_json
+from ai4sts2.environment import (
+    CHARACTERS,
+    fingerprint,
+    native_scope,
+    probe_action,
+    seed_string,
+    write_json,
+)
 from ai4sts2.execution import CANDIDATES, REFERENCE, Execution
 from ai4sts2.game import ROOT, OfficialGame, prepare_game
 from ai4sts2.resources import capacity
@@ -155,8 +162,7 @@ def select_result(results):
 def calibrate(minutes=5, scope="first_combat"):
     if not 0 < minutes <= 30:
         raise ValueError("Use a budget between zero and 30 minutes.")
-    if scope not in {"run", "first_combat"}:
-        raise ValueError("Unknown episode scope.")
+    scope = native_scope(scope)
     deadline = time.monotonic() + minutes * 60
     build = fingerprint(scope)
     executable = prepare_game()
@@ -198,6 +204,7 @@ def calibrate(minutes=5, scope="first_combat"):
 
 
 def cached_report(scope="first_combat"):
+    scope = native_scope(scope)
     path = ROOT / "artifacts/runtime.json"
     if not path.is_file():
         return None

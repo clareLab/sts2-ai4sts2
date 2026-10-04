@@ -46,6 +46,7 @@ def job(source, output, targets=(128, 256)):
 
 
 def test_continuation_matches_uninterrupted_training_and_reuses_completed_stages(source, tmp_path):
+    source["config"]["initial_policy"] = "earlier-transfer"
     output = tmp_path / "resumed"
     assert curve.run_candidate(job(source, output, (128,)))["status"] == "complete"
     assert curve.run_candidate(job(source, output))["status"] == "complete"
@@ -63,7 +64,8 @@ def test_continuation_matches_uninterrupted_training_and_reuses_completed_stages
     try:
         for actor, directory in ((left, output), (right, direct)):
             actor.config = source["config"] | {
-                "initial_checkpoint": str(directory / "seed-5/checkpoint_000256")
+                "initial_checkpoint": str(directory / "seed-5/checkpoint_000256"),
+                "initial_policy": None,
             }
             actor.setup(actor.config)
         assert left.environment.snapshot() == right.environment.snapshot()

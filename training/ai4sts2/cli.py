@@ -14,7 +14,7 @@ def main():
     baseline.add_argument("--minutes", type=float, default=5)
     baseline.add_argument("--per-character", type=int, default=1)
     baseline.add_argument("--seed", type=int, default=0)
-    baseline.add_argument("--scope", choices=("run", "first_combat"), default="run")
+    baseline.add_argument("--scope", choices=("run", "act1", "first_combat"), default="run")
     baseline.add_argument("--steps", type=int, default=4096)
     baseline.add_argument("--refresh", action="store_true")
     selection = commands.add_parser("check-selection")
@@ -33,9 +33,10 @@ def main():
     pilot.add_argument("--minutes", type=float, default=30)
     pilot.add_argument("--iterations", type=int, default=4)
     pilot.add_argument("--steps", type=int, default=128)
-    pilot.add_argument("--scope", choices=("run", "first_combat"), default="run")
+    pilot.add_argument("--scope", choices=("run", "act1", "first_combat"), default="run")
     pilot.add_argument("--resume", help="Recover an interrupted Ray experiment.")
     pilot.add_argument("--checkpoint", help="Start another bounded pilot from a saved model.")
+    pilot.add_argument("--initial-policy", help="Transfer weights into a fresh training task.")
     pilot.add_argument("--policy", choices=("flat", "shared"), default="flat")
     pilot.add_argument("--width", type=int, default=64)
     pilot.add_argument("--encoding", choices=("hash", "tree"), default="hash")
@@ -54,7 +55,7 @@ def main():
     ablation.add_argument(
         "--workers", type=int, default=0, help="Concurrent trials; zero selects automatically."
     )
-    ablation.add_argument("--scope", choices=("run", "first_combat"), default="run")
+    ablation.add_argument("--scope", choices=("run", "act1", "first_combat"), default="run")
     args = parser.parse_args()
     if args.command == "baseline":
         from ai4sts2.baseline import run
@@ -114,6 +115,7 @@ def main():
                     getattr(args, "policy", "flat"),
                     getattr(args, "width", 64),
                     getattr(args, "encoding", "hash"),
+                    getattr(args, "initial_policy", None),
                 ),
                 indent=2,
             )

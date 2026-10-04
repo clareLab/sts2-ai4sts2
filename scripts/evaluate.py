@@ -180,12 +180,14 @@ def run(
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     resources = budget().report(workers)
-    build = fingerprint("run")
-    models = candidates(json.loads(Path(study_path).read_text()), build, policy_modes)
+    study = json.loads(Path(study_path).read_text())
+    scope = study["build"].get("scope", "run")
+    build = fingerprint(scope)
+    models = candidates(study, build, policy_modes)
     manifest = output / "plan.json"
     previous = json.loads(manifest.read_text()) if manifest.exists() else None
     seed = previous["cases"][0]["seed_index"] if previous else secrets.randbits(60)
-    plan = evaluation_plan("run", seed, "test", 4096, per_character) | {
+    plan = evaluation_plan(scope, seed, "test", 4096, per_character) | {
         "build": build,
         "candidates": models,
         "evaluator": digest(__file__),
@@ -217,13 +219,13 @@ def run(
                 pending.append((key, case, candidate, path))
     execution = executable = None
     if pending and time.monotonic() < deadline:
-        execution = selected_execution("run")
+        execution = selected_execution(scope)
         if execution is None and auto_calibrate:
             if deadline - time.monotonic() < 30:
                 deadline = time.monotonic()
             else:
-                calibrate(min(5, (deadline - time.monotonic()) / 60), "run")
-                execution = selected_execution("run")
+                calibrate(min(5, (deadline - time.monotonic()) / 60), scope)
+                execution = selected_execution(scope)
         if execution is None and time.monotonic() < deadline:
             raise ValueError("A matching execution calibration is required.")
         if execution is not None:
@@ -258,7 +260,7 @@ def run(
                 )
             if getattr(local, "environment", None) is None:
                 local.environment = Sts2Env(
-                    executable, execution=execution, scope="run", max_steps=4096
+                    executable, execution=execution, scope=scope, max_steps=4096
                 )
                 with lock:
                     environments.append(local.environment)
@@ -320,6 +322,7 @@ def run(
                                 "total": len(plan["cases"]) * len(models),
                                 "candidate": record["candidate"],
                                 "floor": record.get("episode", {}).get("floor"),
+                                "task_success": record.get("episode", {}).get("task_success"),
                                 "error": record.get("error"),
                             }
                         ),

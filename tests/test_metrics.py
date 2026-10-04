@@ -12,12 +12,13 @@ def episode(floor, *, victory=False, truncated=False, character="IRONCLAD", act=
     }
 
 
-def test_progress_distinguishes_zero_win_candidates_and_keeps_wins_primary():
+def test_floors_are_diagnostic_and_cannot_rank_zero_success_candidates():
     shallow = summarise([episode(2)] * 5)
     deeper = summarise([episode(floor) for floor in (9, 4, 5, 6, 8)])
     winning = summarise([episode(1, victory=True)] + [episode(0)] * 4)
     extreme = summarise([episode(10**16)] * 5)
-    assert shallow["selection_score"] < deeper["selection_score"] < winning["selection_score"]
+    assert shallow["selection_score"] == deeper["selection_score"] == 0
+    assert winning["selection_score"] == 0.2
     assert extreme["selection_score"] < winning["selection_score"]
     assert deeper["mean_floor"] == 6.4
     assert deeper["median_floor"] == 6

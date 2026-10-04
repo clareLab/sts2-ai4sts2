@@ -29,8 +29,7 @@ class TrainingProgress:
 
     def update(self, episode):
         index = CHARACTERS.index(episode["character"])
-        floor = episode["floor"]
-        self.totals[index] += 1.0 if episode["victory"] else floor / (floor + 1)
+        self.totals[index] += float(episode.get("task_success", episode["victory"]))
         self.counts[index] += 1
 
     def evaluate_agent(self, *args, **kwargs):
@@ -128,11 +127,12 @@ class TrainingSignals:
             )
         elif done and not episode["truncated"]:
             self.curriculum.evaluator.update(episode)
+            success = float(episode.get("task_success", episode["victory"]))
             self.curriculum.update_on_episode(
-                float(episode["victory"]),
+                success,
                 episode["steps"],
                 CHARACTERS.index(episode["character"]),
-                float(episode["victory"]),
+                success,
             )
         if self.rnd_scale == 0:
             return 0.0

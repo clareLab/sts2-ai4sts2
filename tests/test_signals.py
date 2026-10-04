@@ -1,7 +1,6 @@
 import copy
 
 import numpy as np
-import pytest
 import torch
 from ai4sts2.environment import CHARACTERS, Sts2Env
 from ai4sts2.signals import TrainingSignals, novelty_features
@@ -74,15 +73,18 @@ def test_predictor_learns_and_target_stays_frozen():
     assert all(parameter.grad is None for parameter in signals.rnd.target_network.parameters())
 
 
-def test_continuous_floor_progress_adapts_curriculum_without_starving_a_character():
+def test_task_success_adapts_curriculum_without_floor_credit_or_starving_a_character():
     signals = TrainingSignals(5, {"curriculum_mix": 0.75})
     np.testing.assert_allclose(signals.probabilities(), np.full(5, 0.2))
     for _ in range(10):
-        signals.observe(state(), episode(floor=8), True)
+        signals.observe(state(), episode(floor=100), True)
+    assert signals.curriculum.task_rates[0] == 0
+    for _ in range(10):
+        signals.observe(state(), episode(floor=8) | {"task_success": True}, True)
     weights = signals.probabilities()
     assert weights[0] > weights[1]
     assert np.all(weights >= 0.05 - 1e-12)
-    assert signals.curriculum.task_rates[0] == pytest.approx(8 / 9)
+    assert signals.curriculum.task_rates[0] == 1
     counts = signals.curriculum.completed_episodes
     signals.observe(state(), episode(floor=100, truncated=True), True)
     assert signals.curriculum.completed_episodes == counts

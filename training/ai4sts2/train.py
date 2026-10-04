@@ -17,7 +17,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 
 from ai4sts2.baseline import run as random_baseline
 from ai4sts2.calibration import calibrate, quarantine_execution, selected_execution
-from ai4sts2.environment import Sts2Env, evaluate, fingerprint, write_json
+from ai4sts2.environment import SCOPES, Sts2Env, evaluate, fingerprint, write_json
 from ai4sts2.execution import Execution
 from ai4sts2.game import ROOT, WorkerFailure, prepare_game
 from ai4sts2.metrics import compare_evaluations, summarise
@@ -195,6 +195,7 @@ def pilot_report(results, scope, build, baseline, iterations, interrupted=False)
                 "checkpoint": str(result.checkpoint.path),
                 "config": result.config,
                 "win_rate": result.metrics.get("validation_win_rate"),
+                "task_success_rate": result.metrics.get("validation_task_success_rate"),
                 "mean_floor": result.metrics.get("validation_mean_floor"),
                 "selection_score": result.metrics.get("validation_selection_score"),
                 "random_baseline_comparison": result.metrics.get("random_baseline_comparison"),
@@ -210,6 +211,8 @@ def pilot_report(results, scope, build, baseline, iterations, interrupted=False)
 
 class PopulationMember(tune.Trainable):
     def setup(self, config):
+        if config.get("initial_checkpoint") and config.get("initial_policy"):
+            raise ValueError("Choose checkpoint recovery or policy transfer.")
         torch.set_num_threads(1)
         policy = config.get("policy", "flat")
         if policy not in {"flat", "shared"}:
@@ -252,6 +255,31 @@ class PopulationMember(tune.Trainable):
         )
         if config.get("initial_checkpoint"):
             self.load_checkpoint(config["initial_checkpoint"])
+        elif config.get("initial_policy"):
+            self.initialise_policy(config["initial_policy"])
+
+    def initialise_policy(self, checkpoint_dir):
+        directory = Path(checkpoint_dir)
+        build = json.loads((directory / "build.json").read_text())
+        if {k: v for k, v in build.items() if k not in {"trainer", "scope"}} != {
+            k: v for k, v in self.build.items() if k not in {"trainer", "scope"}
+        }:
+            raise ValueError("Policy transfer requires matching game, bridge and observations.")
+        python_rng, numpy_rng = random.getstate(), np.random.get_state()
+        try:
+            with torch.random.fork_rng(devices=[]):
+                source = TimedPPO.load(directory / "policy.zip", device="cpu")
+        finally:
+            random.setstate(python_rng)
+            np.random.set_state(numpy_rng)
+        if (
+            type(source.policy) is not type(self.model.policy)
+            or source.observation_space != self.model.observation_space
+            or source.action_space != self.model.action_space
+            or getattr(source.policy, "encoding", "hash") != self.config.get("encoding", "hash")
+        ):
+            raise ValueError("Policy transfer architecture does not match.")
+        self.model.policy.load_state_dict(source.policy.state_dict())
 
     def step(self, callback=None):
         with tempfile.TemporaryDirectory(prefix="recovery-", dir=self.logdir) as checkpoint:
@@ -284,7 +312,7 @@ class PopulationMember(tune.Trainable):
             seed=self.config["seed"],
             execution=self.execution,
             scope=self.scope,
-            max_steps=4096 if self.scope == "run" else 256,
+            max_steps=256 if self.scope == "first_combat" else 4096,
             signals=self.signals if training else None,
             encoding=self.config.get("encoding", "hash"),
             discount=self.config.get("gamma", 0.99),
@@ -324,6 +352,7 @@ class PopulationMember(tune.Trainable):
         training_episodes = self.environment.drain_episodes()
         return {
             "validation_win_rate": result["win_rate"],
+            "validation_task_success_rate": result["task_success_rate"],
             "validation_mean_floor": result["mean_floor"],
             "validation_median_floor": result["median_floor"],
             "validation_selection_score": result["selection_score"],
@@ -465,22 +494,23 @@ def run(
     policy="flat",
     width=64,
     encoding="hash",
+    initial_policy=None,
 ):
     if not 0 < minutes <= 30:
         raise ValueError("This pilot supports a budget of at most 30 minutes.")
     if iterations < 2 or steps < 64 or steps % 64:
         raise ValueError("Use at least two iterations and a multiple of 64 steps.")
-    if scope not in {"run", "first_combat"}:
+    if scope not in SCOPES:
         raise ValueError("Unknown episode scope.")
     if policy not in {"flat", "shared"} or not isinstance(width, int) or width < 1:
         raise ValueError("Invalid policy architecture or width.")
     if encoding not in {"hash", "tree"} or (encoding == "tree" and policy != "shared"):
         raise ValueError("Structured observations require the shared policy.")
-    if resume and checkpoint:
-        raise ValueError("Choose either interrupted-experiment recovery or a starting checkpoint.")
+    if sum(bool(value) for value in (resume, checkpoint, initial_policy)) > 1:
+        raise ValueError("Choose experiment recovery, checkpoint recovery or policy transfer.")
     if experiment not in {"pbt", "ablation", "policy_ablation", "encoding_ablation"}:
         raise ValueError("Unknown experiment.")
-    if experiment != "pbt" and checkpoint:
+    if experiment != "pbt" and (checkpoint or initial_policy):
         raise ValueError("The ablation requires identical fresh model initialisations.")
     resources = budget().report(workers)
     studies = {
@@ -514,11 +544,13 @@ def run(
     baseline = random_baseline(
         minutes=min(5, max(0.001, (deadline - time.monotonic()) / 60)),
         scope=scope,
-        max_steps=4096 if scope == "run" else 256,
+        max_steps=256 if scope == "first_combat" else 4096,
     )
     if not baseline["eligible"]:
         raise RuntimeError("Random baseline did not finish every evaluation case.")
-    baseline_reference = {key: baseline[key] for key in ("evaluation_id", "wins", "eligible")} | {
+    baseline_reference = {
+        key: baseline[key] for key in ("evaluation_id", "wins", "task_successes", "eligible")
+    } | {
         "episodes": [
             {key: episode[key] for key in ("character", "seed", "floor")}
             for episode in baseline["episodes"]
@@ -592,6 +624,7 @@ def run(
                     "executable": str(executable),
                     "steps_per_iteration": steps,
                     "initial_checkpoint": checkpoint,
+                    "initial_policy": initial_policy,
                     "execution": execution.to_dict(),
                     "scope": scope,
                     "baseline": baseline_reference,

@@ -172,7 +172,11 @@ def run_candidate(job):
     )
     if time.monotonic() + estimate >= deadline:
         return {"seed": source["seed"], "status": "budget"}
-    config = source["config"] | {"initial_checkpoint": current["checkpoint"], "fixed_steps": True}
+    config = source["config"] | {
+        "initial_checkpoint": current["checkpoint"],
+        "initial_policy": None,
+        "fixed_steps": True,
+    }
     member = object.__new__(PopulationMember)
     member.config = config
     member._logdir = str(directory)
@@ -216,6 +220,7 @@ def run_candidate(job):
                         "steps": target,
                         "mean_floor": metrics["validation_mean_floor"],
                         "wins": metrics["validation_win_rate"],
+                        "task_success_rate": metrics["validation_task_success_rate"],
                         "training_seconds": metrics["training_seconds"],
                         "evaluation_seconds": metrics["evaluation_seconds"],
                     }
@@ -254,8 +259,9 @@ def run(study_path, output, targets=(1536, 3072), variant="control", minutes=20,
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     with FileLock(output / "run.lock", timeout=0):
-        build = fingerprint("run")
-        inputs = sources(json.loads(Path(study_path).read_text()), variant, build)
+        study = json.loads(Path(study_path).read_text())
+        build = fingerprint(study["build"].get("scope", "run"))
+        inputs = sources(study, variant, build)
         targets = list(targets)
         if targets != sorted(set(targets)) or not targets or any(target % 64 for target in targets):
             raise ValueError("Use ascending distinct targets divisible by 64.")

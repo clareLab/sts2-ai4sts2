@@ -2,7 +2,7 @@ import json
 import time
 
 from ai4sts2.calibration import selected_execution
-from ai4sts2.environment import Sts2Env, evaluate, evaluation_plan, fingerprint, write_json
+from ai4sts2.environment import SCOPES, Sts2Env, evaluate, evaluation_plan, fingerprint, write_json
 from ai4sts2.execution import REFERENCE
 from ai4sts2.game import ROOT, prepare_game
 
@@ -10,7 +10,7 @@ from ai4sts2.game import ROOT, prepare_game
 def run(minutes=5, per_character=1, seed=0, scope="run", max_steps=4096, refresh=False):
     if not 0 < minutes <= 30:
         raise ValueError("Use a budget between zero and 30 minutes.")
-    if scope not in {"run", "first_combat"}:
+    if scope not in SCOPES:
         raise ValueError("Unknown episode scope.")
     plan = evaluation_plan(scope, seed=seed, max_steps=max_steps, per_character=per_character)
     build = fingerprint(scope)
@@ -47,6 +47,7 @@ def run(minutes=5, per_character=1, seed=0, scope="run", max_steps=4096, refresh
                 {
                     "baseline_episodes": len(result["episodes"]),
                     "win_rate": result["win_rate"],
+                    "task_success_rate": result["task_success_rate"],
                     "mean_floor": result["mean_floor"],
                     "complete": result["complete"],
                 }
