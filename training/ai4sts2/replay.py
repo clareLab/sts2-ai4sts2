@@ -1,8 +1,86 @@
+import hashlib
+import json
 import math
+from pathlib import Path
 
 import numpy as np
 import torch
 from stable_baselines3.common.callbacks import BaseCallback
+
+
+def replay_dataset(manifest, build, discount):
+    from tensordict import TensorDict
+
+    from ai4sts2.environment import ACTION_FEATURES, MAX_ACTIONS, STATE_FEATURES, seed_string
+
+    manifest = Path(manifest)
+    collection = json.loads(manifest.read_text())
+    if not collection.get("complete") or not collection.get("records"):
+        raise ValueError("A complete training corpus is required.")
+    expected_build = {key: value for key, value in build.items() if key != "trainer"}
+    episodes, seen = [], set()
+    for record in collection["records"]:
+        if (
+            not record.get("complete")
+            or record.get("truncated") is not False
+            or record.get("split") != "train"
+            or {key: value for key, value in record["build"].items() if key != "trainer"}
+            != expected_build
+        ):
+            raise ValueError("Replay requires complete, compatible training episodes.")
+        case = record["case"]
+        identity = (case["character"], case["seed"], case["mode"])
+        if identity in seen or case["seed"] != seed_string("train", case["seed_index"]):
+            raise ValueError("Duplicate or invalid training seed in replay.")
+        seen.add(identity)
+        path = manifest.parent / record["trajectory"]
+        if hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]:
+            raise ValueError("Replay episode checksum does not match.")
+        with np.load(path, allow_pickle=False) as data:
+            if set(data.files) != {"state", "actions", "action_masks", "action_indices", "rewards"}:
+                raise ValueError("Unexpected replay episode fields.")
+            count = record["episode"]["steps"]
+            if (
+                count < 1
+                or data["state"].shape != (count, STATE_FEATURES)
+                or data["actions"].shape != (count, MAX_ACTIONS, ACTION_FEATURES)
+                or data["action_masks"].shape != (count, MAX_ACTIONS)
+                or data["action_indices"].shape != (count,)
+                or data["rewards"].shape != (count,)
+                or data["action_indices"].dtype != np.int64
+                or data["action_masks"].dtype != np.bool_
+                or not all(np.isfinite(data[key]).all() for key in data.files)
+            ):
+                raise ValueError("Invalid replay episode arrays.")
+            indices = data["action_indices"]
+            if (
+                np.any(indices < 0)
+                or np.any(indices >= MAX_ACTIONS)
+                or not data["action_masks"][np.arange(count), indices].all()
+            ):
+                raise ValueError("Replay contains an illegal action.")
+            if data["rewards"][:-1].any() or data["rewards"][-1] != (
+                1 if record["episode"]["task_success"] else -1
+            ):
+                raise ValueError("Replay requires complete sparse task rewards.")
+            episodes.append(
+                TensorDict(
+                    {
+                        "observation": TensorDict(
+                            {
+                                key: torch.from_numpy(data[key].copy())
+                                for key in ("state", "actions")
+                            },
+                            batch_size=[count],
+                        ),
+                        "action": torch.from_numpy(indices.copy()),
+                        "action_mask": torch.from_numpy(data["action_masks"].copy()),
+                        "return": torch.from_numpy(episode_returns(data["rewards"], discount)),
+                    },
+                    batch_size=[count],
+                )
+            )
+    return torch.cat(episodes, dim=0)
 
 
 def episode_returns(rewards, discount):

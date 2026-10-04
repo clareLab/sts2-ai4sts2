@@ -201,3 +201,184 @@ def test_interrupted_rollout_does_not_replay_without_a_ppo_update():
         assert callback.diagnostics == []
     finally:
         environment.close()
+
+
+@pytest.fixture
+def replay_corpus(tmp_path):
+    import hashlib
+    import json
+
+    from ai4sts2.environment import encode, seed_string
+    from test_environment import state
+
+    observation = encode(state())
+    path = tmp_path / "episode.npz"
+    np.savez_compressed(
+        path,
+        **{key: np.stack([value, value]) for key, value in observation.items()},
+        action_masks=np.tile(np.arange(128) < 2, (2, 1)),
+        action_indices=np.array([0, 1], dtype=np.int64),
+        rewards=np.array([0, 1], dtype=np.float32),
+    )
+    record = {
+        "complete": True,
+        "truncated": False,
+        "split": "train",
+        "build": {"game": "test", "schema": 1},
+        "case": {
+            "character": "IRONCLAD",
+            "seed": seed_string("train", 12),
+            "seed_index": 12,
+            "mode": "sampled",
+        },
+        "trajectory": path.name,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "episode": {"steps": 2, "task_success": True},
+    }
+    manifest = tmp_path / "corpus.json"
+    manifest.write_text(json.dumps({"complete": True, "records": [record]}))
+    return manifest
+
+
+def test_corpus_allows_new_trainer_with_unchanged_game_and_schema(replay_corpus):
+    from ai4sts2.replay import replay_dataset
+
+    data = replay_dataset(replay_corpus, {"game": "test", "schema": 1, "trainer": "new"}, 0.5)
+    torch.testing.assert_close(data["return"], torch.tensor([0.5, 1.0]))
+    assert data["action_mask"][torch.arange(2), data["action"]].all()
+
+
+@pytest.mark.parametrize("split", ["validation", "test"])
+def test_replay_rejects_evaluation_data(replay_corpus, split):
+    import json
+
+    from ai4sts2.replay import replay_dataset
+
+    saved = json.loads(replay_corpus.read_text())
+    saved["records"][0]["split"] = split
+    replay_corpus.write_text(json.dumps(saved))
+    with pytest.raises(ValueError, match="training episodes"):
+        replay_dataset(replay_corpus, {"game": "test", "schema": 1}, 1.0)
+
+
+@pytest.mark.parametrize("change", ["build", "checksum", "duplicate", "incomplete", "seed"])
+def test_corpus_provenance_errors_are_rejected(replay_corpus, change):
+    import json
+
+    from ai4sts2.replay import replay_dataset
+
+    saved = json.loads(replay_corpus.read_text())
+    row = saved["records"][0]
+    if change == "build":
+        row["build"]["game"] = "different"
+    elif change == "checksum":
+        row["sha256"] = "wrong"
+    elif change == "duplicate":
+        saved["records"].append(row)
+    elif change == "incomplete":
+        row["truncated"] = True
+    else:
+        row["case"]["seed"] = "wrong"
+    replay_corpus.write_text(json.dumps(saved))
+    with pytest.raises(ValueError):
+        replay_dataset(replay_corpus, {"game": "test", "schema": 1}, 1.0)
+
+
+@pytest.mark.parametrize("change", ["illegal", "shape", "reward", "nonfinite"])
+def test_corpus_rejects_bad_arrays_even_with_valid_checksums(replay_corpus, change):
+    import hashlib
+    import json
+
+    from ai4sts2.replay import replay_dataset
+
+    saved = json.loads(replay_corpus.read_text())
+    row = saved["records"][0]
+    path = replay_corpus.parent / row["trajectory"]
+    with np.load(path) as archive:
+        data = {key: archive[key].copy() for key in archive.files}
+    if change == "illegal":
+        data["action_indices"][0] = 3
+    elif change == "shape":
+        data["state"] = data["state"][:1]
+    elif change == "reward":
+        data["rewards"][0] = 1
+    else:
+        data["actions"][0, 0, 0] = np.nan
+    np.savez_compressed(path, **data)
+    row["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    replay_corpus.write_text(json.dumps(saved))
+    with pytest.raises(ValueError):
+        replay_dataset(replay_corpus, {"game": "test", "schema": 1}, 1.0)
+
+
+def test_integrated_replay_recovers_exactly_and_validation_never_updates_it(
+    monkeypatch, tmp_path, replay_corpus
+):
+    from ai4sts2.environment import evaluate
+    from test_checkpoint import member
+
+    candidate = member(monkeypatch, policy="shared")
+    candidate._logdir = str(tmp_path)
+    candidate.config |= {
+        "replay_corpus": str(replay_corpus),
+        "replay_updates": 4,
+        "replay_value_coefficient": 0.01,
+        "fixed_steps": True,
+    }
+    candidate.apply_parameters(candidate.config)
+    candidate.sample_count = 64
+    try:
+        first = candidate.step()
+        assert first["auxiliary_updates"] == 4
+        saved = tmp_path / "saved"
+        saved.mkdir()
+        candidate.save_checkpoint(saved)
+        second = candidate.step()
+        weights = {key: value.clone() for key, value in candidate.model.policy.state_dict().items()}
+        generator = candidate.replay_generator.get_state().clone()
+        snapshot = candidate.environment.snapshot()
+        evaluate(candidate.model, candidate.validation_environment)
+        assert torch.equal(candidate.replay_generator.get_state(), generator)
+        assert candidate.replay_updates == 8
+        candidate.cleanup()
+        candidate.load_checkpoint(saved)
+        repeated = candidate.step()
+        assert second["auxiliary_diagnostics"] == repeated["auxiliary_diagnostics"]
+        assert repeated["auxiliary_updates"] == 8
+        assert candidate.environment.snapshot() == snapshot
+        assert torch.equal(candidate.replay_generator.get_state(), generator)
+        for key, value in weights.items():
+            assert torch.equal(candidate.model.policy.state_dict()[key], value)
+    finally:
+        candidate.cleanup()
+
+
+def test_disabling_replay_preserves_sampler_and_allows_reenabling(
+    monkeypatch, tmp_path, replay_corpus
+):
+    from test_checkpoint import member
+
+    candidate = member(monkeypatch, policy="shared")
+    candidate._logdir = str(tmp_path)
+    candidate.config |= {
+        "replay_corpus": str(replay_corpus),
+        "replay_updates": 0,
+        "fixed_steps": True,
+    }
+    candidate.apply_parameters(candidate.config)
+    candidate.sample_count = 64
+    try:
+        before = candidate.replay_generator.get_state().clone()
+        assert candidate.replay_buffer is None
+        assert candidate.step()["auxiliary_updates"] == 0
+        assert torch.equal(before, candidate.replay_generator.get_state())
+        candidate.config["replay_updates"] = 1
+        candidate.apply_parameters(candidate.config)
+        assert candidate.step()["auxiliary_updates"] == 1
+        candidate.config["replay_updates"] = 0
+        candidate.apply_parameters(candidate.config)
+        before = candidate.replay_generator.get_state().clone()
+        assert candidate.step()["auxiliary_updates"] == 1
+        assert torch.equal(before, candidate.replay_generator.get_state())
+    finally:
+        candidate.cleanup()

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -21,6 +22,7 @@ from ai4sts2.execution import Execution
 from ai4sts2.game import ROOT, WorkerFailure, prepare_game
 from ai4sts2.metrics import summarise
 from ai4sts2.policy import SharedActionPolicy
+from ai4sts2.replay import SelfImitationCallback, replay_dataset
 from ai4sts2.resources import TRIAL_MEMORY, budget
 from ai4sts2.signals import TrainingSignals
 
@@ -225,6 +227,11 @@ class PopulationMember(tune.Trainable):
         self.scope = config.get("scope", "run")
         self.ascension = config.get("ascension", 10)
         self.build = fingerprint(self.scope, self.ascension)
+        self.replay_buffer = None
+        self.replay_identity = None
+        self.replay_callback = None
+        self.replay_updates = 0
+        self.replay_generator = torch.Generator().manual_seed(config["seed"])
         self.recoveries = []
         self.signals = TrainingSignals(config["seed"], config)
         self.execution = selected_execution(self.scope, self.ascension) or Execution(
@@ -262,10 +269,15 @@ class PopulationMember(tune.Trainable):
             device="cpu",
             seed=config["seed"],
         )
-        if config.get("initial_checkpoint"):
-            self.load_checkpoint(config["initial_checkpoint"])
-        elif config.get("initial_policy"):
-            self.initialise_policy(config["initial_policy"])
+        try:
+            self.configure_replay(config)
+            if config.get("initial_checkpoint"):
+                self.load_checkpoint(config["initial_checkpoint"])
+            elif config.get("initial_policy"):
+                self.initialise_policy(config["initial_policy"])
+        except Exception:
+            self.cleanup()
+            raise
 
     def initialise_policy(self, checkpoint_dir):
         directory = Path(checkpoint_dir)
@@ -338,9 +350,24 @@ class PopulationMember(tune.Trainable):
         self.model.optimisation_seconds = 0.0
         self.model.drain_diagnostics()
         started = time.monotonic()
-        self.model.learn(
-            total_timesteps=self.sample_count, reset_num_timesteps=False, callback=callback
+        self.replay_callback = SelfImitationCallback(
+            self.replay_buffer,
+            self.config.get("replay_updates", 0),
+            self.config.get("replay_value_coefficient", 0.01),
         )
+        self.model.learn(
+            total_timesteps=self.sample_count,
+            reset_num_timesteps=False,
+            callback=[
+                self.replay_callback,
+                *(callback if isinstance(callback, list) else [callback]),
+            ]
+            if callback
+            else self.replay_callback,
+        )
+        replay_diagnostics = self.replay_callback.diagnostics
+        self.replay_updates += len(replay_diagnostics)
+        self.replay_callback = None
         training_seconds = time.monotonic() - started
         training_profile = self.environment.drain_measurements()
         started = time.monotonic()
@@ -381,6 +408,8 @@ class PopulationMember(tune.Trainable):
             "training_seconds": training_seconds,
             "optimisation_seconds": self.model.optimisation_seconds,
             "learning_diagnostics": self.model.drain_diagnostics(),
+            "auxiliary_updates": self.replay_updates,
+            "auxiliary_diagnostics": replay_diagnostics,
             "evaluation_seconds": evaluation_seconds,
             "training_profile": training_profile,
             "evaluation_profile": evaluation_profile,
@@ -411,6 +440,18 @@ class PopulationMember(tune.Trainable):
         write_json(directory / "environment.json", self.environment.snapshot())
         torch.save(self.signals.snapshot(), directory / "signals.pt")
         write_json(directory / "schedule.json", {"sample_count": self.sample_count})
+        if self.replay_identity is not None:
+            torch.save(
+                {
+                    "generator": self.replay_generator.get_state(),
+                    "updates": self.replay_updates
+                    + (len(self.replay_callback.diagnostics) if self.replay_callback else 0),
+                    "corpus_sha256": self.replay_identity[1],
+                },
+                directory / "replay.pt",
+            )
+        else:
+            (directory / "replay.pt").unlink(missing_ok=True)
         if self.evaluation is not None:
             write_json(directory / "evaluation.json", self.evaluation)
         return checkpoint_dir
@@ -452,6 +493,15 @@ class PopulationMember(tune.Trainable):
         torch.set_rng_state(state["torch_rng"])
         self.environment.rng.bit_generator.state = state["environment_rng"]
         self.apply_parameters(self.config)
+        self.replay_callback = None
+        if self.replay_identity is not None:
+            replay = torch.load(directory / "replay.pt", weights_only=True)
+            if replay["corpus_sha256"] != self.replay_identity[1]:
+                raise ValueError("Checkpoint replay corpus does not match.")
+            self.replay_generator.set_state(replay["generator"])
+            self.replay_updates = replay["updates"]
+        elif (directory / "replay.pt").exists():
+            raise ValueError("Checkpoint recovery requires its replay corpus configuration.")
 
     def apply_parameters(self, config):
         expected = config.get("policy", "flat")
@@ -481,6 +531,43 @@ class PopulationMember(tune.Trainable):
         self.model.rollout_buffer.gae_lambda = self.model.gae_lambda
         self.model.n_epochs = config.get("epochs", self.model.n_epochs)
         self.model.clip_range = FloatSchedule(config.get("clip_range", 0.2))
+        self.configure_replay(config)
+
+    def configure_replay(self, config):
+        updates = config.get("replay_updates", 0)
+        SelfImitationCallback(None, updates, config.get("replay_value_coefficient", 0.01))
+        path = config.get("replay_corpus")
+        if updates and not path:
+            raise ValueError("Self-imitation updates require a training corpus.")
+        if path and (
+            config.get("encoding", "hash") != "hash"
+            or config.get("rnd_scale", 0)
+            or config.get("progress_scale", 0)
+            or config.get("floor_goals")
+        ):
+            raise ValueError("Replay requires matching hash observations and sparse task rewards.")
+        identity = (
+            (
+                str(Path(path).resolve()),
+                hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+                self.model.gamma,
+            )
+            if path
+            else None
+        )
+        if identity and config.get("corpus_sha256", identity[1]) != identity[1]:
+            raise ValueError("Replay corpus checksum does not match.")
+        if self.replay_identity is not None and identity != self.replay_identity:
+            raise ValueError("Cannot change an active replay corpus or return discount.")
+        self.replay_identity = identity
+        if updates and self.replay_buffer is None:
+            from torchrl.data import TensorDictReplayBuffer, TensorStorage
+
+            self.replay_buffer = TensorDictReplayBuffer(
+                storage=TensorStorage(replay_dataset(path, self.build, self.model.gamma)),
+                batch_size=self.model.n_steps,
+                generator=self.replay_generator,
+            )
 
     def reset_config(self, new_config):
         self.cleanup()
