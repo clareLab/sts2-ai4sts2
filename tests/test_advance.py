@@ -11,6 +11,7 @@ from ai4sts2.environment import evaluation_plan, write_json
 from test_checkpoint import member
 from test_curve import curve
 from test_evaluate import holdout
+from test_replay import replay_corpus as replay_corpus
 
 sys.modules.setdefault("curve", curve)
 sys.modules.setdefault("evaluate", holdout)
@@ -210,3 +211,118 @@ def test_interrupted_round_resumes_from_the_last_atomic_checkpoint(frozen, monke
     assert json.loads((Path(resumed["checkpoint"]) / "environment.json").read_text()) == json.loads(
         (Path(uninterrupted["checkpoint"]) / "environment.json").read_text()
     )
+
+
+def test_replay_comparison_has_matched_initialisation_and_frozen_controls(
+    frozen, monkeypatch, replay_corpus
+):
+    import ai4sts2.train as training
+
+    path, output, source = frozen
+    collection = json.loads(replay_corpus.read_text())
+    for record in collection["records"]:
+        record["build"] = source["build"]
+    write_json(replay_corpus, collection)
+    source["trials"][0]["config"] |= {
+        "replay_corpus": str(replay_corpus),
+        "replay_updates": 1,
+        "collect_replay": True,
+    }
+    write_json(path, source)
+    with pytest.raises(ValueError, match="requires policy transfer"):
+        advance.prepare(output, path, 64, 2, False, True)
+    plan = advance.prepare(output, path, 64, 2, True, True)
+    assert advance.prepare(output, path, 64, 2, True, True) == plan
+    with pytest.raises(ValueError, match="different request"):
+        advance.prepare(output, path, 64, 2, True, False)
+    jobs = advance.training_jobs(output, plan)
+    assert [variant["collect_replay"] for _, variant in jobs] == [False, True]
+    assert len({variant["training_seed"] for _, variant in jobs}) == 1
+    assert all(variant["source"] == plan["source"] for _, variant in jobs)
+    monkeypatch.setattr(advance, "prepare_game", lambda: "fake")
+    monkeypatch.setattr(training, "fingerprint", lambda *_: source["build"])
+    trials = [
+        advance.train(directory, variant, time.monotonic() + 300) for directory, variant in jobs
+    ]
+    assert [trial["variant"] for trial in trials] == ["fixed", "online"]
+    assert all(not trial["metrics"]["validation_performed"] for trial in trials)
+    models = [training.TimedPPO.load(Path(trial["checkpoint"]) / "policy.zip") for trial in trials]
+    for name, value in models[0].policy.state_dict().items():
+        assert torch.equal(value, models[1].policy.state_dict()[name])
+    snapshots = [
+        json.loads((Path(t["checkpoint"]) / "environment.json").read_text()) for t in trials
+    ]
+    assert snapshots[0] == snapshots[1]
+    totals = advance.training_totals(output, plan)
+    assert [row["steps"] for row in totals] == [64, 64]
+    assert all(row["episodes"] > 0 and row["seconds"] > 0 for row in totals)
+    assert trials[0]["config"]["collect_replay"] is False
+
+
+def test_incomplete_round_never_evaluates_or_selects(frozen, monkeypatch):
+    from ai4sts2.resources import Budget
+
+    path, output, source = frozen
+    events = []
+    monkeypatch.setattr(advance, "budget", lambda: Budget(2, 8 * 1024**3))
+    monkeypatch.setattr(advance, "ensure_execution", lambda *_: None)
+    monkeypatch.setattr(advance, "train_round", lambda *_: [{"environment_steps": 128}])
+    monkeypatch.setattr(advance, "validate", lambda *_: events.append("evaluation"))
+    result = advance.run(path, output, steps=128)
+    assert not result["complete"] and not result["training_complete"]
+    assert events == [] and not (output / "selection.json").exists()
+    monkeypatch.setattr(advance, "train_round", lambda *_: [{"environment_steps": 192}])
+
+    def evaluate(*args):
+        events.append("evaluation")
+        return {"eligible": True, "complete": True}
+
+    monkeypatch.setattr(advance, "validate", evaluate)
+    result = advance.run(path, output, steps=128)
+    assert result["complete"] and result["training_complete"]
+    assert events == ["evaluation"]
+
+
+@pytest.mark.parametrize("winner", [0, 1, 2])
+def test_comparison_keeps_incumbent_and_selects_a_trained_continuation(
+    monkeypatch, tmp_path, winner
+):
+    trials = [{"checkpoint": name} for name in ("incumbent", "fixed", "online")]
+    reports = [{"rank": int(index == winner)} for index in range(3)]
+    plan = {"request": {"build": {}}, "validation_panel": {"split": "validation"}}
+    monkeypatch.setattr(holdout, "progression_key", lambda report: report["rank"])
+    advance.save_selection(
+        tmp_path, plan, trials, {"complete": True, "eligible": True, "trials": reports}
+    )
+    selected = json.loads((tmp_path / "selection.json").read_text())
+    continuation = json.loads((tmp_path / "continuation.json").read_text())
+    assert selected["trials"][0]["checkpoint"] == trials[winner]["checkpoint"]
+    assert continuation["trials"][0]["checkpoint"] == ("online" if winner == 2 else "fixed")
+
+
+def test_parallel_round_uses_isolated_processes_and_shared_budget(monkeypatch, tmp_path):
+    from concurrent.futures import Future
+
+    calls = []
+
+    class Pool:
+        def __init__(self, max_workers, mp_context):
+            assert max_workers == 2 and mp_context.get_start_method() == "spawn"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def submit(self, function, directory, plan, deadline, executable):
+            assert function is advance.train and deadline == 123 and executable == "prepared"
+            calls.append(plan["variant"])
+            future = Future()
+            future.set_result({"variant": plan["variant"]})
+            return future
+
+    monkeypatch.setattr(advance, "ProcessPoolExecutor", Pool)
+    monkeypatch.setattr(advance, "prepare_game", lambda: "prepared")
+    result = advance.train_round(tmp_path, {"request": {"compare_replay": True}}, 123, 2)
+    assert calls == ["fixed", "online"] and len(result) == 2

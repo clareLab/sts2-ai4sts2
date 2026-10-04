@@ -2,10 +2,12 @@ import argparse
 import gc
 import hashlib
 import json
+import multiprocessing
 import os
 import secrets
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import curve
@@ -32,7 +34,7 @@ def verify_trial(trial, build):
         raise ValueError("The source checkpoint has changed.")
 
 
-def prepare(output, initial, steps, per_character, transfer):
+def prepare(output, initial, steps, per_character, transfer, compare_replay=False):
     if steps < 64 or steps % 64 or per_character < 1:
         raise ValueError("Use positive whole rollouts and positive evaluation case counts.")
     initial = Path(initial).resolve()
@@ -42,6 +44,12 @@ def prepare(output, initial, steps, per_character, transfer):
     if source["build"].get("scope") != "act1":
         raise ValueError("Progression selection requires the Act 1 task.")
     trial = source["trials"][0]
+    if compare_replay and (
+        not transfer
+        or not trial["config"].get("replay_corpus")
+        or not trial["config"].get("replay_updates", 0)
+    ):
+        raise ValueError("Replay comparison requires policy transfer and an active replay corpus.")
     verify_trial(trial, source["build"])
     build = fingerprint("act1", source["build"]["ascension"])
 
@@ -58,6 +66,7 @@ def prepare(output, initial, steps, per_character, transfer):
         "steps": steps,
         "per_character": per_character,
         "transfer": transfer,
+        "compare_replay": compare_replay,
         "build": build,
         "runner": {
             name: holdout.digest(Path(__file__).with_name(name))
@@ -106,7 +115,7 @@ def persist(member, output, plan, metrics=None):
         member.save_checkpoint(directory)
         trial = {
             "plan": identity(plan),
-            "variant": "candidate",
+            "variant": plan.get("variant", "candidate"),
             "seed": member.config["seed"],
             "checkpoint": str(target),
             "environment_steps": steps,
@@ -120,7 +129,7 @@ def persist(member, output, plan, metrics=None):
     return trial
 
 
-def train(output, plan, deadline):
+def train(output, plan, deadline, executable=None):
     build = plan["request"]["build"]
     checkpoints = sorted((output / "checkpoints").glob("step-*/result.json"))
     current = load(checkpoints[-1]) if checkpoints else None
@@ -134,14 +143,19 @@ def train(output, plan, deadline):
             return current
     if time.monotonic() + 60 >= deadline:
         return current
-    executable = prepare_game()
+    executable = executable or prepare_game()
     transfer = current is None and plan["request"]["transfer"]
     config = (current or plan["source"])["config"] | {
         "seed": plan["training_seed"],
         "executable": str(executable),
         "fixed_steps": True,
         "validate_each_iteration": False,
-        "collect_replay": bool(plan["source"]["config"].get("replay_corpus")),
+        "collect_replay": plan.get(
+            "collect_replay",
+            plan["source"]["config"].get(
+                "collect_replay", bool(plan["source"]["config"].get("replay_corpus"))
+            ),
+        ),
         "initial_checkpoint": None if transfer else (current or plan["source"])["checkpoint"],
         "initial_policy": plan["source"]["checkpoint"] if transfer else None,
     }
@@ -170,10 +184,10 @@ def train(output, plan, deadline):
                 json.dumps(
                     {
                         "stage": "training",
+                        "variant": plan.get("variant", "candidate"),
                         "steps": member.model.num_timesteps,
                         "target": plan["target_steps"],
                         "seconds": metrics["training_seconds"],
-                        "progress": metrics["training_progress"],
                     }
                 ),
                 flush=True,
@@ -181,6 +195,55 @@ def train(output, plan, deadline):
         return current
     finally:
         member.cleanup()
+
+
+def training_jobs(output, plan):
+    if not plan["request"].get("compare_replay"):
+        return [(output, plan)]
+    return [
+        (output / variant, plan | {"variant": variant, "collect_replay": collect})
+        for variant, collect in (("fixed", False), ("online", True))
+    ]
+
+
+def train_round(output, plan, deadline, workers):
+    jobs = training_jobs(output, plan)
+    if len(jobs) == 1:
+        return [train(*jobs[0], deadline)]
+    executable = prepare_game()
+    with ProcessPoolExecutor(
+        max_workers=min(workers, len(jobs)), mp_context=multiprocessing.get_context("spawn")
+    ) as pool:
+        futures = [
+            pool.submit(train, directory, variant, deadline, executable)
+            for directory, variant in jobs
+        ]
+        return [future.result() for future in futures]
+
+
+def training_totals(output, plan):
+    totals = []
+    for directory, variant in training_jobs(output, plan):
+        rows = [load(path) for path in sorted(directory.glob("checkpoints/step-*/result.json"))]
+        metrics = [row["metrics"] for row in rows if row["metrics"]]
+        episodes = [episode for metric in metrics for episode in metric["training_episodes"]]
+        totals.append(
+            {
+                "variant": variant.get("variant", "candidate"),
+                "steps": rows[-1]["environment_steps"] - rows[0]["environment_steps"]
+                if rows
+                else 0,
+                "episodes": len(episodes),
+                "act1_clears": sum(episode["task_success"] for episode in episodes),
+                "elite_successes": sum(
+                    episode.get("act1_elite_wins", 0) > 0 for episode in episodes
+                ),
+                "seconds": sum(metric["training_seconds"] for metric in metrics),
+                "optimisation_seconds": sum(metric["optimisation_seconds"] for metric in metrics),
+                "replay_transitions": metrics[-1].get("replay_transitions", 0) if metrics else 0,
+            }
+        )
+    return totals
 
 
 def cache_reference(output, plan, candidate):
@@ -210,10 +273,11 @@ def cache_reference(output, plan, candidate):
 
 
 def validate(output, plan, current, deadline, workers):
-    reference = load(output / "reference.json")
+    current = current if isinstance(current, list) else [current]
+    reference = load(training_jobs(output, plan)[0][0] / "reference.json")
     if not plan["request"]["transfer"]:
         reference = plan["source"]
-    trials = [reference | {"variant": "reference"}, current | {"variant": "candidate"}]
+    trials = [reference | {"variant": "reference"}, *current]
     build = plan["request"]["build"]
     comparison = {"complete": True, "build": build, "trials": trials}
     write_json(output / "comparison.json", comparison)
@@ -252,7 +316,10 @@ def save_selection(output, plan, trials, result):
     best = max(
         range(len(trials)), key=lambda index: holdout.progression_key(result["trials"][index])
     )
-    for filename, index in (("selection.json", best), ("continuation.json", 1)):
+    continuation = max(
+        range(1, len(trials)), key=lambda index: holdout.progression_key(result["trials"][index])
+    )
+    for filename, index in (("selection.json", best), ("continuation.json", continuation)):
         write_json(
             output / filename,
             {
@@ -270,7 +337,16 @@ def save_selection(output, plan, trials, result):
         )
 
 
-def run(initial, output, steps=8192, minutes=30, per_character=2, transfer=False, workers=0):
+def run(
+    initial,
+    output,
+    steps=8192,
+    minutes=30,
+    per_character=2,
+    transfer=False,
+    workers=0,
+    compare_replay=False,
+):
     if not 0 < minutes <= 30:
         raise ValueError("Use a budget between zero and 30 minutes.")
     started = time.monotonic()
@@ -278,7 +354,7 @@ def run(initial, output, steps=8192, minutes=30, per_character=2, transfer=False
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     with FileLock(output / "run.lock", timeout=0):
-        plan = prepare(output, initial, steps, per_character, transfer)
+        plan = prepare(output, initial, steps, per_character, transfer, compare_replay)
         resources = budget().report(workers)
         report = {"complete": False, "build": plan["request"]["build"], "resources": resources}
         try:
@@ -291,15 +367,21 @@ def run(initial, output, steps=8192, minutes=30, per_character=2, transfer=False
             report["calibration_seconds"] = time.monotonic() - phase_started
             phase_started = time.monotonic()
             reserve = max(180, (deadline - started) * 0.3)
-            current = train(output, plan, deadline - reserve)
+            current = train_round(output, plan, deadline - reserve, resources["concurrent_trials"])
             report["training_seconds"] = time.monotonic() - phase_started
             gc.collect()
-            finished = current is not None and current["environment_steps"] == plan["target_steps"]
-            report |= {"training_complete": finished, "checkpoint": current}
+            finished = all(
+                trial is not None and trial["environment_steps"] == plan["target_steps"]
+                for trial in current
+            )
+            report |= {"training_complete": finished, "checkpoints": current}
             if finished:
                 result = validate(output, plan, current, deadline, resources["concurrent_trials"])
                 report |= {"validation": result, "complete": result["eligible"]}
             return report
+        except Exception as error:
+            report["error"] = f"{type(error).__name__}: {error}"
+            raise
         finally:
             groups = [p for p in cgroups() if (p / "memory.peak").exists()]
             report |= {
@@ -308,6 +390,7 @@ def run(initial, output, steps=8192, minutes=30, per_character=2, transfer=False
                 "certifying": False,
                 "promoted": False,
                 "test_episodes": 0,
+                "training_totals": training_totals(output, plan),
             }
             write_json(output / "summary.json", report)
 
@@ -321,6 +404,7 @@ if __name__ == "__main__":
     parser.add_argument("--per-character", type=int, default=2)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--transfer", action="store_true")
+    parser.add_argument("--compare-replay", action="store_true")
     result = run(**vars(parser.parse_args()))
     print(json.dumps({"complete": result["complete"], "seconds": result["seconds"]}), flush=True)
     if not result["complete"]:
