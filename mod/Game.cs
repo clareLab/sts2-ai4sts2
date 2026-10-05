@@ -21,6 +21,7 @@ using MegaCrit.Sts2.Core.Helpers;
 using MegaCrit.Sts2.Core.Hooks;
 using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Models.Events;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
 using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Random;
@@ -465,6 +466,9 @@ internal static class Game
                 if (PendingOptionTasks(Manager.EventSynchronizer).Any(t => !t.IsCompleted)) return null;
                 var ev = Manager.EventSynchronizer.GetLocalEvent();
                 if (ev.Id != eventRoom.CanonicalEvent.Id) return null;
+                if (Marked(eventRoom, "left")) return Map(run);
+                if (ev is FakeMerchant fake) return new Decision("shop",
+                    [.. fake.StartedFight ? [] : Relics(fake.Inventory), new Option("leave", e => e.Option("leave"), () => Leave(eventRoom)), .. Potions(false)]);
                 if (ev.IsFinished) return Map(run);
                 var choices = ev.CurrentOptions.Select((o, i) => (Option: o, Index: i))
                     .Where(x => !x.Option.IsLocked && !x.Option.IsProceed && !(DisableOnChosen(x.Option) && x.Option.WasChosen))
@@ -621,9 +625,15 @@ internal static class Game
         return new Decision("map", [.. options, .. Potions(false)]);
     }
 
-    private static Decision Rewards(RewardsSet frame)
+    private static Decision? Rewards(RewardsSet frame)
     {
         var synchronizer = Manager.RewardsSetSynchronizer;
+        foreach (var reward in frame.Rewards.OfType<CardReward>())
+            if (!reward.SuccessfullySelected && Mark(reward, "peeked"))
+            {
+                Track(Pick(reward, -1, null));
+                return null;
+            }
         var options = new List<Option>();
         foreach (var reward in frame.Rewards.Where(r => !r.SuccessfullySelected))
         {
@@ -641,6 +651,7 @@ internal static class Game
             }
             else if (reward is not PotionReward || Me.HasOpenPotionSlots)
                 options.Add(new Option("reward", e => e.Option("reward", key: "reward." + reward.GetType().Name,
+                    card: reward is SpecialCardReward special && SpecialCard(special) is { } card ? e.Card(card, "offer", e.NextOption) : -1,
                     relic: reward is RelicReward { Relic: { } relic } ? e.Relic(relic, "offer", e.NextOption) : -1,
                     potion: reward is PotionReward { Potion: { } potion } ? e.Potion(potion, "offer", -1, e.NextOption) : -1,
                     value: reward is GoldReward gold ? gold.Amount : 0), () => synchronizer.SelectLocalReward(reward)));
@@ -655,6 +666,8 @@ internal static class Game
             }));
         return new Decision("rewards", [.. options, .. Potions(false)]);
     }
+
+    private static readonly AccessTools.FieldRef<SpecialCardReward, CardModel?> SpecialCard = AccessTools.FieldRefAccess<SpecialCardReward, CardModel?>("_card");
 
     private static Task Pick(CardReward reward, int card, string? alternative)
     {
@@ -685,10 +698,7 @@ internal static class Game
             if (entry is { IsStocked: true, EnoughGold: true, CreationResult: { } result } && Hook.ShouldAddToDeck(run, result.Card, out _))
                 options.Add(new Option("buy_card", e => e.Option("buy_card", card: e.Card(result.Card, "offer", e.NextOption), value: entry.Cost),
                     () => entry.OnTryPurchaseWrapper(inventory)));
-        foreach (var entry in inventory.RelicEntries)
-            if (entry is { IsStocked: true, EnoughGold: true, Model: { } relic })
-                options.Add(new Option("buy_relic", e => e.Option("buy_relic", relic: e.Relic(relic, "offer", e.NextOption), value: entry.Cost),
-                    () => entry.OnTryPurchaseWrapper(inventory)));
+        options.AddRange(Relics(inventory));
         foreach (var entry in inventory.PotionEntries)
             if (entry is { IsStocked: true, EnoughGold: true, Model: { } potion } && player.HasOpenPotionSlots && Hook.ShouldProcurePotion(run, null, potion, player))
                 options.Add(new Option("buy_potion", e => e.Option("buy_potion", potion: e.Potion(potion, "offer", -1, e.NextOption), value: entry.Cost),
@@ -698,6 +708,11 @@ internal static class Game
         options.Add(new Option("leave", e => e.Option("leave"), () => Leave(shop)));
         return new Decision("shop", [.. options, .. Potions(false)]);
     }
+
+    private static IEnumerable<Option> Relics(MerchantInventory inventory) =>
+        inventory.RelicEntries.Where(entry => entry is { IsStocked: true, EnoughGold: true, Model: not null }).Select(entry =>
+            new Option("buy_relic", e => e.Option("buy_relic", relic: e.Relic(entry.Model!, "offer", e.NextOption), value: entry.Cost),
+                () => entry.OnTryPurchaseWrapper(inventory)));
 
     private static Decision Select(Selection selection)
     {
@@ -741,15 +756,11 @@ internal static class Game
         int width = sphere.cells.GetLength(0), height = sphere.cells.GetLength(1);
         for (int x = 0; x < width; x++)
             for (int y = 0; y < height; y++)
-            {
-                var cell = sphere.cells[x, y];
-                bool near = false;
-                for (int dx = -1; dx <= 1 && !near; dx++)
-                    for (int dy = -1; dy <= 1 && !near; dy++)
-                        near = x + dx >= 0 && x + dx < width && y + dy >= 0 && y + dy < height && sphere.cells[x + dx, y + dy].IsHidden;
-                if (cell.IsHidden) options.Add(SphereOption(sphere, CrystalSphereMinigame.CrystalSphereToolType.Small, cell, x, y));
-                if (near) options.Add(SphereOption(sphere, CrystalSphereMinigame.CrystalSphereToolType.Big, cell, x, y));
-            }
+                if (sphere.cells[x, y].IsHidden)
+                {
+                    options.Add(SphereOption(sphere, CrystalSphereMinigame.CrystalSphereToolType.Small, sphere.cells[x, y], x, y));
+                    options.Add(SphereOption(sphere, CrystalSphereMinigame.CrystalSphereToolType.Big, sphere.cells[x, y], x, y));
+                }
         return new Decision("sphere", options.ToArray(), Prelude: e =>
         {
             var revealed = sphere.cells.Cast<CrystalSphereCell>().Where(c => c.Item != null).GroupBy(c => c.Item).Where(g => g.All(c => !c.IsHidden))
@@ -758,7 +769,8 @@ internal static class Game
                 for (int y = 0; y < height; y++)
                 {
                     var cell = sphere.cells[x, y];
-                    e.Cell(x, y, cell.IsHidden, cell.Item != null && revealed.Contains(cell.Item) ? cell.Item.GetType().Name : null);
+                    var item = cell.IsHidden ? null : cell.Item;
+                    e.Cell(x, y, cell.IsHidden, item != null && revealed.Contains(item), item?.GetType().Name);
                 }
         });
     }

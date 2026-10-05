@@ -17,12 +17,14 @@ using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Models.Events;
 using MegaCrit.Sts2.Core.Models.Potions;
+using MegaCrit.Sts2.Core.Models.Powers;
 using MegaCrit.Sts2.Core.Nodes.Events.Custom.CrystalSphere;
 using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
 using MegaCrit.Sts2.Core.Saves;
 using MegaCrit.Sts2.Core.Saves.Managers;
 using MegaCrit.Sts2.Core.TestSupport;
+using MegaCrit.Sts2.Core.ValueProps;
 
 namespace ai4sts2;
 
@@ -44,7 +46,7 @@ internal static class Patches
         {
             typeof(SelectionContractPatch), typeof(BundleChoice), typeof(SphereScreen), typeof(MerchantRemoval), typeof(RealRules),
             typeof(Persistence), typeof(CancelWithoutFrame), typeof(NoRealDelay), typeof(TrialHeadless),
-            typeof(FoulPotionTarget), typeof(FoulPotionThrow), typeof(CosmeticOnly), typeof(MapSegments)
+            typeof(FoulPotionTarget), typeof(FoulPotionThrow), typeof(CosmeticOnly), typeof(MapSegments), typeof(BoulderHits)
         })
             harmony.CreateClassProcessor(type).Patch();
         if (Game.Audited) Game.Instrument(harmony);
@@ -194,7 +196,8 @@ internal static class Patches
         [
             AccessTools.Method(typeof(MegaCrit.Sts2.Core.Models.Relics.CallingBell), "GenerateRewards"),
             AccessTools.Method(typeof(MegaCrit.Sts2.Core.Models.Relics.Cauldron), "GenerateRewards"),
-            AccessTools.Method(typeof(MerchantPotionEntry), nameof(MerchantPotionEntry.CalcCost))
+            AccessTools.Method(typeof(MerchantPotionEntry), nameof(MerchantPotionEntry.CalcCost)),
+            AccessTools.Method(typeof(CardSelectCmd), nameof(CardSelectCmd.Reset))
         ];
 
         private static void Prefix(out bool __state)
@@ -204,6 +207,27 @@ internal static class Patches
         }
 
         private static void Finalizer(bool __state) => TestMode.IsOn = __state;
+    }
+
+    [HarmonyPatch(typeof(RollingBoulderPower), nameof(RollingBoulderPower.AfterPlayerTurnStart))]
+    private static class BoulderHits
+    {
+        private static readonly Action<PowerModel> Flash = AccessTools.MethodDelegate<Action<PowerModel>>(AccessTools.Method(typeof(PowerModel), "Flash"));
+
+        private static bool Prefix(RollingBoulderPower __instance, PlayerChoiceContext choiceContext, Player player, ref Task __result)
+        {
+            __result = Roll(__instance, choiceContext, player);
+            return false;
+        }
+
+        private static async Task Roll(RollingBoulderPower power, PlayerChoiceContext context, Player player)
+        {
+            if (player != power.Owner.Player) return;
+            Flash(power);
+            foreach (var creature in power.CombatState.HittableEnemies)
+                await CreatureCmd.Damage(context, [creature], power.Amount, ValueProp.Unpowered, power.Owner);
+            power.SetAmount(power.Amount + power.DynamicVars.Damage.IntValue);
+        }
     }
 
     [HarmonyPatch(typeof(MapPathPruning), nameof(MapPathPruning.FindMatchingSegments))]

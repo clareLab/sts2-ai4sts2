@@ -89,9 +89,8 @@ internal sealed class RewardPick(int card, string? alternative) : ICardSelector
     {
         if (_used) return default;
         _used = true;
-        return alternative == null
-            ? new CardRewardSelection { card = options[card].Card }
-            : new CardRewardSelection { alternative = alternatives.Single(a => a.OptionId == alternative) };
+        if (alternative != null) return new CardRewardSelection { alternative = alternatives.Single(a => a.OptionId == alternative) };
+        return card < 0 ? default : new CardRewardSelection { card = options[card].Card };
     }
 
     public Task<IEnumerable<CardModel>> GetSelectedCards(IEnumerable<CardModel> options, int minSelect, int maxSelect)

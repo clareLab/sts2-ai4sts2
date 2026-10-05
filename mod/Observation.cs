@@ -100,7 +100,7 @@ internal sealed class Encoder
         new("orb", "model", "passive", "evoke", "position"),
         new("node", "row", "column", "type", "visited", "current", "next"),
         new("edge", "parent", "child"),
-        new("cell", "x", "y", "hidden", "item"),
+        new("cell", "x", "y", "hidden", "revealed", "item"),
         new("option", "kind", "card", "creature", "relic", "potion", "node", "cell", "key", "value")
     ];
 
@@ -232,7 +232,7 @@ internal sealed class Encoder
             creature.IsAlive ? 1 : 0, creature.IsHittable ? 1 : 0, creature.IsPet ? 1 : 0, first, firstDamage, firstHits, second, secondDamage,
             secondHits, intents.Length);
         _rows[creature] = row;
-        foreach (var power in creature.Powers) T("power").Add(row, Vocab.Id(power.Id), power.Amount, Vocab.Id(power.Type));
+        foreach (var power in creature.Powers.Where(p => p.IsVisible)) T("power").Add(row, Vocab.Id(power.Id), power.Amount, Vocab.Id(power.Type));
         return row;
     }
 
@@ -243,7 +243,7 @@ internal sealed class Encoder
         return row;
     }
 
-    internal int Cell(int x, int y, bool hidden, string? item) => T("cell").Add(x, y, hidden ? 1 : 0, Vocab.Id(item));
+    internal int Cell(int x, int y, bool hidden, bool revealed, string? item) => T("cell").Add(x, y, hidden ? 1 : 0, revealed ? 1 : 0, Vocab.Id(item));
 
     internal int NextOption => T("option").Rows;
 
