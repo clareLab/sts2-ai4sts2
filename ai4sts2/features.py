@@ -227,7 +227,7 @@ class Batch:
                 names = stacked[:, [i for v in layout.variables for i in v[:2]]]
                 values = np.stack([stacked[:, [v[2], v[3]]] for v in layout.variables], axis=1)
                 item["variables"] = torch.from_numpy(
-                    names.astype(np.int64).reshape(len(stacked), -1, 2)
+                    names.astype(np.int64).reshape(len(stacked), len(layout.variables), 2)
                 )
                 item["variable_values"] = torch.from_numpy(symlog(values).astype(np.float32))
                 item["weights"] = torch.from_numpy(np.concatenate([e["weights"] for e in entries]))
