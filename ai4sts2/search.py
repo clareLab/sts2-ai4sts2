@@ -123,7 +123,8 @@ def search(evaluator, decision, simulations, width, rng, noise=True):
             visits[action] += 1
         evaluator.kernel.call("restore", id=root)
     finally:
-        evaluator.kernel.call("release", id=root)
+        if not evaluator.kernel.failed:
+            evaluator.kernel.call("release", id=root)
     score = gumbel + logits + sigma()
     most = visits.max()
     choice = max((a for a in top if visits[a] == most), key=lambda a: score[a])

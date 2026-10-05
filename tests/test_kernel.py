@@ -167,19 +167,19 @@ def test_snapshots_restore_in_place_and_match_replay(kernel):
         assert branch(kernel, replayed, seed) == trace
 
 
-def test_resampling_reaches_every_random_stream(kernel):
+def test_resampling_covers_every_stream_drawn_in_combat(monkeypatch):
+    monkeypatch.setenv("AI4STS2_AUDIT", "1")
     rng = random.Random(13)
-    audited = 0
-    for character in kernel.hello["characters"]:
-        decision = kernel.call(
-            "begin", character=character, seed=f"AUDIT-{character}", ascension=10
-        )
-        while decision["kind"] != "end" and audited < 3 * len(kernel.hello["characters"]):
-            if decision["kind"] == "combat" and rng.random() < 0.2:
-                result = kernel.call("audit", seed=rng.getrandbits(62))
-                assert result["total"] > 0 and not result["untouched"]
-                audited += 1
-                if audited % 3 == 0:
-                    break
-            decision = kernel.call("step", index=rng.randrange(len(decision["options"])))
-    assert audited > 0
+    audits = []
+    with Kernel(engine()) as instance:
+        for character in instance.hello["characters"]:
+            arguments = {"character": character, "seed": f"AUDIT-{character}", "ascension": 10}
+            decision = instance.call("begin", **arguments)
+            found = 0
+            while decision["kind"] != "end" and found < 3:
+                if decision["kind"] == "combat" and rng.random() < 0.3:
+                    audits.append(instance.call("audit", seed=rng.getrandbits(62)))
+                    found += 1
+                decision = instance.call("step", index=rng.randrange(len(decision["options"])))
+    assert audits and all(audit["drawn"] > 0 for audit in audits)
+    assert [audit["leaks"] for audit in audits if audit["leaks"]] == []

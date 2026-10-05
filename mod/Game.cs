@@ -255,12 +255,13 @@ internal static class Game
             if (timer.Elapsed.TotalSeconds > 30) throw new TimeoutException("The previous turn loop did not stop.");
             await Host.Frame();
         }
+        if (previous is { IsFaulted: true }) throw new InvalidOperationException("The previous turn loop failed.", previous.Exception);
         ((CancellationTokenSource)SourceField.GetValue(saved.Turn)!).Dispose();
         saved.Graph.Restore();
         Manager.WinTime = saved.WinTime;
         SourceField.SetValue(saved.Turn, new CancellationTokenSource());
         foreach (var signal in Signals) signal.SetValue(saved.Turn, Activator.CreateInstance(signal.PropertyType));
-        LoopField.SetValue(manager, Resume(saved.Turn));
+        LoopField.SetValue(manager, TaskHelper.RunSafely(Resume(saved.Turn)));
         Current = null;
         _fault = null;
         return await Settle();
@@ -294,19 +295,22 @@ internal static class Game
     }
 
     private static readonly AccessTools.FieldRef<RunRngSet, ulong> RunSeed = AccessTools.FieldRefAccess<RunRngSet, ulong>("<Seed>k__BackingField");
-    private static (object? Combat, Rng[] Streams) _streams;
+    private static (object? Combat, uint Newest, Rng[] Streams) _streams;
+    private static readonly AccessTools.FieldRef<PlayerRngSet, ulong> PlayerSeed = AccessTools.FieldRefAccess<PlayerRngSet, ulong>("<Seed>k__BackingField");
 
     internal static Decision Determinize(ulong seed)
     {
         var decision = Current ?? throw new InvalidOperationException("No decision is pending.");
         var run = Run!;
         var source = new Rng(seed);
-        if (!ReferenceEquals(_streams.Combat, Book.Combat) || _streams.Streams == null)
-            _streams = (Book.Combat, Snapshot.Reachable(typeof(Rng), run, CombatManager.Instance, Manager).Select(r => (Rng)r.Value).ToArray());
+        uint newest = Book.Combat?.Creatures.Max(c => c.CombatId ?? 0) ?? 0;
+        if (!ReferenceEquals(_streams.Combat, Book.Combat) || _streams.Newest != newest || _streams.Streams == null)
+            _streams = (Book.Combat, newest, Snapshot.Reachable(typeof(Rng), run, CombatManager.Instance, Manager).Select(r => (Rng)r.Value).ToArray());
         foreach (var rng in _streams.Streams) Reseed(rng, source);
         RunSeed(run.Rng) = source.NextUnsignedLong();
         foreach (var player in run.Players)
         {
+            PlayerSeed(player.PlayerRng) = source.NextUnsignedLong();
             if (player.PlayerCombatState?.DrawPile is not { } pile) continue;
             var cards = PileCards(pile);
             for (int i = cards.Count - 1; i > 0; i--)
@@ -318,18 +322,64 @@ internal static class Game
         return decision;
     }
 
-    internal static object Audit(ulong seed)
+    internal static readonly bool Audited = System.Environment.GetEnvironmentVariable("AI4STS2_AUDIT") == "1";
+    private static bool _auditing;
+    private static readonly HashSet<Rng> Drawn = new(ReferenceEqualityComparer.Instance);
+    private static readonly HashSet<Rng> Created = new(ReferenceEqualityComparer.Instance);
+    private static readonly Dictionary<Rng, string> Traces = new(ReferenceEqualityComparer.Instance);
+
+    internal static void Instrument(Harmony harmony)
     {
-        var rngs = Snapshot.Reachable(typeof(Rng), Run!, CombatManager.Instance, Manager);
-        var fields = new System.Text.Json.JsonSerializerOptions { IncludeFields = true };
-        var before = rngs.Select(r => System.Text.Json.JsonSerializer.Serialize(((Rng)r.Value).ToSerializable(), fields)).ToArray();
-        var graph = new Snapshot(Run!, CombatManager.Instance, Book, Manager, Manager.ActionQueueSet, Manager.ActionQueueSynchronizer,
-            Manager.PlayerChoiceSynchronizer, Manager.ActionExecutor, NetCombatCardDb.Instance, SaveManager.Instance.Progress);
-        Determinize(seed);
-        var untouched = rngs.Where((r, i) => System.Text.Json.JsonSerializer.Serialize(((Rng)r.Value).ToSerializable(), fields) == before[i])
-            .Select(r => r.Path).ToArray();
-        graph.Restore();
-        return new { total = rngs.Count, sample = before[0], untouched };
+        var draw = new HarmonyMethod(typeof(Game), nameof(OnDraw));
+        foreach (var method in typeof(Rng).GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.DeclaredOnly))
+            if (method.Name.StartsWith("Next") && !method.IsGenericMethodDefinition) harmony.Patch(method, prefix: draw);
+        var made = new HarmonyMethod(typeof(Game), nameof(OnCreate));
+        foreach (var constructor in typeof(Rng).GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+            harmony.Patch(constructor, postfix: made);
+    }
+
+    private static void OnDraw(Rng __instance)
+    {
+        if (_auditing && Drawn.Add(__instance)) Traces[__instance] = System.Environment.StackTrace;
+    }
+
+    private static void OnCreate(Rng __instance)
+    {
+        if (_auditing) Created.Add(__instance);
+    }
+
+    internal static async Task<object> Audit(ulong seed)
+    {
+        if (!Audited) throw new InvalidOperationException("Start the kernel with AI4STS2_AUDIT=1.");
+        int root = Save();
+        var random = new System.Random((int)seed);
+        Drawn.Clear();
+        Created.Clear();
+        Traces.Clear();
+        _auditing = true;
+        int steps = 0;
+        try
+        {
+            Determinize(seed);
+            var reseeded = new HashSet<Rng>(_streams.Streams, ReferenceEqualityComparer.Instance);
+            Created.Clear();
+            Drawn.Clear();
+            Traces.Clear();
+            var decision = Current!;
+            while (decision.Kind != "end" && CombatManager.Instance.IsInProgress && steps++ < 300)
+                decision = await Step(random.Next(decision.Options.Length));
+            _auditing = false;
+            var leaks = Drawn.Where(r => !reseeded.Contains(r) && !Created.Contains(r) && !ReferenceEquals(r, Rng.Chaotic))
+                .Select(r => string.Join(" < ", Traces[r].Split('\n').Select(l => l.Trim()).Where(l => l.StartsWith("at MegaCrit") && !l.StartsWith("at MegaCrit.Sts2.Core.Random"))
+                    .Take(5))).ToArray();
+            return new { reseeded = reseeded.Count, drawn = Drawn.Count, created = Created.Count, steps, chaotic = Drawn.Contains(Rng.Chaotic), leaks };
+        }
+        finally
+        {
+            _auditing = false;
+            await Load(root);
+            Drop(root);
+        }
     }
 
     private static void Reseed(Rng rng, Rng source) => rng.LoadFromSerializable(new Rng(source.NextUnsignedLong()).ToSerializable());

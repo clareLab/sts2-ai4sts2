@@ -47,6 +47,7 @@ internal static class Patches
             typeof(FoulPotionTarget), typeof(FoulPotionThrow), typeof(CosmeticOnly), typeof(MapSegments)
         })
             harmony.CreateClassProcessor(type).Patch();
+        if (Game.Audited) Game.Instrument(harmony);
     }
 
     private static bool NotMe(Player? player) => false;
