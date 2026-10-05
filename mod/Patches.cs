@@ -41,7 +41,7 @@ internal static class Patches
         {
             typeof(SelectionContractPatch), typeof(BundleChoice), typeof(SphereScreen), typeof(MerchantRemoval), typeof(RealRules),
             typeof(Persistence), typeof(CancelWithoutFrame), typeof(NoRealDelay), typeof(TrialHeadless),
-            typeof(FoulPotionTarget), typeof(FoulPotionThrow)
+            typeof(FoulPotionTarget), typeof(FoulPotionThrow), typeof(CosmeticOnly)
         })
             harmony.CreateClassProcessor(type).Patch();
     }
@@ -115,6 +115,12 @@ internal static class Patches
 
         private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions) =>
             Replace(instructions, AccessTools.Method(typeof(LocalContext), nameof(LocalContext.IsMe), [typeof(Player)]), AccessTools.Method(typeof(Patches), nameof(NotMe)));
+    }
+
+    [HarmonyPatch(typeof(MegaCrit.Sts2.Core.Models.Monsters.SoulNexus), "AfterDeath")]
+    private static class CosmeticOnly
+    {
+        private static Exception? Finalizer(Exception? __exception) => __exception is NullReferenceException ? null : __exception;
     }
 
     private static bool AtMerchant(AbstractRoom? room) => room is MerchantRoom || room is EventRoom { CanonicalEvent: FakeMerchant };
