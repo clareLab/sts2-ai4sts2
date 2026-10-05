@@ -436,9 +436,10 @@ class Learner:
 
     def run(self):
         deadline = time.monotonic() + self.args.minutes * 60
-        saved = cycle = snapshot = time.monotonic()
+        saved = cycle = time.monotonic()
+        snapshot = self.samples // self.args.snapshot_samples * self.args.snapshot_samples
         try:
-            while time.monotonic() < deadline:
+            while time.monotonic() < deadline and self.samples < self.args.samples:
                 started = time.monotonic()
                 while self.size < self.args.rollout and time.monotonic() < deadline:
                     self.receive(block=True)
@@ -473,9 +474,10 @@ class Learner:
                 if time.monotonic() - saved > self.args.save_minutes * 60:
                     self.save()
                     saved = time.monotonic()
-                if time.monotonic() - snapshot > self.args.snapshot_minutes * 60:
-                    self.save(self.directory / "snapshots" / f"{self.samples}.pt")
-                    snapshot = time.monotonic()
+                every = self.args.snapshot_samples
+                if self.samples >= snapshot + every:
+                    snapshot = self.samples // every * every
+                    self.save(self.directory / "snapshots" / f"{snapshot}.pt")
         finally:
             self.save()
             for process in self.actors:
@@ -646,7 +648,8 @@ def main():
     parser.add_argument("--restarts", type=float, default=0.0)
     parser.add_argument("--archive", type=int, default=256)
     parser.add_argument("--save-minutes", type=float, default=10)
-    parser.add_argument("--snapshot-minutes", type=float, default=60)
+    parser.add_argument("--samples", type=int, default=10**12)
+    parser.add_argument("--snapshot-samples", type=int, default=10**6)
     args = parser.parse_args()
     torch.set_num_threads(2)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
