@@ -436,7 +436,7 @@ class Learner:
 
     def run(self):
         deadline = time.monotonic() + self.args.minutes * 60
-        saved = cycle = time.monotonic()
+        saved = cycle = snapshot = time.monotonic()
         try:
             while time.monotonic() < deadline:
                 started = time.monotonic()
@@ -473,6 +473,9 @@ class Learner:
                 if time.monotonic() - saved > self.args.save_minutes * 60:
                     self.save()
                     saved = time.monotonic()
+                if time.monotonic() - snapshot > self.args.snapshot_minutes * 60:
+                    self.save(self.directory / "snapshots" / f"{self.samples}.pt")
+                    snapshot = time.monotonic()
         finally:
             self.save()
             for process in self.actors:
@@ -600,7 +603,7 @@ class Learner:
                     result[character] |= {"won": round(float(won.mean()), 2)}
         return result
 
-    def save(self):
+    def save(self, path=None):
         state = {
             "net": self.net.state_dict(),
             "optimizer": self.optimizer.state_dict(),
@@ -613,9 +616,11 @@ class Learner:
             "commit": self.commit,
             "args": vars(self.args),
         }
-        temporary = self.directory / "model.pt.tmp"
+        path = path or self.directory / "model.pt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
         torch.save(state, temporary)
-        temporary.replace(self.directory / "model.pt")
+        temporary.replace(path)
 
 
 def main():
@@ -624,7 +629,7 @@ def main():
     parser.add_argument("--outcome", choices=("wkch", "wfh", "floor"), default="wkch")
     parser.add_argument("--frontier", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--actors", type=int, default=4)
-    parser.add_argument("--kernels", type=int, default=3)
+    parser.add_argument("--kernels", type=int, default=4)
     parser.add_argument("--minutes", type=float, default=60)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--width", type=int, default=128)
@@ -641,6 +646,7 @@ def main():
     parser.add_argument("--restarts", type=float, default=0.0)
     parser.add_argument("--archive", type=int, default=256)
     parser.add_argument("--save-minutes", type=float, default=10)
+    parser.add_argument("--snapshot-minutes", type=float, default=60)
     args = parser.parse_args()
     torch.set_num_threads(2)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
