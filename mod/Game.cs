@@ -11,6 +11,7 @@ using MegaCrit.Sts2.Core.Entities.Merchant;
 using MegaCrit.Sts2.Core.Entities.Multiplayer;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Entities.Potions;
+using MegaCrit.Sts2.Core.Entities.Rngs;
 using MegaCrit.Sts2.Core.Entities.TreasureRelicPicking;
 using MegaCrit.Sts2.Core.Events;
 using MegaCrit.Sts2.Core.Events.Custom.CrystalSphereEvent;
@@ -207,6 +208,38 @@ internal static class Game
         Track(decision.Options[index].Execute());
         return await Settle();
     }
+
+    internal static async Task<Decision> Replay(IEnumerable<int> actions)
+    {
+        var decision = Current ?? throw new InvalidOperationException("No decision is pending.");
+        foreach (int index in actions) decision = await Step(index);
+        return decision;
+    }
+
+    internal static Decision Determinize(ulong seed)
+    {
+        var decision = Current ?? throw new InvalidOperationException("No decision is pending.");
+        var run = Run!;
+        var source = new Rng(seed);
+        foreach (var type in Enum.GetValues<RunRngType>()) Reseed(run.Rng.GetRng(type), source);
+        foreach (var player in run.Players)
+        {
+            foreach (var type in Enum.GetValues<PlayerRngType>()) Reseed(player.PlayerRng.GetRng(type), source);
+            if (player.PlayerCombatState?.DrawPile is not { } pile) continue;
+            var cards = PileCards(pile);
+            for (int i = cards.Count - 1; i > 0; i--)
+            {
+                int j = source.NextInt(i + 1);
+                (cards[i], cards[j]) = (cards[j], cards[i]);
+            }
+        }
+        return decision;
+    }
+
+    private static void Reseed(Rng rng, Rng source) => rng.LoadFromSerializable(new Rng(source.NextUnsignedLong()).ToSerializable());
+
+    [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_cards")]
+    private static extern ref List<CardModel> PileCards(CardPile pile);
 
     private static async Task<Decision> Settle()
     {

@@ -108,3 +108,26 @@ def test_processes_agree():
                     break
                 index = rng.randrange(len(a["options"]))
                 a, b = first.call("step", index=index), second.call("step", index=index)
+
+
+def test_determinize_keeps_the_observation_and_resamples_the_future(kernel):
+    arguments = {"character": kernel.hello["characters"][0], "seed": "RESAMPLE", "ascension": 10}
+    rng = random.Random(5)
+    prefix = []
+    decision = kernel.call("begin", **arguments)
+    while decision["kind"] != "combat" or "end_turn" not in decision["options"]:
+        prefix.append(rng.randrange(len(decision["options"])))
+        decision = kernel.call("step", index=prefix[-1])
+    kernel.call("begin", **arguments)
+    replayed = kernel.call("replay", actions=prefix)
+    assert fingerprint(kernel, replayed) == fingerprint(kernel, decision)
+    futures = []
+    for seed in (1, 2, 3, 4, 1):
+        kernel.call("begin", **arguments)
+        kernel.call("replay", actions=prefix)
+        resampled = kernel.call("determinize", seed=seed)
+        assert fingerprint(kernel, resampled) == fingerprint(kernel, decision)
+        after = kernel.call("step", index=resampled["options"].index("end_turn"))
+        futures.append(fingerprint(kernel, after))
+    assert futures[0] == futures[-1]
+    assert len(set(futures)) > 1
