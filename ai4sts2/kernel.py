@@ -253,7 +253,8 @@ class Kernel:
         if not self.failed:
             shutil.rmtree(self.directory, ignore_errors=True)
         elif self.directory.name.startswith("kernel-"):
-            failed = self.directory.with_name("failed-" + self.directory.name.removeprefix("kernel-"))
+            name = self.directory.name.removeprefix("kernel-")
+            failed = self.directory.with_name(f"failed-{name}")
             self.directory.rename(failed)
             self.directory = failed
 
