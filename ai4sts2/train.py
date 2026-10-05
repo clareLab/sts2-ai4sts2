@@ -80,13 +80,14 @@ class Statistics:
         ]
 
 
-def wilson_lower(successes, trials, z=1.959964):
+def wilson(successes, trials, z=1.959964):
     if trials == 0:
-        return 0.0
+        return 0.0, 1.0
     p = successes / trials
     centre = p + z * z / (2 * trials)
     margin = z * math.sqrt(p * (1 - p) / trials + z * z / (4 * trials * trials))
-    return (centre - margin) / (1 + z * z / trials)
+    scale = 1 + z * z / trials
+    return (centre - margin) / scale, (centre + margin) / scale
 
 
 def make_net(layout, outcome, args):
@@ -271,7 +272,7 @@ class Learner:
             losses.append(1 - wins / trials if trials else 1.0)
             while self.frontier[c] < TARGET:
                 wins, trials = self.statistics.wins((character, self.frontier[c]))
-                if trials < self.args.reference or wilson_lower(wins, trials) < 0.5:
+                if trials < self.args.reference or wilson(wins, trials)[0] < 0.5:
                     break
                 self.frontier[c] += 1
         total = sum(losses)

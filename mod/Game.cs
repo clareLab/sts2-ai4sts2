@@ -591,7 +591,7 @@ internal static class Game
         {
             act = run.CurrentActIndex,
             floor = run.TotalFloor,
-            room = run.CurrentRoom?.GetType().Name,
+            room = run.CurrentRoom?.RoomType.ToString(),
             hp = player.Creature.CurrentHp,
             max_hp = player.Creature.MaxHp,
             gold = player.Gold,
