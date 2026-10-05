@@ -209,7 +209,7 @@ class Trainer:
         advantages = np.array([s["advantage"] for s in samples], dtype=np.float32)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         targets = (returns - self.returns.mean) / self.returns.std
-        lengths = np.array([length(s["observation"], self.schema) for s in samples])
+        lengths = np.array([length(s["observation"]) for s in samples])
         stats = collections.defaultdict(list)
         for _ in range(self.args.epochs):
             order = np.random.permutation(len(samples))

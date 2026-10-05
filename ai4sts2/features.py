@@ -148,31 +148,24 @@ POOLED = ("deck", "draw", "discard", "exhaust")
 TOKENS = ORDER[:2] + ("pile",) + ORDER[2:]
 
 
-def length(observation, schema):
-    in_combat = observation["global"][0, schema["global"].index("in_combat")] > 0
-    return sum(
-        len(v) for k, v in observation.items() if k != "edge" and not (in_combat and k == "node")
-    )
+def length(observation):
+    return sum(len(v) for k, v in observation.items() if k != "edge")
 
 
 class Batch:
-    def __init__(self, observations, layout, schema, vocabulary, combat_map=False):
+    def __init__(self, observations, layout, schema, vocabulary):
         self.size = len(observations)
         card_columns = schema["card"]
         zone_column = card_columns.index("zone")
         offer_column = card_columns.index("offer")
         option_card = schema["option"].index("card")
         pooled_ids = np.array([vocabulary.id(f"zone.{zone}") for zone in POOLED])
-        in_combat = schema["global"].index("in_combat")
         entries = []
         counts = np.zeros((self.size, len(TOKENS)), dtype=np.int64)
         for b, observation in enumerate(observations):
             entry = {}
             for table in ORDER:
-                values = observation[table]
-                if table == "node" and observation["global"][0, in_combat] > 0 and not combat_map:
-                    values = values[:0]
-                entry[table] = values
+                entry[table] = observation[table]
             cards = entry["card"]
             zones = cards[:, zone_column].astype(np.int64)
             keep = ~np.isin(zones, pooled_ids) | (cards[:, offer_column] >= 0)

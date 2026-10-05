@@ -14,6 +14,9 @@ namespace ai4sts2;
 internal static class Vocab
 {
     private static readonly Dictionary<string, int> Ids = new(StringComparer.Ordinal);
+    private static readonly Dictionary<ModelId, int> Models = [];
+    private static readonly Dictionary<Enum, int> Enums = [];
+    private static readonly Dictionary<(string, string), int> Prefixed = [];
     private static readonly List<string> Fresh = [];
 
     internal static int Id(string? value)
@@ -28,9 +31,24 @@ internal static class Vocab
         return id;
     }
 
-    internal static int Id(ModelId? id) => id == null ? 0 : Id(id.ToString());
+    internal static int Id(ModelId? id)
+    {
+        if (id == null) return 0;
+        if (!Models.TryGetValue(id, out int value)) Models[id] = value = Id(id.ToString());
+        return value;
+    }
 
-    internal static int Id(Enum value) => Id(value.GetType().Name + "." + value);
+    internal static int Id(Enum value)
+    {
+        if (!Enums.TryGetValue(value, out int id)) Enums[value] = id = Id(value.GetType().Name + "." + value);
+        return id;
+    }
+
+    internal static int Id(string prefix, string value)
+    {
+        if (!Prefixed.TryGetValue((prefix, value), out int id)) Prefixed[(prefix, value)] = id = Id(prefix + value);
+        return id;
+    }
 
     internal static string[] Drain()
     {
@@ -105,7 +123,7 @@ internal sealed class Encoder
         T("global").Add(Vocab.Id(player.Character.Id), run.AscensionLevel, run.CurrentActIndex, run.ActFloor, run.TotalFloor, player.Gold,
             player.Creature.CurrentHp, player.Creature.MaxHp, player.Creature.Block, combat?.Energy ?? 0, combat?.MaxEnergy ?? player.MaxEnergy,
             combat?.Stars ?? 0, combat?.TurnNumber ?? 0, player.PotionSlots.Count, combat?.OrbQueue.Capacity ?? 0,
-            Vocab.Id(run.CurrentRoom?.RoomType.ToString()), Vocab.Id("decision." + decision), inCombat ? 1 : 0,
+            Vocab.Id(run.CurrentRoom?.RoomType.ToString()), Vocab.Id("decision.", decision), inCombat ? 1 : 0,
             inCombat ? combat!.DrawPile.Cards.Count : 0, inCombat ? combat!.DiscardPile.Cards.Count : 0, inCombat ? combat!.ExhaustPile.Cards.Count : 0,
             player.Deck.Cards.Count, Vocab.Id(run.Act.BossEncounter?.Id), Vocab.Id(run.Act.SecondBossEncounter?.Id), Vocab.Id(run.Act.Id),
             Vocab.Id(eventModel?.Id), selection?.Minimum ?? 0, selection?.Maximum ?? 0, selection?.Chosen.Count ?? 0);
@@ -128,6 +146,7 @@ internal sealed class Encoder
         foreach (var relic in player.Relics) Relic(relic, "owned");
         for (int slot = 0; slot < player.PotionSlots.Count; slot++)
             if (player.PotionSlots[slot] is { } potion) Potion(potion, "owned", slot);
+        if (inCombat) return;
         var visited = run.VisitedMapCoords.ToHashSet();
         var points = map.GetAllMapPoints().Append(map.StartingMapPoint).Append(map.BossMapPoint);
         if (map.SecondBossMapPoint != null) points = points.Append(map.SecondBossMapPoint);
@@ -140,8 +159,7 @@ internal sealed class Encoder
     }
 
     private static IEnumerable<CardModel> Canonical(IEnumerable<CardModel> cards) =>
-        cards.OrderBy(c => c.Id.ToString(), StringComparer.Ordinal).ThenBy(c => c.CurrentUpgradeLevel).ThenBy(c => c.Enchantment?.Id.ToString())
-            .ThenBy(c => c.Affliction?.Id.ToString());
+        cards.OrderBy(c => c.Id).ThenBy(c => c.CurrentUpgradeLevel).ThenBy(c => c.Enchantment?.Id).ThenBy(c => c.Affliction?.Id);
 
     internal int Card(CardModel card, string zone, int offer = -1)
     {
@@ -155,20 +173,24 @@ internal sealed class Encoder
         foreach (var keyword in card.Keywords) keywords |= 1 << (int)keyword;
         var values = new float[]
         {
-            Vocab.Id("zone." + zone), Vocab.Id(card.Id), card.CurrentUpgradeLevel, card.EnergyCost.GetWithModifiers(CostModifiers.All),
+            Vocab.Id("zone.", zone), Vocab.Id(card.Id), card.CurrentUpgradeLevel, card.EnergyCost.GetWithModifiers(CostModifiers.All),
             card.EnergyCost.GetWithModifiers(CostModifiers.None), card.EnergyCost.CostsX ? 1 : 0, card.GetStarCostWithModifiers(),
             Vocab.Id(card.Type), Vocab.Id(card.Rarity), Vocab.Id(card.TargetType), keywords, Vocab.Id(card.Enchantment?.Id),
             card.Enchantment?.Amount ?? 0, Vocab.Id(card.Affliction?.Id), card.Affliction?.Amount ?? 0,
-            card.Pile?.Type == PileType.Hand && card.CanPlay() ? 1 : 0, _selected.Contains(card) ? 1 : 0, offer
+            0, _selected.Contains(card) ? 1 : 0, offer
         };
         values.CopyTo(row, 0);
-        var variables = card.DynamicVars.Clone(card);
-        if (card.Pile?.Type is PileType.Hand or PileType.Play) card.UpdateDynamicVarPreview(CardPreviewMode.Normal, null, variables);
+        var variables = card.DynamicVars;
+        if (card.Pile?.Type is PileType.Hand or PileType.Play)
+        {
+            variables = variables.Clone(card);
+            card.UpdateDynamicVarPreview(CardPreviewMode.Normal, null, variables);
+        }
         int slot = 0;
         foreach (var variable in variables.Values.OrderBy(v => v.Name, StringComparer.Ordinal))
         {
             if (slot == VarSlots) break;
-            row[values.Length + slot * 3] = Vocab.Id("var." + variable.Name);
+            row[values.Length + slot * 3] = Vocab.Id("var.", variable.Name);
             row[values.Length + slot * 3 + 1] = (float)variable.BaseValue;
             row[values.Length + slot * 3 + 2] = (float)variable.PreviewValue;
             slot++;
@@ -179,14 +201,14 @@ internal sealed class Encoder
     internal int Relic(RelicModel relic, string zone, int offer = -1)
     {
         if (_rows.TryGetValue(relic, out int existing)) return existing;
-        return _rows[relic] = T("relic").Add(Vocab.Id("zone." + zone), Vocab.Id(relic.Id), relic.ShowCounter ? relic.DisplayAmount : 0,
+        return _rows[relic] = T("relic").Add(Vocab.Id("zone.", zone), Vocab.Id(relic.Id), relic.ShowCounter ? relic.DisplayAmount : 0,
             Vocab.Id(relic.Status), relic.IsUsedUp ? 1 : 0, offer);
     }
 
     internal int Potion(PotionModel potion, string zone, int slot = -1, int offer = -1)
     {
         if (_rows.TryGetValue(potion, out int existing)) return existing;
-        return _rows[potion] = T("potion").Add(Vocab.Id("zone." + zone), Vocab.Id(potion.Id), slot, Vocab.Id(potion.Usage), offer);
+        return _rows[potion] = T("potion").Add(Vocab.Id("zone.", zone), Vocab.Id(potion.Id), slot, Vocab.Id(potion.Usage), offer);
     }
 
     internal int Creature(Creature creature)
@@ -224,7 +246,11 @@ internal sealed class Encoder
     internal int NextOption => T("option").Rows;
 
     internal int Option(string kind, int card = -1, int creature = -1, int relic = -1, int potion = -1, int node = -1, int cell = -1, string? key = null,
-        double value = 0) => T("option").Add(Vocab.Id("option." + kind), card, creature, relic, potion, node, cell, Vocab.Id(key), (float)value);
+        double value = 0)
+    {
+        if (kind == "play") T("card").Set(card, "playable", 1);
+        return T("option").Add(Vocab.Id("option.", kind), card, creature, relic, potion, node, cell, Vocab.Id(key), (float)value);
+    }
 
     internal object Layout() => _tables.Values.ToDictionary(t => t.Name, t => t.Rows);
 
