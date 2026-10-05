@@ -51,7 +51,7 @@ class Outcome:
             cells = np.arange(self.cells, dtype=np.float32)
             return np.append(np.stack([cells, cells + 1], 1).reshape(-1), self.cells)
         if mass is None:
-            return np.full(self.bins, 0.5, np.float32)
+            return np.zeros(self.bins, np.float32)
         cells = mass[:-1:2] + mass[1:-1:2]
         below = np.cumsum(cells) - cells
         utility = np.stack([below, below + cells], 1).reshape(-1)
@@ -208,20 +208,19 @@ class Learner:
         self.frontier = self.context.Array(
             "i", [0 if args.frontier else TARGET] * len(self.characters), lock=False
         )
-        self.net = make_net(self.layout, self.outcome, args)
+        self.net = make_net(self.layout, self.outcome, args).to(self.device)
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=args.lr)
         self.updates = self.samples = self.episodes = self.failures = 0
         statistics = ()
         path = self.directory / "model.pt"
         if path.exists():
-            state = torch.load(path, weights_only=True)
+            state = torch.load(path, map_location="cpu", weights_only=True)
             self.net.load_state_dict(state["net"])
             self.optimizer.load_state_dict(state["optimizer"])
             self.updates, self.samples = state["updates"], state["samples"]
             self.episodes, statistics = state["episodes"], state["statistics"]
             self.frontier[:] = state["frontier"]
         self.statistics = Statistics(args.reference, statistics)
-        self.net.to(self.device)
         self.published = make_net(self.layout, self.outcome, args).share_memory()
         self.publish()
         self.commit = subprocess.run(
@@ -376,7 +375,8 @@ class Learner:
                 self.args.lam,
                 utilities[segment["group"]],
             )
-        advantages[:count] /= np.sqrt(np.mean(advantages[:count] ** 2)) + 1e-8
+        scale = np.sqrt(np.mean(advantages[:count] ** 2))
+        advantages[:count] = advantages[:count] / scale if scale > 1e-6 else 0
         clock.append(time.perf_counter())
         stats = collections.defaultdict(list)
         passes = 0

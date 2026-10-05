@@ -55,7 +55,7 @@ def test_utility_is_monotone_in_outcome_order(name):
     utility = outcome.utility(mass / mass.sum())
     assert (np.diff(utility[:-1]) >= -1e-9).all()
     assert utility[-1] >= utility[:-1].max() - 1e-9
-    assert np.allclose(outcome.utility(None), 0.5)
+    assert not outcome.utility(None).any()
 
 
 def test_outcome_targets_split_within_a_cell():
