@@ -1,3 +1,4 @@
+import ctypes
 import json
 import os
 import shutil
@@ -13,6 +14,24 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 HEADER = struct.Struct("<ii")
+LIBC = ctypes.CDLL(None, use_errno=True)
+
+
+def die_with_parent():
+    LIBC.prctl(1, signal.SIGKILL)
+
+
+def sweep(parent):
+    for directory in parent.glob("kernel-*"):
+        pid = directory / "pid"
+        try:
+            alive = pid.exists() and Path(f"/proc/{int(pid.read_text())}").exists()
+        except ValueError:
+            alive = False
+        if not alive and (pid.exists() or time.time() - directory.stat().st_mtime > 3600):
+            shutil.rmtree(directory, ignore_errors=True)
+
+
 REQUEST = struct.Struct("<i")
 
 
@@ -56,6 +75,7 @@ class Kernel:
     def __init__(self, executable, boot_timeout=120, connect=True):
         parent = ROOT / "artifacts/kernels"
         parent.mkdir(parents=True, exist_ok=True)
+        sweep(parent)
         self.directory = Path(tempfile.mkdtemp(prefix="kernel-", dir=parent))
         self.socket = None
         self.process = None
@@ -116,7 +136,9 @@ class Kernel:
             stdout=self.log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            preexec_fn=die_with_parent,
         )
+        (self.directory / "pid").write_text(str(self.process.pid))
         self.started = time.monotonic()
 
     def connect(self):
@@ -230,6 +252,10 @@ class Kernel:
             self.log = None
         if not self.failed:
             shutil.rmtree(self.directory, ignore_errors=True)
+        elif self.directory.name.startswith("kernel-"):
+            failed = self.directory.with_name("failed-" + self.directory.name.removeprefix("kernel-"))
+            self.directory.rename(failed)
+            self.directory = failed
 
     def __enter__(self):
         return self

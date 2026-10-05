@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from ai4sts2.features import ORDER
+from ai4sts2.features import TOKENS
 
 
 class Net(nn.Module):
@@ -9,9 +9,10 @@ class Net(nn.Module):
         super().__init__()
         self.width = width
         self.embed = nn.Embedding(capacity, width, padding_idx=0)
-        self.kind = nn.Embedding(len(ORDER), width)
+        self.kind = nn.Embedding(len(TOKENS), width)
+        widths = {table: layout.width(table) for table in TOKENS if table != "pile"} | {"pile": 1}
         self.numeric = nn.ModuleDict(
-            {table: nn.Linear(layout.width(table), width) for table in ORDER if layout.width(table)}
+            {table: nn.Linear(size, width) for table, size in widths.items() if size}
         )
         self.variable = nn.Linear(2, width)
         layer = nn.TransformerEncoderLayer(
@@ -24,7 +25,7 @@ class Net(nn.Module):
 
     def forward(self, batch):
         flat = torch.zeros(batch.size * batch.width, self.width)
-        for index, table in enumerate(ORDER):
+        for index, table in enumerate(TOKENS):
             item = batch.tables[table]
             count = len(item["position"])
             if not count:
@@ -37,9 +38,10 @@ class Net(nn.Module):
             if table == "card":
                 gates = torch.tanh(self.variable(item["variable_values"]))
                 tokens = tokens + (self.embed(item["variables"]) * gates).sum(1)
-            flat = flat.index_copy(0, item["position"], tokens)
+                tokens = tokens * item["weights"].unsqueeze(-1)
+            flat = flat.index_add(0, item["position"], tokens)
         related = torch.zeros_like(flat)
-        for table in ORDER:
+        for table in TOKENS:
             item = batch.tables[table]
             for references, _target in item.get("references", []):
                 valid = references >= 0

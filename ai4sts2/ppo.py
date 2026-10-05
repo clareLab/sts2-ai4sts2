@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ai4sts2.features import Batch, Layout, Translator, Vocabulary
+from ai4sts2.features import Batch, Layout, Translator, Vocabulary, length
 from ai4sts2.kernel import ROOT, KernelError
 from ai4sts2.model import Net
 from ai4sts2.pool import Pool
@@ -116,6 +116,7 @@ class Trainer:
             [self.translators[w] for w in workers],
             self.layout,
             self.schema,
+            self.vocabulary,
         )
         with torch.no_grad():
             logits, values = self.net(batch)
@@ -169,6 +170,7 @@ class Trainer:
                 [self.translators[w] for w in waiting],
                 self.layout,
                 self.schema,
+                self.vocabulary,
             )
             with torch.no_grad():
                 _, values = self.net(batch)
@@ -207,17 +209,27 @@ class Trainer:
         advantages = np.array([s["advantage"] for s in samples], dtype=np.float32)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         targets = (returns - self.returns.mean) / self.returns.std
-        order = np.arange(len(samples))
+        lengths = np.array([length(s["observation"], self.schema) for s in samples])
         stats = collections.defaultdict(list)
         for _ in range(self.args.epochs):
-            np.random.shuffle(order)
-            for start in range(0, len(order), self.args.minibatch):
-                chunk = order[start : start + self.args.minibatch]
+            order = np.random.permutation(len(samples))
+            group = self.args.minibatch * 8
+            chunks = []
+            for begin in range(0, len(order), group):
+                block = order[begin : begin + group]
+                block = block[np.argsort(lengths[block], kind="stable")]
+                chunks += [
+                    block[i : i + self.args.minibatch]
+                    for i in range(0, len(block), self.args.minibatch)
+                ]
+            np.random.shuffle(chunks)
+            for chunk in chunks:
                 batch = Batch(
                     [samples[i]["observation"] for i in chunk],
                     [samples[i]["translator"] for i in chunk],
                     self.layout,
                     self.schema,
+                    self.vocabulary,
                 )
                 logits, values = self.net(batch)
                 distribution = torch.distributions.Categorical(logits=logits)
