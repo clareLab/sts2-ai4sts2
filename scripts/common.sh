@@ -13,3 +13,9 @@ ai4sts2_game_paths() {
   data_dir="${STS2_DATA_DIR:-$game_dir/data_sts2_linuxbsd_x86_64}"
   [[ -f "$data_dir/sts2.dll" ]] || { echo 'sts2.dll not found. Set STS2_DIR or STS2_DATA_DIR.' >&2; return 1; }
 }
+
+ai4sts2_contained() {
+  systemctl --user set-property --runtime ai4sts2.slice MemoryMax=20G \
+    ManagedOOMMemoryPressure=kill ManagedOOMMemoryPressureLimit=50%
+  exec systemd-run --user --scope --quiet --slice=ai4sts2.slice "$@"
+}
