@@ -130,6 +130,7 @@ internal static class Game
         Foes.Clear();
         Book.Combat = null;
         Saves.Clear();
+        _streams = default;
         _fault = null;
         Book.ActChange = null;
         Run = null;
@@ -294,15 +295,20 @@ internal static class Game
         return decision;
     }
 
+    private static readonly AccessTools.FieldRef<RunRngSet, ulong> RunSeed = AccessTools.FieldRefAccess<RunRngSet, ulong>("<Seed>k__BackingField");
+    private static (object? Combat, Rng[] Streams) _streams;
+
     internal static Decision Determinize(ulong seed)
     {
         var decision = Current ?? throw new InvalidOperationException("No decision is pending.");
         var run = Run!;
         var source = new Rng(seed);
-        foreach (var type in Enum.GetValues<RunRngType>()) Reseed(run.Rng.GetRng(type), source);
+        if (!ReferenceEquals(_streams.Combat, Book.Combat) || _streams.Streams == null)
+            _streams = (Book.Combat, Snapshot.Reachable(typeof(Rng), run, CombatManager.Instance, Manager).Select(r => (Rng)r.Value).ToArray());
+        foreach (var rng in _streams.Streams) Reseed(rng, source);
+        RunSeed(run.Rng) = source.NextUnsignedLong();
         foreach (var player in run.Players)
         {
-            foreach (var type in Enum.GetValues<PlayerRngType>()) Reseed(player.PlayerRng.GetRng(type), source);
             if (player.PlayerCombatState?.DrawPile is not { } pile) continue;
             var cards = PileCards(pile);
             for (int i = cards.Count - 1; i > 0; i--)
@@ -312,6 +318,20 @@ internal static class Game
             }
         }
         return decision;
+    }
+
+    internal static object Audit(ulong seed)
+    {
+        var rngs = Snapshot.Reachable(typeof(Rng), Run!, CombatManager.Instance, Manager);
+        var fields = new System.Text.Json.JsonSerializerOptions { IncludeFields = true };
+        var before = rngs.Select(r => System.Text.Json.JsonSerializer.Serialize(((Rng)r.Value).ToSerializable(), fields)).ToArray();
+        var graph = new Snapshot(Run!, CombatManager.Instance, Book, Manager, Manager.ActionQueueSet, Manager.ActionQueueSynchronizer,
+            Manager.PlayerChoiceSynchronizer, Manager.ActionExecutor, NetCombatCardDb.Instance, SaveManager.Instance.Progress);
+        Determinize(seed);
+        var untouched = rngs.Where((r, i) => System.Text.Json.JsonSerializer.Serialize(((Rng)r.Value).ToSerializable(), fields) == before[i])
+            .Select(r => r.Path).ToArray();
+        graph.Restore();
+        return new { total = rngs.Count, sample = before[0], untouched };
     }
 
     private static void Reseed(Rng rng, Rng source) => rng.LoadFromSerializable(new Rng(source.NextUnsignedLong()).ToSerializable());

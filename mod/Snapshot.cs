@@ -34,6 +34,14 @@ internal sealed class Snapshot
     internal int Objects => _targets.Length;
     internal int Words => _buffer.Length;
 
+    private Snapshot()
+    {
+        _buffer = [];
+        _table = [];
+        _targets = [];
+        _decoders = [];
+    }
+
     internal Snapshot(params object[] roots)
     {
         foreach (object root in roots) _roots.Add(root);
@@ -91,6 +99,52 @@ internal sealed class Snapshot
                     else indices[dimension] = array.GetLowerBound(dimension);
             }
         }
+    }
+
+    internal static List<(object Value, string Path)> Reachable(Type wanted, params object[] roots)
+    {
+        var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        var found = new List<(object, string)>();
+        var queue = new Queue<(object Value, string Path)>(roots.Select(r => (r, r.GetType().Name)));
+        var probe = new Snapshot();
+        foreach (object root in roots) probe._roots.Add(root);
+        while (queue.Count > 0)
+        {
+            var (value, path) = queue.Dequeue();
+            if (!seen.Add(value)) continue;
+            if (wanted.IsInstanceOfType(value)) found.Add((value, path));
+            if (value is Delegate callback)
+            {
+                foreach (Delegate part in callback.GetInvocationList())
+                    if (part.Target != null) queue.Enqueue((part.Target, path + "->" + part.Method.Name));
+                continue;
+            }
+            if (!probe.Owned(value)) continue;
+            if (value is Array array)
+            {
+                Type element = array.GetType().GetElementType()!;
+                foreach (object? item in array) Visit(queue, element, item, path + "[]");
+                continue;
+            }
+            foreach (FieldInfo field in Layout(value.GetType())) Visit(queue, field.FieldType, field.GetValue(value), path + "." + field.Name);
+        }
+        return found;
+    }
+
+    private static void Visit(Queue<(object, string)> queue, Type type, object? value, string path)
+    {
+        if (value == null || type.IsPrimitive || type.IsEnum) return;
+        if (!type.IsValueType)
+        {
+            queue.Enqueue((value, path));
+            return;
+        }
+        if (Nullable.GetUnderlyingType(type) is { } underlying)
+        {
+            Visit(queue, underlying, value, path);
+            return;
+        }
+        foreach (FieldInfo field in Layout(type)) Visit(queue, field.FieldType, field.GetValue(value), path + "." + field.Name);
     }
 
     private void Word(ulong value) => _words.Add(value);

@@ -169,3 +169,21 @@ def test_snapshots_restore_in_place_and_match_replay(kernel):
             assert branch(kernel, replayed, seed) == trace
     finally:
         kernel.call("horizon", enabled=False)
+
+
+def test_resampling_reaches_every_random_stream(kernel):
+    rng = random.Random(13)
+    audited = 0
+    for character in kernel.hello["characters"]:
+        decision = kernel.call(
+            "begin", character=character, seed=f"AUDIT-{character}", ascension=10
+        )
+        while decision["kind"] != "end" and audited < 3 * len(kernel.hello["characters"]):
+            if decision["kind"] == "combat" and rng.random() < 0.2:
+                result = kernel.call("audit", seed=rng.getrandbits(62))
+                assert result["total"] > 0 and not result["untouched"]
+                audited += 1
+                if audited % 3 == 0:
+                    break
+            decision = kernel.call("step", index=rng.randrange(len(decision["options"])))
+    assert audited > 0

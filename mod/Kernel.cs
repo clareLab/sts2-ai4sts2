@@ -23,6 +23,7 @@ internal static class Kernel
         "replay" => Describe(await Game.Replay(request.GetProperty("actions").EnumerateArray().Select(a => a.GetInt32()).ToArray())),
         "determinize" => Describe(Game.Determinize(request.GetProperty("seed").GetUInt64())),
         "snapshot" => new { id = Game.Save() },
+        "audit" => Game.Audit(request.GetProperty("seed").GetUInt64()),
         "restore" => Describe(await Game.Load(request.GetProperty("id").GetInt32())),
         "release" => Release(request.GetProperty("id").GetInt32()),
         "horizon" => Horizon(request.GetProperty("enabled").GetBoolean()),
