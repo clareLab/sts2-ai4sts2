@@ -21,6 +21,7 @@ from ai4sts2.features import Batch, Layout, Translator, length
 from ai4sts2.kernel import ROOT, Kernel, die_with_parent, engine
 from ai4sts2.model import Net
 from ai4sts2.pool import Pool
+from ai4sts2.search import Evaluator, search
 
 ACTS = 3
 COMBATS = 18
@@ -130,7 +131,8 @@ def actor(index, args, executable, weights_path, schedule, connection):
     torch.set_num_threads(1)
     rng = random.Random(f"{args.seed}:{index}:{time.time_ns()}")
     outcome = Outcome(args.outcome)
-    pool = Pool(args.kernels, executable)
+    searcher = index < args.searchers
+    pool = Pool(1 if searcher else args.kernels, executable)
     schema, characters = pool.kernels[0].schema, pool.kernels[0].hello["characters"]
     layout = Layout.from_schema(schema)
     net = make_net(layout, outcome, args)
@@ -139,8 +141,10 @@ def actor(index, args, executable, weights_path, schedule, connection):
     episodes = [None] * len(pool)
     segments = [None] * len(pool)
     decisions = [None] * len(pool)
+    contexts = [None] * len(pool)
     weights, frontier, utilities = schedule
     archive = collections.deque(maxlen=args.archive)
+    generator = np.random.default_rng([args.seed, index, time.time_ns()])
 
     def begin(worker):
         if archive and rng.random() < args.restarts:
@@ -252,15 +256,27 @@ def actor(index, args, executable, weights_path, schedule, connection):
         if len(segment["steps"]) >= args.segment:
             flush(worker, bootstrap=observation)
             segments[worker] = {**segment, "version": seen, "steps": []}
-        decisions[worker] = observation
+        decisions[worker], contexts[worker] = observation, decision
 
-    def spread(group, logits):
+    def eligible(worker):
+        decision = contexts[worker]
+        room = decision["state"]["room"]
+        return (
+            decision["kind"] == "combat"
+            and room in ("Elite", "Boss")
+            and len(decision["options"]) > 1
+        )
+
+    def utility(group):
         c = characters.index(group[0])
         offset = (c * (TARGET + 1) + group[1]) * outcome.bins
-        utility = np.frombuffer(utilities, np.float32)[offset : offset + outcome.bins]
+        return np.frombuffer(utilities, np.float32)[offset : offset + outcome.bins].copy()
+
+    def spread(group, logits):
+        values = utility(group)
         probabilities = torch.softmax(logits, -1).numpy()
-        mean = probabilities @ utility
-        return float(np.sqrt(max(probabilities @ utility**2 - mean**2, 0.0)))
+        mean = probabilities @ values
+        return float(np.sqrt(max(probabilities @ values**2 - mean**2, 0.0)))
 
     reload()
     for worker in range(len(pool)):
@@ -288,8 +304,25 @@ def actor(index, args, executable, weights_path, schedule, connection):
                     opening["spread"] = spread(segment["group"], values[row])
                     if opening["room"] in ("Elite", "Boss"):
                         remember(worker)
-                action = int(actions[row])
-                segment["steps"].append((decisions[worker], action, float(logps[row])))
+                action, logp, target = int(actions[row]), float(logps[row]), None
+                if searcher and eligible(worker):
+                    kernel = pool.kernels[worker]
+                    evaluator = Evaluator(
+                        kernel, net, layout, translators[worker], outcome, utility(segment["group"])
+                    )
+                    try:
+                        action, target = search(
+                            evaluator,
+                            contexts[worker],
+                            args.simulations,
+                            args.candidates,
+                            generator,
+                        )
+                    except Exception as error:
+                        fail(worker, error)
+                        continue
+                    logp = float(np.log(max(target[action], 1e-12)))
+                segment["steps"].append((decisions[worker], action, logp, target))
                 episode["actions"].append(action)
                 decisions[worker] = None
                 send(worker, "step", index=action)
@@ -504,9 +537,10 @@ class Learner:
         steps = [step for segment in segments for step in segment["steps"]]
         count = len(steps)
         tails = [s["bootstrap"] for s in segments if "bootstrap" in s]
-        actions = np.array([action for _, action, _ in steps] + [0] * len(tails))
-        behaviour = np.array([logp for _, _, logp in steps] + [0] * len(tails), np.float32)
-        prepared = list(self.batches([observation for observation, _, _ in steps] + tails))
+        actions = np.array([step[1] for step in steps] + [0] * len(tails))
+        behaviour = np.array([step[2] for step in steps] + [0] * len(tails), np.float32)
+        imitation = [step[3] for step in steps] + [None] * len(tails)
+        prepared = list(self.batches([step[0] for step in steps] + tails))
         clock.append(time.perf_counter())
         bins = self.outcome.bins
         current = np.zeros(count + len(tails), np.float32)
@@ -552,7 +586,8 @@ class Learner:
                 chunk, batch = prepared[k]
                 if not (chunk < count).any():
                     continue
-                inside = torch.from_numpy(chunk < count).to(self.device)
+                searched = np.array([imitation[i] is not None for i in chunk])
+                inside = torch.from_numpy((chunk < count) & ~searched).to(self.device)
                 weight = inside.float() / self.args.minibatch
                 logits, values = self.net(batch)
                 distribution = torch.distributions.Categorical(logits=logits)
@@ -567,6 +602,17 @@ class Learner:
                 value_loss = -((target * torch.log_softmax(values, -1)).sum(-1) * weight).sum()
                 entropy = (distribution.entropy() * weight).sum()
                 loss = policy_loss + value_loss - self.args.entropy * entropy
+                if searched.any():
+                    rows = np.flatnonzero(searched)
+                    goal = np.zeros((len(rows), logits.shape[1]), np.float32)
+                    for r, i in enumerate(chunk[rows]):
+                        goal[r, : len(imitation[i])] = imitation[i]
+                    goal = torch.from_numpy(goal).to(self.device)
+                    logp = torch.log_softmax(logits[torch.from_numpy(rows).to(self.device)], -1)
+                    cross = -(goal * logp.masked_fill(goal <= 0, 0)).sum(-1)
+                    imitate = cross.sum() / self.args.minibatch
+                    loss = loss + imitate
+                    stats["imitation"].append(float(cross.mean()))
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), 0.5)
@@ -582,6 +628,7 @@ class Learner:
         clock.append(time.perf_counter())
         result = {key: round(float(np.mean(value)), 5) for key, value in stats.items()}
         result["passes"] = passes
+        result["searched"] = sum(target is not None for target in imitation)
         result["rho"] = round(float(rho[:count].mean()), 4)
         result["time"] = [round(b - a, 2) for a, b in zip(clock, clock[1:], strict=False)]
         return result
@@ -646,6 +693,9 @@ def main():
     parser.add_argument("--lam", type=float, default=0.95)
     parser.add_argument("--reference", type=int, default=1024)
     parser.add_argument("--restarts", type=float, default=0.0)
+    parser.add_argument("--searchers", type=int, default=0)
+    parser.add_argument("--simulations", type=int, default=16)
+    parser.add_argument("--candidates", type=int, default=4)
     parser.add_argument("--archive", type=int, default=256)
     parser.add_argument("--save-minutes", type=float, default=10)
     parser.add_argument("--samples", type=int, default=10**12)
