@@ -4,6 +4,8 @@ using MegaCrit.Sts2.Core.Models;
 
 namespace ai4sts2;
 
+internal sealed record Reply(object Json, byte[] Binary);
+
 internal static class Kernel
 {
     internal static async Task<object> Handle(string op, JsonElement request) => op switch
@@ -12,7 +14,8 @@ internal static class Kernel
         {
             game = ReleaseInfoManager.Instance.ReleaseInfo?.Version,
             commit = ReleaseInfoManager.Instance.ReleaseInfo?.Commit,
-            characters = ModelDb.AllCharacters.Select(c => c.Id.Entry).ToArray()
+            characters = ModelDb.AllCharacters.Select(c => c.Id.Entry).ToArray(),
+            schema = Encoder.Describe()
         },
         "begin" => Describe(await Game.Begin(request.GetProperty("character").GetString()!, request.GetProperty("seed").GetString()!,
             request.GetProperty("ascension").GetInt32(), request.TryGetProperty("invincible", out var invincible) && invincible.GetBoolean())),
@@ -37,11 +40,19 @@ internal static class Kernel
 
     private static readonly object? request_null = null;
 
-    private static object Describe(Decision decision) => new
+    private static Reply Describe(Decision decision)
     {
-        kind = decision.Kind,
-        victory = decision.Victory,
-        state = Game.Summary(),
-        options = decision.Options.Select(o => new { kind = o.Kind, data = o.Payload }).ToArray()
-    };
+        var encoder = new Encoder(Game.Run!, decision.Kind, Game.PendingSelection);
+        decision.Prelude?.Invoke(encoder);
+        foreach (var option in decision.Options) option.Encode(encoder);
+        return new Reply(new
+        {
+            kind = decision.Kind,
+            victory = decision.Victory,
+            state = Game.Summary(),
+            options = decision.Options.Select(o => o.Kind).ToArray(),
+            layout = encoder.Layout(),
+            vocab = Vocab.Drain()
+        }, encoder.Serialize());
+    }
 }

@@ -9,8 +9,11 @@ import tempfile
 import time
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
-HEADER = struct.Struct("<i")
+HEADER = struct.Struct("<ii")
+REQUEST = struct.Struct("<i")
 
 
 class KernelError(RuntimeError):
@@ -131,7 +134,9 @@ class Kernel:
             self.socket.settimeout(None)
             self.listener.close()
             self.listener = None
+            self.vocab = [None]
             self.hello = self.call("hello")
+            self.schema = self.hello["schema"]
         except BaseException:
             self.failed = True
             self.close()
@@ -149,28 +154,40 @@ class Kernel:
     def send(self, op, **arguments):
         body = json.dumps({"op": op, **arguments}).encode()
         try:
-            self.socket.sendall(HEADER.pack(len(body)) + body)
+            self.socket.sendall(REQUEST.pack(len(body)) + body)
         except OSError as error:
             self.failed = True
             raise KernelError(f"Kernel connection failed. {self.tail()}") from error
 
     def receive(self):
         try:
-            response = json.loads(self._receive())
+            header = self._exactly(HEADER.size)
+            size, binary = HEADER.unpack(header)
+            response = json.loads(self._exactly(size))
+            payload = self._exactly(binary) if binary else None
         except (OSError, EOFError) as error:
             self.failed = True
             raise KernelError(f"Kernel connection failed. {self.tail()}") from error
         if not response["ok"]:
             self.failed = True
             raise KernelError(response["error"])
-        return response.get("result")
+        result = response.get("result")
+        if payload is not None:
+            self.vocab.extend(result.pop("vocab"))
+            values = np.frombuffer(payload, dtype=np.float32)
+            observation, offset = {}, 0
+            for table, columns in self.schema.items():
+                rows = result["layout"][table]
+                count = rows * len(columns)
+                observation[table] = values[offset : offset + count].reshape(rows, len(columns))
+                offset += count
+            if offset != values.size:
+                raise KernelError("Observation layout does not match its payload.")
+            result["observation"] = observation
+        return result
 
     def fileno(self):
         return self.socket.fileno()
-
-    def _receive(self):
-        header = self._exactly(HEADER.size)
-        return self._exactly(HEADER.unpack(header)[0])
 
     def _exactly(self, size):
         buffer = bytearray(size)

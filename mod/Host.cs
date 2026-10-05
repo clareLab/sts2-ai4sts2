@@ -19,6 +19,7 @@ internal static class Host
     private static Task<object>? _pending;
     private static bool _failed;
     private static bool _closing;
+    private static byte[] _binary = [];
 
     internal static void Start()
     {
@@ -69,6 +70,7 @@ internal static class Host
             Dispatcher.SynchronizationContext.ExecutePendingContinuations();
             if (!_pending.IsCompleted) return;
             object reply;
+            byte[] binary = [];
             try
             {
                 reply = _pending.GetAwaiter().GetResult();
@@ -79,7 +81,8 @@ internal static class Host
                 reply = new { ok = false, error = error.ToString() };
             }
             _pending = null;
-            Send(JsonSerializer.SerializeToUtf8Bytes(reply, Json));
+            (binary, _binary) = (_binary, []);
+            Send(JsonSerializer.SerializeToUtf8Bytes(reply, Json), binary);
         }
     }
 
@@ -95,7 +98,13 @@ internal static class Host
                 return new { ok = true };
             }
             if (_failed) throw new InvalidOperationException("The kernel must be restarted after a failure.");
-            return new { ok = true, result = await Kernel.Handle(op, root) };
+            var result = await Kernel.Handle(op, root);
+            if (result is Reply reply)
+            {
+                _binary = reply.Binary;
+                return new { ok = true, result = reply.Json };
+            }
+            return new { ok = true, result };
         }
     }
 
@@ -124,11 +133,13 @@ internal static class Host
         }
     }
 
-    private static void Send(byte[] body)
+    private static void Send(byte[] body, byte[] binary)
     {
-        var header = new byte[4];
+        var header = new byte[8];
         BinaryPrimitives.WriteInt32LittleEndian(header, body.Length);
+        BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(4), binary.Length);
         _socket.Send(header);
         _socket.Send(body);
+        if (binary.Length > 0) _socket.Send(binary);
     }
 }

@@ -40,7 +40,7 @@ class Worker:
 
     def choose(self, decision):
         options = decision["options"]
-        weights = [0.2 if o["kind"] in PASSIVE else 1.0 for o in options]
+        weights = [0.2 if kind in PASSIVE else 1.0 for kind in options]
         return self.rng.choices(range(len(options)), weights)[0]
 
 

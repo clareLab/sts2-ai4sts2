@@ -1,5 +1,6 @@
 import random
 
+import numpy as np
 import pytest
 
 from ai4sts2.kernel import Kernel, engine
@@ -19,9 +20,41 @@ def play(kernel, character, seed, steps):
     decision = kernel.call("begin", character=character, seed=seed, ascension=10)
     while decision["kind"] != "end" and len(trace) < steps:
         index = rng.randrange(len(decision["options"]))
-        trace.append((decision["kind"], len(decision["options"]), index, decision["state"]["hp"]))
+        trace.append(
+            (
+                decision["kind"],
+                tuple(decision["options"]),
+                index,
+                decision["state"]["hp"],
+                fingerprint(kernel, decision),
+            )
+        )
         decision = kernel.call("step", index=index)
     return trace, decision
+
+
+def fingerprint(kernel, decision):
+    observation = decision["observation"]
+    tables = []
+    for name, values in observation.items():
+        columns = kernel.schema[name]
+        named = values.copy()
+        for index, column in enumerate(columns):
+            if column in {"model", "zone", "kind", "key", "type", "character", "room", "decision"}:
+                named[:, index] = [hash(kernel.vocab[int(v)]) % 1000003 for v in values[:, index]]
+        tables.append((name, named.shape, named.tobytes()))
+    return tuple(tables)
+
+
+def test_observation_matches_schema(kernel):
+    decision = kernel.call(
+        "begin", character=kernel.hello["characters"][0], seed="SCHEMA", ascension=10
+    )
+    observation = decision["observation"]
+    assert set(observation) == set(kernel.schema)
+    assert observation["global"].shape == (1, len(kernel.schema["global"]))
+    assert observation["option"].shape[0] == len(decision["options"])
+    assert np.isfinite(observation["card"]).all()
 
 
 def test_characters(kernel):
@@ -30,10 +63,10 @@ def test_characters(kernel):
 
 def test_replay_is_deterministic(kernel):
     character = kernel.hello["characters"][0]
-    first = play(kernel, character, "DETERMINISM", 400)
-    second = play(kernel, character, "DETERMINISM", 400)
+    first, _ = play(kernel, character, "DETERMINISM", 400)
+    second, _ = play(kernel, character, "DETERMINISM", 400)
     assert first == second
-    assert len(first[0]) > 20
+    assert len(first) > 20
 
 
 def test_every_character_reaches_a_decision(kernel):

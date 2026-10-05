@@ -32,9 +32,9 @@ using HarmonyLib;
 
 namespace ai4sts2;
 
-internal sealed record Option(string Kind, object Payload, Func<Task> Execute);
+internal sealed record Option(string Kind, Func<Encoder, int> Encode, Func<Task> Execute);
 
-internal sealed record Decision(string Kind, Option[] Options, bool? Victory = null);
+internal sealed record Decision(string Kind, Option[] Options, bool? Victory = null, Action<Encoder>? Prelude = null);
 
 internal static class Game
 {
@@ -60,6 +60,7 @@ internal static class Game
     private static Player Me => Run!.Players[0];
     internal static RunState? Run { get; private set; }
     internal static Decision? Current { get; private set; }
+    internal static Selection? PendingSelection => Selector.Pending;
     internal static Dictionary<string, int> Waits { get; } = new();
 
     static Game() => TaskHelper.UnobservedFault += error => _fault ??= error;
@@ -251,7 +252,8 @@ internal static class Game
                 if (ev.IsFinished) return Map(run);
                 var choices = ev.CurrentOptions.Select((o, i) => (Option: o, Index: i))
                     .Where(x => !x.Option.IsLocked && !x.Option.IsProceed && !(DisableOnChosen(x.Option) && x.Option.WasChosen))
-                    .Select(x => new Option("event", new { key = x.Option.TextKey, relic = x.Option.Relic?.Id.Entry }, () =>
+                    .Select(x => new Option("event", e => e.Option("event", relic: x.Option.Relic == null ? -1 : e.Relic(x.Option.Relic, "offer", e.NextOption),
+                        key: "event." + x.Option.TextKey), () =>
                     {
                         Manager.EventSynchronizer.ChooseLocalOption(x.Index);
                         return Task.CompletedTask;
@@ -261,8 +263,8 @@ internal static class Game
                 var restOptions = Manager.RestSiteSynchronizer.GetLocalOptions();
                 if (restOptions.Count == 0 || Marked(rest, "left")) return Map(run);
                 var restChoices = restOptions.Select((o, i) => (Option: o, Index: i)).Where(x => x.Option.IsEnabled)
-                    .Select(x => new Option("rest", new { id = x.Option.OptionId }, () => Manager.RestSiteSynchronizer.ChooseLocalOption(x.Index))).ToList();
-                if (Marked(rest, "rested")) restChoices.Add(new Option("leave", new { }, () => Leave(rest)));
+                    .Select(x => new Option("rest", e => e.Option("rest", key: "rest." + x.Option.OptionId), () => Manager.RestSiteSynchronizer.ChooseLocalOption(x.Index))).ToList();
+                if (Marked(rest, "rested")) restChoices.Add(new Option("leave", e => e.Option("leave"), () => Leave(rest)));
                 return new Decision("rest", [.. restChoices, .. Potions(false)]);
             case MerchantRoom shop:
                 return Marked(shop, "left") ? Map(run) : Shop(run, shop);
@@ -275,12 +277,12 @@ internal static class Game
                 if (Manager.TreasureRoomRelicSynchronizer.CurrentRelics is { Count: > 0 } relics && !Marked(chest, "skipped"))
                     return new Decision("treasure",
                     [
-                        new Option("take_relic", new { relic = relics[0].Id.Entry }, () =>
+                        new Option("take_relic", e => e.Option("take_relic", relic: e.Relic(relics[0], "offer", e.NextOption)), () =>
                         {
                             Manager.TreasureRoomRelicSynchronizer.PickRelicLocally(0);
                             return Task.CompletedTask;
                         }),
-                        new Option("skip_relic", new { }, () =>
+                        new Option("skip_relic", e => e.Option("skip_relic"), () =>
                         {
                             Mark(chest, "skipped");
                             Manager.TreasureRoomRelicSynchronizer.SkipRelicLocally();
@@ -327,7 +329,7 @@ internal static class Game
         int turn = player.PlayerCombatState!.TurnNumber;
         var options = new List<Option>
         {
-            new("end_turn", new { }, () =>
+            new("end_turn", e => e.Option("end_turn"), () =>
             {
                 Manager.ActionQueueSynchronizer.RequestEnqueue(new EndPlayerTurnAction(player, turn));
                 return Task.CompletedTask;
@@ -339,7 +341,7 @@ internal static class Game
             IEnumerable<Creature?> targets = card.TargetType is TargetType.AnyEnemy or TargetType.AnyAlly or TargetType.AnyPlayer
                 ? creatures.Where(c => card.IsValidTarget(c) && Targetable(c)).Cast<Creature?>() : card.IsValidTarget(null) ? [null] : [];
             foreach (var target in targets)
-                options.Add(new Option("play", new { card = card.Id.Entry, target = target?.CombatId }, () =>
+                options.Add(new Option("play", e => e.Option("play", card: e.Card(card, "hand"), creature: target == null ? -1 : e.Creature(target)), () =>
                 {
                     Manager.ActionQueueSynchronizer.RequestEnqueue(new PlayCardAction(card, target));
                     return Task.CompletedTask;
@@ -358,7 +360,8 @@ internal static class Game
         {
             if (player.PotionSlots[slot] is not { IsQueued: false } potion) continue;
             uint index = (uint)slot;
-            yield return new Option("discard_potion", new { potion = potion.Id.Entry, slot }, () =>
+            int potionSlot = slot;
+            yield return new Option("discard_potion", e => e.Option("discard_potion", potion: e.Potion(potion, "owned", potionSlot)), () =>
             {
                 Manager.ActionQueueSynchronizer.RequestEnqueue(new DiscardPotionGameAction(player, index, inCombat));
                 return Task.CompletedTask;
@@ -369,7 +372,8 @@ internal static class Game
             IEnumerable<Creature?> targets = potion.TargetType is TargetType.AnyEnemy or TargetType.AnyAlly or TargetType.AnyPlayer or TargetType.Self
                 ? creatures.Where(c => potion.IsValidTarget(c) && (c.Side == CombatSide.Player || Targetable(c))).Cast<Creature?>() : potion.IsValidTarget(null) ? [null] : [];
             foreach (var target in targets)
-                yield return new Option("use_potion", new { potion = potion.Id.Entry, slot, target = target?.CombatId }, () =>
+                yield return new Option("use_potion", e => e.Option("use_potion", potion: e.Potion(potion, "owned", potionSlot),
+                    creature: target == null ? -1 : e.Creature(target)), () =>
                 {
                     potion.EnqueueManualUse(target);
                     return Task.CompletedTask;
@@ -391,7 +395,7 @@ internal static class Game
             else points = MapTravel.GetTravelablePointsFrom(run, map.GetPoint(last) ?? (last == map.StartingMapPoint.coord ? map.StartingMapPoint
                 : throw new InvalidOperationException($"Unknown map coordinate {last}.")));
         }
-        var options = points.Select(p => new Option("map", new { row = p.coord.row, column = p.coord.col, room = p.PointType.ToString() }, () =>
+        var options = points.Select(p => new Option("map", e => e.Option("map", node: e.Node(p)), () =>
         {
             Manager.ActionQueueSynchronizer.RequestEnqueue(new VoteForMapCoordAction(Me, run.MapLocation,
                 new MapVote { coord = p.coord, mapGenerationCount = Manager.MapSelectionSynchronizer.MapGenerationCount }));
@@ -413,18 +417,22 @@ internal static class Game
                 foreach (var card in cards.Cards)
                 {
                     int choice = index++;
-                    options.Add(new Option("reward_card", new { card = card.Id.Entry }, () => Pick(cards, choice, null)));
+                    options.Add(new Option("reward_card", e => e.Option("reward_card", card: e.Card(card, "offer", e.NextOption)), () => Pick(cards, choice, null)));
                 }
                 foreach (var alternative in CardRewardAlternative.Generate(cards).Where(a => a.OptionId != "Skip"))
-                    options.Add(new Option("reward_alternative", new { id = alternative.OptionId }, () => Pick(cards, 0, alternative.OptionId)));
+                    options.Add(new Option("reward_alternative", e => e.Option("reward_alternative", key: "alternative." + alternative.OptionId),
+                        () => Pick(cards, 0, alternative.OptionId)));
             }
             else if (reward is not PotionReward || Me.HasOpenPotionSlots)
-                options.Add(new Option("reward", new { type = reward.GetType().Name }, () => synchronizer.SelectLocalReward(reward)));
+                options.Add(new Option("reward", e => e.Option("reward", key: "reward." + reward.GetType().Name,
+                    relic: reward is RelicReward { Relic: { } relic } ? e.Relic(relic, "offer", e.NextOption) : -1,
+                    potion: reward is PotionReward { Potion: { } potion } ? e.Potion(potion, "offer", -1, e.NextOption) : -1,
+                    value: reward is GoldReward gold ? gold.Amount : 0), () => synchronizer.SelectLocalReward(reward)));
         }
         if (frame.Room is CombatRoom)
-            options.Add(new Option("proceed", new { }, () => Proceed(frame)));
+            options.Add(new Option("proceed", e => e.Option("proceed"), () => Proceed(frame)));
         else if (!frame.DisallowSkipping)
-            options.Add(new Option("skip_rewards", new { }, () =>
+            options.Add(new Option("skip_rewards", e => e.Option("skip_rewards"), () =>
             {
                 synchronizer.SkipLocalRewardsSet();
                 return Task.CompletedTask;
@@ -459,35 +467,39 @@ internal static class Game
         var options = new List<Option>();
         foreach (var entry in inventory.CardEntries)
             if (entry is { IsStocked: true, EnoughGold: true, CreationResult: { } result } && Hook.ShouldAddToDeck(run, result.Card, out _))
-                options.Add(new Option("buy_card", new { card = result.Card.Id.Entry, cost = entry.Cost }, () => entry.OnTryPurchaseWrapper(inventory)));
+                options.Add(new Option("buy_card", e => e.Option("buy_card", card: e.Card(result.Card, "offer", e.NextOption), value: entry.Cost),
+                    () => entry.OnTryPurchaseWrapper(inventory)));
         foreach (var entry in inventory.RelicEntries)
             if (entry is { IsStocked: true, EnoughGold: true, Model: { } relic })
-                options.Add(new Option("buy_relic", new { relic = relic.Id.Entry, cost = entry.Cost }, () => entry.OnTryPurchaseWrapper(inventory)));
+                options.Add(new Option("buy_relic", e => e.Option("buy_relic", relic: e.Relic(relic, "offer", e.NextOption), value: entry.Cost),
+                    () => entry.OnTryPurchaseWrapper(inventory)));
         foreach (var entry in inventory.PotionEntries)
             if (entry is { IsStocked: true, EnoughGold: true, Model: { } potion } && player.HasOpenPotionSlots && Hook.ShouldProcurePotion(run, null, potion, player))
-                options.Add(new Option("buy_potion", new { potion = potion.Id.Entry, cost = entry.Cost }, () => entry.OnTryPurchaseWrapper(inventory)));
+                options.Add(new Option("buy_potion", e => e.Option("buy_potion", potion: e.Potion(potion, "offer", -1, e.NextOption), value: entry.Cost),
+                    () => entry.OnTryPurchaseWrapper(inventory)));
         if (inventory.CardRemovalEntry is { Used: false, EnoughGold: true } removal && player.Deck.Cards.Any(c => c.IsRemovable))
-            options.Add(new Option("buy_removal", new { cost = removal.Cost }, () => removal.OnTryPurchaseWrapper(inventory)));
-        options.Add(new Option("leave", new { }, () => Leave(shop)));
+            options.Add(new Option("buy_removal", e => e.Option("buy_removal", value: removal.Cost), () => removal.OnTryPurchaseWrapper(inventory)));
+        options.Add(new Option("leave", e => e.Option("leave"), () => Leave(shop)));
         return new Decision("shop", [.. options, .. Potions(false)]);
     }
 
     private static Decision Select(Selection selection)
     {
-        var options = selection.Remaining.Select(card => new Option("select_card", new { card = card.Id.Entry }, () =>
+        var options = selection.Remaining.Select(card => new Option("select_card", e => e.Option("select_card", card: e.Card(card, "choice", e.NextOption),
+            key: "select." + selection.Method), () =>
         {
             selection.Chosen.Add(card);
             if (selection.Chosen.Count == selection.Maximum) Selector.Finish(false);
             return Task.CompletedTask;
         })).ToList();
         if (selection.CanConfirm && selection.Chosen.Count < selection.Maximum)
-            options.Add(new Option("confirm_selection", new { }, () =>
+            options.Add(new Option("confirm_selection", e => e.Option("confirm_selection", key: "select." + selection.Method), () =>
             {
                 Selector.Finish(false);
                 return Task.CompletedTask;
             }));
         if (selection.CanSkip)
-            options.Add(new Option("skip_selection", new { }, () =>
+            options.Add(new Option("skip_selection", e => e.Option("skip_selection", key: "select." + selection.Method), () =>
             {
                 Selector.Finish(true);
                 return Task.CompletedTask;
@@ -495,8 +507,12 @@ internal static class Game
         return new Decision("select", options.ToArray());
     }
 
-    private static Decision Bundle(Bundle bundle) => new("bundle", bundle.Options.Select(cards => new Option("bundle",
-        new { cards = cards.Select(c => c.Id.Entry).ToArray() }, () =>
+    private static Decision Bundle(Bundle bundle) => new("bundle", bundle.Options.Select(cards => new Option("bundle", e =>
+        {
+            int index = e.NextOption;
+            foreach (var card in cards) e.Card(card, "offer", index);
+            return e.Option("bundle", value: cards.Count);
+        }, () =>
         {
             Patches.PendingBundle = null;
             bundle.Source.SetResult(cards);
@@ -518,11 +534,21 @@ internal static class Game
                 if (cell.IsHidden) options.Add(SphereOption(sphere, CrystalSphereMinigame.CrystalSphereToolType.Small, cell, x, y));
                 if (near) options.Add(SphereOption(sphere, CrystalSphereMinigame.CrystalSphereToolType.Big, cell, x, y));
             }
-        return new Decision("sphere", options.ToArray());
+        return new Decision("sphere", options.ToArray(), Prelude: e =>
+        {
+            var revealed = sphere.cells.Cast<CrystalSphereCell>().Where(c => c.Item != null).GroupBy(c => c.Item).Where(g => g.All(c => !c.IsHidden))
+                .Select(g => g.Key).ToHashSet();
+            for (int x = 0; x < width; x++)
+                for (int y = 0; y < height; y++)
+                {
+                    var cell = sphere.cells[x, y];
+                    e.Cell(x, y, cell.IsHidden, cell.Item != null && revealed.Contains(cell.Item) ? cell.Item.GetType().Name : null);
+                }
+        });
     }
 
     private static Option SphereOption(CrystalSphereMinigame sphere, CrystalSphereMinigame.CrystalSphereToolType tool, CrystalSphereCell cell, int x, int y) =>
-        new("sphere", new { tool = tool.ToString(), x, y }, () =>
+        new("sphere", e => e.Option("sphere", cell: x * sphere.cells.GetLength(1) + y, key: "tool." + tool), () =>
         {
             sphere.SetTool(tool);
             return sphere.CellClicked(cell);
