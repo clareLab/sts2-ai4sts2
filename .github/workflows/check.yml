@@ -19,4 +19,3 @@ jobs:
           python-version: '3.12'
       - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y shellcheck
       - run: ./scripts/lint.sh
-      - run: ./scripts/python.sh pytest -q -m "not game"

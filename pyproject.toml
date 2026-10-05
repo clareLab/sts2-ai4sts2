@@ -7,7 +7,7 @@ name = "ai4sts2"
 version = "0.2.0"
 requires-python = ">=3.12,<3.13"
 authors = [{ name = "clareLab", email = "yaho@clarelab.moe" }]
-dependencies = ["numpy>=2,<3", "torch>=2.8,<3"]
+dependencies = ["numpy>=2,<3", "torch>=2.14,<3", "triton-xpu>=3.8"]
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "ruff>=0.13,<1"]
@@ -15,12 +15,16 @@ dev = ["pytest>=8,<10", "ruff>=0.13,<1"]
 [tool.hatch.build.targets.wheel]
 packages = ["ai4sts2"]
 
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
 [tool.uv.sources]
-torch = { index = "pytorch-cpu" }
+torch = { index = "pytorch-xpu" }
+triton-xpu = { index = "pytorch-xpu" }
 
 [[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
 explicit = true
 
 [tool.ruff]

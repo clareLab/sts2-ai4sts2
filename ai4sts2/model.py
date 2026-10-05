@@ -24,7 +24,7 @@ class Net(nn.Module):
         self.value = nn.Sequential(nn.Linear(width, width), nn.GELU(), nn.Linear(width, 1))
 
     def forward(self, batch):
-        flat = torch.zeros(batch.size * batch.width, self.width)
+        flat = self.embed.weight.new_zeros(batch.size * batch.width, self.width)
         for index, table in enumerate(TOKENS):
             item = batch.tables[table]
             count = len(item["position"])
