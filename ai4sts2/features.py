@@ -153,6 +153,8 @@ def length(observation):
 
 
 class Batch:
+    FIELDS = ("global_position", "mask", "option_positions", "option_mask", "receivers", "senders")
+
     def __init__(self, observations, layout, schema, vocabulary):
         self.size = len(observations)
         card_columns = schema["card"]
@@ -199,6 +201,7 @@ class Batch:
         starts = base[:, None] + offsets
         self.tables = {}
         positions, row_starts, stacks = {}, {}, {}
+        receivers, senders = [], []
         for table in ORDER:
             t = TOKENS.index(table)
             arrays = [entry[table] for entry in entries]
@@ -233,22 +236,21 @@ class Batch:
                 offers = stacked[:, schema[table].index("offer")].astype(np.int64)
                 option = TOKENS.index("option")
                 valid = (offers >= 0) & (offers < counts[batch_index, option])
-                resolved = np.where(valid, starts[batch_index, option] + offers, -1)
-                item["offers"] = torch.from_numpy(resolved.astype(np.int64))
-            item["batch"] = batch_index
+                receivers.append(starts[batch_index[valid], option] + offers[valid])
+                senders.append(positions[table][valid])
             self.tables[table] = item
         for table in ORDER:
-            item = self.tables[table]
-            batch_index = item.pop("batch")
+            sizes = np.array([len(observation[table]) for observation in observations])
+            batch_index = np.repeat(np.arange(self.size), sizes)
             for column, target in layout.references[table]:
                 refs = stacks[table][:, column].astype(np.int64)
-                sizes = np.diff(np.append(row_starts[target], len(stacks[target])))
-                valid = (refs >= 0) & (refs < sizes[batch_index])
-                resolved = np.full(len(refs), -1, dtype=np.int64)
-                if valid.any():
-                    index = row_starts[target][batch_index[valid]] + refs[valid]
-                    resolved[valid] = positions[target][index]
-                item.setdefault("references", []).append((torch.from_numpy(resolved), target))
+                counts_target = np.diff(np.append(row_starts[target], len(stacks[target])))
+                valid = (refs >= 0) & (refs < counts_target[batch_index])
+                receivers.append(positions[table][valid])
+                rows = row_starts[target][batch_index[valid]] + refs[valid]
+                senders.append(positions[target][rows])
+        self.receivers = torch.from_numpy(np.concatenate(receivers).astype(np.int64))
+        self.senders = torch.from_numpy(np.concatenate(senders).astype(np.int64))
         piles = [(b, zone, count) for b, e in enumerate(entries) for zone, count in e["piles"]]
         rank = np.zeros(len(piles), dtype=np.int64)
         seen = {}
@@ -282,10 +284,7 @@ class Batch:
     def to(self, device):
         for item in self.tables.values():
             for key, value in item.items():
-                if key == "references":
-                    item[key] = [(r.to(device, non_blocking=True), t) for r, t in value]
-                else:
-                    item[key] = value.to(device, non_blocking=True)
-        for key in ("global_position", "mask", "option_positions", "option_mask"):
+                item[key] = value.to(device, non_blocking=True)
+        for key in self.FIELDS:
             setattr(self, key, getattr(self, key).to(device, non_blocking=True))
         return self

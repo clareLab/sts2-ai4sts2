@@ -40,19 +40,8 @@ class Net(nn.Module):
                 tokens = tokens + (self.embed(item["variables"]) * gates).sum(1)
                 tokens = tokens * item["weights"].unsqueeze(-1)
             flat = flat.index_add(0, item["position"], tokens)
-        related = torch.zeros_like(flat)
-        for table in TOKENS:
-            item = batch.tables[table]
-            for references, _target in item.get("references", []):
-                valid = references >= 0
-                if valid.any():
-                    related = related.index_add(0, item["position"][valid], flat[references[valid]])
-            offers = item.get("offers")
-            if offers is not None:
-                valid = offers >= 0
-                if valid.any():
-                    related = related.index_add(0, offers[valid], flat[item["position"][valid]])
-        hidden = (flat + related).view(batch.size, batch.width, self.width)
+        flat = flat.index_add(0, batch.receivers, flat[batch.senders])
+        hidden = flat.view(batch.size, batch.width, self.width)
         hidden = self.norm(self.encoder(hidden, src_key_padding_mask=~batch.mask))
         hidden = hidden.reshape(-1, self.width)
         logits = self.policy(hidden[batch.option_positions]).squeeze(-1)
