@@ -27,6 +27,7 @@ using MegaCrit.Sts2.Core.Random;
 using MegaCrit.Sts2.Core.Rewards;
 using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
+using MegaCrit.Sts2.Core.Saves;
 using MegaCrit.Sts2.Core.TestSupport;
 using MegaCrit.Sts2.Core.Unlocks;
 using HarmonyLib;
@@ -40,25 +41,24 @@ internal sealed record Decision(string Kind, Option[] Options, bool? Victory = n
 internal static class Game
 {
     private static readonly Selector Selector = new();
-    private static readonly List<RewardsSet> Frames = [];
+    private static readonly Ledger Book = new();
+    private static List<RewardsSet> Frames => Book.Frames;
     private static readonly Func<RewardsSet, Task> Register = set =>
     {
         set.ThrowInTestIfRewardsNotTaken = false;
         Frames.Add(set);
         return Task.CompletedTask;
     };
-    private static readonly List<Task> Tasks = [];
-    private static readonly HashSet<(object Item, string Flag)> Marks = new(new MarkComparer());
+    private static List<Task> Tasks => Book.Tasks;
+    private static HashSet<(object Item, string Flag)> Marks => Book.Marks;
     private static readonly Func<EventOption, bool> DisableOnChosen =
         AccessTools.MethodDelegate<Func<EventOption, bool>>(AccessTools.PropertyGetter(typeof(EventOption), "DisableOnChosen"));
     private static readonly AccessTools.FieldRef<ActionQueueSet, System.Collections.IList> ActionQueues =
         AccessTools.FieldRefAccess<ActionQueueSet, System.Collections.IList>("_actionQueues");
     private static readonly FieldInfo QueuedActions = AccessTools.Field(AccessTools.Inner(typeof(ActionQueueSet), "ActionQueue"), "actions");
-    private static readonly Dictionary<Creature, int> Foes = new(ReferenceEqualityComparer.Instance);
-    private static CombatState? _combat;
+    private static Dictionary<Creature, int> Foes => Book.Foes;
     private static IDisposable? _selectorScope;
     private static Exception? _fault;
-    private static int? _actChange;
     private static RunManager Manager => RunManager.Instance;
     private static Player Me => Run!.Players[0];
     internal static RunState? Run { get; private set; }
@@ -128,9 +128,10 @@ internal static class Game
         Frames.Clear();
         Marks.Clear();
         Foes.Clear();
-        _combat = null;
+        Book.Combat = null;
+        Saves.Clear();
         _fault = null;
-        _actChange = null;
+        Book.ActChange = null;
         Run = null;
         Current = null;
     }
@@ -145,9 +146,9 @@ internal static class Game
     {
         _fault ??= action.Exception;
         if (CombatManager.Instance.DebugOnlyGetState() is not { } state) return;
-        if (state != _combat)
+        if (state != Book.Combat)
         {
-            _combat = state;
+            Book.Combat = state;
             Foes.Clear();
         }
         foreach (var enemy in state.Enemies)
@@ -165,8 +166,8 @@ internal static class Game
 
     private static float? Foe()
     {
-        if (Run!.CurrentRoom is not CombatRoom || _combat == null || Foes.Count == 0) return null;
-        return (float)_combat.Enemies.Where(e => e.IsAlive && Foes.ContainsKey(e) && e.HpDisplay != HpDisplay.InfiniteWithoutNumbers)
+        if (Run!.CurrentRoom is not CombatRoom || Book.Combat == null || Foes.Count == 0) return null;
+        return (float)Book.Combat.Enemies.Where(e => e.IsAlive && Foes.ContainsKey(e) && e.HpDisplay != HpDisplay.InfiniteWithoutNumbers)
             .Sum(e => e.CurrentHp) / Math.Max(1, Foes.Values.Sum());
     }
 
@@ -191,7 +192,7 @@ internal static class Game
         if (!task.IsCompleted) Tasks.Add(task);
     }
 
-    private sealed class MarkComparer : IEqualityComparer<(object Item, string Flag)>
+    internal sealed class MarkComparer : IEqualityComparer<(object Item, string Flag)>
     {
         public bool Equals((object Item, string Flag) x, (object Item, string Flag) y) => ReferenceEquals(x.Item, y.Item) && x.Flag == y.Flag;
 
@@ -209,6 +210,81 @@ internal static class Game
         Current = null;
         Track(decision.Options[index].Execute());
         return await Settle();
+    }
+
+    internal static bool Horizon { get; set; }
+
+    private sealed record Saved(Snapshot Graph, object Turn, long WinTime);
+
+    private static readonly Dictionary<int, Saved> Saves = [];
+    private static int _saves;
+    private static readonly FieldInfo TurnField = AccessTools.Field(typeof(CombatManager), "_turnState");
+    private static readonly FieldInfo LoopField = AccessTools.Field(typeof(CombatManager), "_turnLoopTask");
+    private static readonly Type TurnType = TurnField.FieldType;
+    private static readonly FieldInfo SourceField = AccessTools.Field(TurnType, "_cts");
+    private static readonly MethodInfo CancelMethod = AccessTools.Method(TurnType, "Cancel");
+    private static readonly PropertyInfo StateProperty = AccessTools.Property(TurnType, "State");
+    private static readonly PropertyInfo[] Signals = [AccessTools.Property(TurnType, "EndTurnSignalSource"), AccessTools.Property(TurnType, "BeginEnemyTurnSignalSource")];
+    private static readonly MethodInfo SwitchMethod = AccessTools.Method(typeof(CombatManager), "AwaitTurnEndAndSwitchSides");
+    private static readonly MethodInfo StartMethod = AccessTools.Method(typeof(CombatManager), "StartTurn");
+
+    internal static int Save()
+    {
+        if (Current?.Kind != "combat") throw new InvalidOperationException("Snapshots require a stable combat decision.");
+        var turn = TurnField.GetValue(CombatManager.Instance)!;
+        var graph = new Snapshot(Run!, CombatManager.Instance, Book, Manager, Manager.ActionQueueSet, Manager.ActionQueueSynchronizer,
+            Manager.PlayerChoiceSynchronizer, Manager.ActionExecutor, NetCombatCardDb.Instance, SaveManager.Instance.Progress);
+        Saves[++_saves] = new Saved(graph, turn, Manager.WinTime);
+        return _saves;
+    }
+
+    internal static void Drop(int id) => Saves.Remove(id);
+
+    internal static async Task<Decision> Load(int id)
+    {
+        var saved = Saves[id];
+        var manager = CombatManager.Instance;
+        if (!ReferenceEquals(TurnField.GetValue(manager), saved.Turn)) throw new InvalidOperationException("Snapshots restore only within their combat.");
+        if (Selector.Pending != null) throw new InvalidOperationException("Snapshots cannot restore over a pending selection.");
+        var previous = (Task?)LoopField.GetValue(manager);
+        CancelMethod.Invoke(saved.Turn, null);
+        var timer = Stopwatch.StartNew();
+        while (previous is { IsCompleted: false })
+        {
+            Dispatcher.SynchronizationContext.ExecutePendingContinuations();
+            if (previous.IsCompleted) break;
+            if (timer.Elapsed.TotalSeconds > 30) throw new TimeoutException("The previous turn loop did not stop.");
+            await Host.Frame();
+        }
+        ((CancellationTokenSource)SourceField.GetValue(saved.Turn)!).Dispose();
+        saved.Graph.Restore();
+        Manager.WinTime = saved.WinTime;
+        SourceField.SetValue(saved.Turn, new CancellationTokenSource());
+        foreach (var signal in Signals) signal.SetValue(saved.Turn, Activator.CreateInstance(signal.PropertyType));
+        LoopField.SetValue(manager, Resume(saved.Turn));
+        Current = null;
+        _fault = null;
+        return await Settle();
+    }
+
+    private static async Task Resume(object turn)
+    {
+        var manager = CombatManager.Instance;
+        object? action = await Switch(turn);
+        while (manager.IsInProgress && ReferenceEquals(turn, TurnField.GetValue(manager)))
+        {
+            var state = (CombatState)StateProperty.GetValue(turn)!;
+            bool player = state.CurrentSide == CombatSide.Player;
+            await (Task)StartMethod.Invoke(manager, [turn, player ? null : action])!;
+            action = player ? await Switch(turn) : null;
+        }
+    }
+
+    private static async Task<object?> Switch(object turn)
+    {
+        var task = (Task)SwitchMethod.Invoke(CombatManager.Instance, [turn])!;
+        await task;
+        return task.GetType().GetProperty("Result")!.GetValue(task);
     }
 
     internal static async Task<Decision> Replay(IEnumerable<int> actions)
@@ -256,7 +332,7 @@ internal static class Game
             if ((Current = Capture()) != null) return Current;
             if (_progress) continue;
             if (timer.Elapsed.TotalSeconds > 30) throw new TimeoutException($"No decision in {Run?.CurrentRoom?.GetType().Name} at floor {Run?.TotalFloor}.");
-            string reason = $"{Run?.CurrentRoom?.GetType().Name}|loading={Manager.NetService.IsGameLoading}|exec={Manager.ActionExecutor.IsRunning}|queues={QueuesEmpty}|tasks={Tasks.Count(t => !t.IsCompleted)}|frames={Frames.Count}|act={_actChange}|combat={CombatManager.Instance.IsInProgress}";
+            string reason = $"{Run?.CurrentRoom?.GetType().Name}|loading={Manager.NetService.IsGameLoading}|exec={Manager.ActionExecutor.IsRunning}|queues={QueuesEmpty}|tasks={Tasks.Count(t => !t.IsCompleted)}|frames={Frames.Count}|act={Book.ActChange}|combat={CombatManager.Instance.IsInProgress}";
             Waits[reason] = Waits.GetValueOrDefault(reason) + 1;
             await Host.Frame();
         }
@@ -292,16 +368,17 @@ internal static class Game
         if (Frames.Count > 0) return Rewards(Frames[^1]);
         Tasks.RemoveAll(t => t.IsCompleted);
         if (Tasks.Count > 0) return null;
-        if (_actChange is { } act)
+        if (Book.ActChange is { } act)
         {
             if (run.CurrentActIndex == act) return null;
-            _actChange = null;
+            Book.ActChange = null;
         }
         if (CombatManager.Instance.IsInProgress) return Stable(run) ? Combat(run) : null;
         switch (run.CurrentRoom)
         {
             case CombatRoom combat:
                 if (!combat.IsPreFinished) return null;
+                if (Horizon) return new Decision("horizon", []);
                 if (Mark(combat, "offered"))
                 {
                     if (combat.Encounter.ShouldGiveRewards) Track(combat.OfferRoomEndRewards());
@@ -517,7 +594,7 @@ internal static class Game
         var map = run.Map;
         if (run.CurrentRoom?.RoomType == RoomType.Boss && !(map.SecondBossMapPoint != null && run.CurrentMapCoord == map.BossMapPoint.coord))
         {
-            _actChange = run.CurrentActIndex;
+            Book.ActChange = run.CurrentActIndex;
             Manager.ActChangeSynchronizer.SetLocalPlayerReady();
             return Task.CompletedTask;
         }
@@ -637,4 +714,14 @@ internal static class Game
             foe = Foe()
         };
     }
+}
+
+internal sealed class Ledger
+{
+    internal readonly List<RewardsSet> Frames = [];
+    internal readonly List<Task> Tasks = [];
+    internal readonly HashSet<(object Item, string Flag)> Marks = new(new Game.MarkComparer());
+    internal readonly Dictionary<Creature, int> Foes = new(ReferenceEqualityComparer.Instance);
+    internal CombatState? Combat;
+    internal int? ActChange;
 }
