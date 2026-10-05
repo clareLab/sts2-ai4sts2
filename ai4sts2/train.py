@@ -119,24 +119,36 @@ def actor(index, args, executable, published, version, lock, schedule, channel):
     net = make_net(layout, outcome, args)
     seen = -1
     translators = [Translator() for _ in range(len(pool))]
+    episodes = [None] * len(pool)
     segments = [None] * len(pool)
     decisions = [None] * len(pool)
-    weights, frontier = schedule
+    weights, frontier, utilities = schedule
+    archive = collections.deque(maxlen=args.archive)
 
     def begin(worker):
-        with weights.get_lock():
-            mix = list(weights[:])
-        c = rng.choices(range(len(characters)), weights=mix)[0]
-        ascension = frontier[c] if frontier[c] < TARGET and rng.random() < 0.5 else TARGET
-        seed = "".join(rng.choice(SEED_ALPHABET) for _ in range(10))
-        group = (characters[c], ascension)
+        if archive and rng.random() < args.restarts:
+            entry = rng.choices(archive, weights=[e["spread"] + 1e-6 for e in archive])[0]
+            group, seed = entry["group"], entry["seed"]
+            episodes[worker] = {"restart": entry, "phase": "replay", "actions": []}
+        else:
+            with weights.get_lock():
+                mix = list(weights[:])
+            c = rng.choices(range(len(characters)), weights=mix)[0]
+            ascension = frontier[c] if frontier[c] < TARGET and rng.random() < 0.5 else TARGET
+            seed = "".join(rng.choice(SEED_ALPHABET) for _ in range(10))
+            group = (characters[c], ascension)
+            episodes[worker] = {"restart": None, "phase": None, "actions": [], "start": None}
         segments[worker] = {"group": group, "seed": seed, "version": seen, "steps": []}
-        pool.send(worker, "begin", character=group[0], seed=seed, ascension=ascension)
+        pool.send(worker, "begin", character=group[0], seed=seed, ascension=group[1])
 
     def flush(worker, **ending):
         segment = segments[worker]
         if segment["steps"]:
             channel.put(("segment", {**segment, **ending}))
+
+    def remember(worker):
+        start, segment = episodes[worker]["start"], segments[worker]
+        archive.append({"group": segment["group"], "seed": segment["seed"]} | start)
 
     def absorb(worker, decision):
         if isinstance(decision, KernelError):
@@ -147,19 +159,59 @@ def actor(index, args, executable, published, version, lock, schedule, channel):
             begin(worker)
             return
         translators[worker].sync(pool.kernels[worker].vocab)
-        segment = segments[worker]
+        episode, segment = episodes[worker], segments[worker]
+        if episode["phase"] == "replay":
+            episode["phase"] = "resample"
+            pool.send(worker, "replay", actions=episode["restart"]["prefix"])
+            return
+        if episode["phase"] == "resample":
+            episode["phase"] = None
+            observation = translators[worker].canonical(decision["observation"], layout)
+            expected = episode["restart"]["observation"]
+            if any(not np.array_equal(observation[k], expected[k]) for k in expected):
+                channel.put(("divergence", segment["group"], segment["seed"]))
+                begin(worker)
+                return
+            pool.send(worker, "determinize", seed=rng.getrandbits(63))
+            return
+        state = decision["state"]
         if decision["kind"] == "end":
-            state, victory = decision["state"], bool(decision["victory"])
+            victory = bool(decision["victory"])
             target = outcome.target(state, victory)
             flush(worker, target=target)
-            channel.put(("episode", segment["group"], segment["seed"], target, victory, state))
+            if episode["restart"] is None:
+                if episode["start"] is not None and episode["start"]["room"] == "Monster":
+                    remember(worker)
+                channel.put(("episode", segment["group"], segment["seed"], target, victory, state))
+            else:
+                channel.put(("restart", episode["restart"]["room"], victory, state))
             begin(worker)
             return
         observation = translators[worker].canonical(decision["observation"], layout)
+        if episode["restart"] is not None and not state["combat"]:
+            flush(worker, bootstrap=observation)
+            channel.put(("restart", episode["restart"]["room"], True, state))
+            begin(worker)
+            return
+        if episode["restart"] is None:
+            if state["combat"] and episode["start"] is None:
+                prefix = list(episode["actions"])
+                episode["start"] = {"prefix": prefix, "room": state["room"], "spread": None}
+                episode["start"]["observation"] = observation
+            elif not state["combat"]:
+                episode["start"] = None
         if len(segment["steps"]) >= args.segment:
             flush(worker, bootstrap=observation)
             segments[worker] = {**segment, "version": seen, "steps": []}
         decisions[worker] = observation
+
+    def spread(group, logits):
+        c = characters.index(group[0])
+        offset = (c * (TARGET + 1) + group[1]) * outcome.bins
+        utility = np.frombuffer(utilities.get_obj(), np.float32)[offset : offset + outcome.bins]
+        probabilities = torch.softmax(logits, -1).numpy()
+        mean = probabilities @ utility
+        return float(np.sqrt(max(probabilities @ utility**2 - mean**2, 0.0)))
 
     for worker in range(len(pool)):
         begin(worker)
@@ -172,12 +224,20 @@ def actor(index, args, executable, published, version, lock, schedule, channel):
         if idle:
             batch = Batch([decisions[w] for w in idle], layout)
             with torch.no_grad():
-                distribution = torch.distributions.Categorical(logits=net(batch)[0])
+                logits, values = net(batch)
+                distribution = torch.distributions.Categorical(logits=logits)
                 actions = distribution.sample()
                 logps = distribution.log_prob(actions)
             for row, worker in enumerate(idle):
+                episode, segment = episodes[worker], segments[worker]
+                start = episode.get("start")
+                if start is not None and start["spread"] is None:
+                    start["spread"] = spread(segment["group"], values[row])
+                    if start["room"] in ("Elite", "Boss"):
+                        remember(worker)
                 action = int(actions[row])
-                segments[worker]["steps"].append((decisions[worker], action, float(logps[row])))
+                segment["steps"].append((decisions[worker], action, float(logps[row])))
+                episode["actions"].append(action)
                 decisions[worker] = None
                 try:
                     pool.send(worker, "step", index=action)
@@ -208,6 +268,11 @@ class Learner:
         self.frontier = self.context.Array(
             "i", [0 if args.frontier else TARGET] * len(self.characters), lock=False
         )
+        self.utilities = self.context.Array(
+            "f", len(self.characters) * (TARGET + 1) * self.outcome.bins
+        )
+        self.restarts = collections.defaultdict(lambda: [0, 0])
+        self.divergences = 0
         self.net = make_net(self.layout, self.outcome, args).to(self.device)
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=args.lr)
         self.updates = self.samples = self.episodes = self.failures = 0
@@ -236,7 +301,7 @@ class Learner:
                     self.published,
                     self.version,
                     self.lock,
-                    (self.weights, self.frontier),
+                    (self.weights, self.frontier, self.utilities),
                     self.channel,
                 ),
                 daemon=True,
@@ -265,6 +330,12 @@ class Learner:
             self.size += len(payload[0]["steps"])
         elif kind == "episode":
             self.record(*payload)
+        elif kind == "restart":
+            room, survived, _ = payload
+            self.restarts[room][0] += survived
+            self.restarts[room][1] += 1
+        elif kind == "divergence":
+            self.divergences += 1
         elif kind == "failure":
             self.failures += 1
             print(json.dumps({"failure": payload[0]}), flush=True)
@@ -292,6 +363,14 @@ class Learner:
         share = [loss / total if total else 1 / len(losses) for loss in losses]
         with self.weights.get_lock():
             self.weights[:] = [0.5 / len(losses) + 0.5 * s for s in share]
+        table = np.zeros((len(self.characters), TARGET + 1, self.outcome.bins), np.float32)
+        for c, character in enumerate(self.characters):
+            for ascension in range(TARGET + 1):
+                table[c, ascension] = self.outcome.utility(
+                    self.statistics.mass((character, ascension))
+                )
+        with self.utilities.get_lock():
+            np.frombuffer(self.utilities.get_obj(), np.float32)[:] = table.reshape(-1)
 
     def run(self):
         for process in self.actors:
@@ -315,6 +394,8 @@ class Learner:
                     "lag": round(lag, 2),
                     "episodes": self.episodes,
                     "failures": self.failures,
+                    "restarts": {room: v for room, v in sorted(self.restarts.items())},
+                    "divergences": self.divergences,
                     **stats,
                     "characters": self.summary(),
                 }
@@ -474,6 +555,8 @@ def main():
     parser.add_argument("--entropy", type=float, default=0.01)
     parser.add_argument("--lam", type=float, default=0.95)
     parser.add_argument("--reference", type=int, default=1024)
+    parser.add_argument("--restarts", type=float, default=0.0)
+    parser.add_argument("--archive", type=int, default=256)
     parser.add_argument("--save-minutes", type=float, default=10)
     args = parser.parse_args()
     torch.set_num_threads(2)
