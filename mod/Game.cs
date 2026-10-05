@@ -705,6 +705,7 @@ internal static class Game
             floor = run.TotalFloor,
             room = run.CurrentRoom?.RoomType.ToString(),
             combat = CombatManager.Instance.IsInProgress,
+            turn = player.PlayerCombatState?.TurnNumber ?? 0,
             hp = player.Creature.CurrentHp,
             max_hp = player.Creature.MaxHp,
             gold = player.Gold,

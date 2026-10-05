@@ -11,20 +11,21 @@ from scipy import stats
 
 from ai4sts2.features import Batch, Layout, Translator
 from ai4sts2.kernel import Kernel, KernelError, die_with_parent, engine
-from ai4sts2.train import ACTS, COMBATS, TARGET, Outcome, make_net, wilson
+from ai4sts2.search import Evaluator, search
+from ai4sts2.train import ACTS, COMBATS, TARGET, Outcome, Statistics, make_net, wilson
 
 COMBAT_NODES = {"MapPointType.Monster", "MapPointType.Elite", "MapPointType.Boss"}
 
 
 def load(checkpoint, layout):
     if checkpoint is None:
-        return None, None
+        return None, None, None
     state = torch.load(checkpoint, weights_only=True)
     args = argparse.Namespace(**state["args"])
     outcome = Outcome(args.outcome)
     net = make_net(layout, outcome, args)
     net.load_state_dict(state["net"])
-    return net.eval(), outcome
+    return net.eval(), outcome, Statistics(args.reference, state["statistics"])
 
 
 def play(index, args, executable, jobs, results):
@@ -32,7 +33,8 @@ def play(index, args, executable, jobs, results):
     torch.set_num_threads(1)
     kernel = Kernel(executable)
     layout = Layout.from_schema(kernel.schema)
-    net, outcome = load(args.checkpoint, layout)
+    net, outcome, statistics = load(args.checkpoint, layout)
+    generator = np.random.default_rng(index)
     for character, seed in jobs:
         rng = random.Random(f"{args.policy}:{character}:{seed}")
         translator = Translator()
@@ -54,14 +56,20 @@ def play(index, args, executable, jobs, results):
                 count = len(decision["options"])
                 if net is None:
                     action = rng.randrange(count)
+                elif args.policy == "search" and decision["kind"] == "combat" and count > 1:
+                    utility = outcome.utility(statistics.mass((character, args.ascension)))
+                    evaluator = Evaluator(kernel, net, layout, translator, outcome, utility)
+                    action, _ = search(
+                        evaluator, decision, args.simulations, args.width, generator, False
+                    )
                 else:
-                    batch = Batch([translator.canonical(decision["observation"], layout)], layout)
+                    observation = translator.canonical(decision["observation"], layout)
                     with torch.no_grad():
-                        logits, values = net(batch)
+                        logits, values = net(Batch([observation], layout))
                     if start is None and outcome.name == "wkch":
                         mass = torch.softmax(values[0], -1).numpy()
                         start = float(mass[2 * COMBATS : -1].sum() + mass[-1])
-                    if args.policy == "argmax":
+                    if args.policy != "sample":
                         action = int(logits[0].argmax())
                     else:
                         weights = torch.softmax(logits[0], -1).tolist()
@@ -217,7 +225,9 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run")
     run.add_argument("--checkpoint")
-    run.add_argument("--policy", choices=("argmax", "sample", "random"), default="argmax")
+    run.add_argument("--policy", choices=("argmax", "sample", "random", "search"), default="argmax")
+    run.add_argument("--simulations", type=int, default=32)
+    run.add_argument("--width", type=int, default=8)
     run.add_argument("--panel", default="EVAL")
     run.add_argument("--runs", type=int, default=200)
     run.add_argument("--ascension", type=int, default=TARGET)

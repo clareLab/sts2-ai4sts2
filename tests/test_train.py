@@ -7,7 +7,9 @@ import torch
 from ai4sts2.features import Batch, Layout, Translator
 from ai4sts2.kernel import Kernel, engine
 from ai4sts2.model import Net
+from ai4sts2.search import Evaluator, search
 from ai4sts2.train import ACTS, COMBATS, Outcome, vtrace, wilson
+from tests.test_kernel import branch, fingerprint
 
 
 def distributions(rng, count, bins):
@@ -100,3 +102,31 @@ def test_batched_forward_matches_single_observations():
             assert torch.allclose(logits[row, :width], single[0], atol=1e-4)
             assert torch.isinf(logits[row, width:]).all()
             assert torch.allclose(values[row], value[0], atol=1e-4)
+
+
+@pytest.mark.game
+def test_search_leaves_the_real_game_untouched():
+    arguments = {"seed": "SEARCH", "ascension": 10}
+    rng = random.Random(9)
+    with Kernel(engine()) as kernel:
+        arguments["character"] = kernel.hello["characters"][2]
+        layout = Layout.from_schema(kernel.schema)
+        outcome = Outcome("wkch")
+        net = Net(layout, outcome.bins).eval()
+        evaluator = Evaluator(
+            kernel, net, layout, Translator(), outcome, np.linspace(0, 1, outcome.bins)
+        )
+        prefix = []
+        decision = kernel.call("begin", **arguments)
+        while decision["kind"] != "combat" or len(decision["options"]) < 3:
+            prefix.append(rng.randrange(len(decision["options"])))
+            decision = kernel.call("step", index=prefix[-1])
+        root = fingerprint(kernel, decision)
+        action, improved = search(evaluator, decision, 8, 4, np.random.default_rng(0))
+        assert improved.sum() == pytest.approx(1)
+        restored = kernel.call("replay", actions=[])
+        assert fingerprint(kernel, restored) == root
+        searched = branch(kernel, kernel.call("step", index=action), 3)
+        kernel.call("begin", **arguments)
+        kernel.call("replay", actions=prefix)
+        assert branch(kernel, kernel.call("step", index=action), 3) == searched
