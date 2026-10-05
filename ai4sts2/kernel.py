@@ -50,13 +50,25 @@ def engine():
 
 
 class Kernel:
-    def __init__(self, executable, boot_timeout=120):
+    def __init__(self, executable, boot_timeout=120, connect=True):
         parent = ROOT / "artifacts/kernels"
         parent.mkdir(parents=True, exist_ok=True)
         self.directory = Path(tempfile.mkdtemp(prefix="kernel-", dir=parent))
         self.socket = None
         self.process = None
+        self.listener = None
         self.failed = False
+        self.boot_timeout = boot_timeout
+        try:
+            self._spawn(executable)
+            if connect:
+                self.connect()
+        except BaseException:
+            self.failed = True
+            self.close()
+            raise
+
+    def _spawn(self, executable):
         profile = self.directory / "data/SlayTheSpire2"
         settings = profile / "default/1/settings.save"
         settings.parent.mkdir(parents=True)
@@ -75,53 +87,57 @@ class Kernel:
         )
         (profile / ".ai4sts2-kernel").touch()
         address = self.directory / "kernel.sock"
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(address))
+        self.listener.listen(1)
+        self.listener.settimeout(1)
+        command = [
+            str(executable),
+            "--headless",
+            "--audio-driver",
+            "Dummy",
+            "--force-steam=off",
+            "--ai4sts2-kernel",
+        ]
+        if shutil.which("steam-run"):
+            command.insert(0, "steam-run")
+        self.log = (self.directory / "game.log").open("wb")
+        self.process = subprocess.Popen(
+            command,
+            cwd=Path(executable).parent,
+            env=os.environ
+            | {
+                "XDG_DATA_HOME": str(self.directory / "data"),
+                "XDG_CONFIG_HOME": str(self.directory / "config"),
+                "AI4STS2_SOCKET": str(address),
+            },
+            stdin=subprocess.DEVNULL,
+            stdout=self.log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        self.started = time.monotonic()
+
+    def connect(self):
         try:
-            listener.bind(str(address))
-            listener.listen(1)
-            listener.settimeout(1)
-            command = [
-                str(executable),
-                "--headless",
-                "--audio-driver",
-                "Dummy",
-                "--force-steam=off",
-                "--ai4sts2-kernel",
-            ]
-            if shutil.which("steam-run"):
-                command.insert(0, "steam-run")
-            self.log = (self.directory / "game.log").open("wb")
-            self.process = subprocess.Popen(
-                command,
-                cwd=Path(executable).parent,
-                env=os.environ
-                | {
-                    "XDG_DATA_HOME": str(self.directory / "data"),
-                    "XDG_CONFIG_HOME": str(self.directory / "config"),
-                    "AI4STS2_SOCKET": str(address),
-                },
-                stdin=subprocess.DEVNULL,
-                stdout=self.log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            deadline = time.monotonic() + boot_timeout
             while self.socket is None:
-                if self.process.poll() is not None or time.monotonic() > deadline:
-                    self.failed = True
+                if (
+                    self.process.poll() is not None
+                    or time.monotonic() > self.started + self.boot_timeout
+                ):
                     raise KernelError(f"Kernel did not connect. {self.tail()}")
                 try:
-                    self.socket, _ = listener.accept()
+                    self.socket, _ = self.listener.accept()
                 except TimeoutError:
                     pass
             self.socket.settimeout(None)
+            self.listener.close()
+            self.listener = None
             self.hello = self.call("hello")
         except BaseException:
             self.failed = True
             self.close()
             raise
-        finally:
-            listener.close()
 
     def tail(self, lines=40):
         path = self.directory / "game.log"
@@ -129,9 +145,19 @@ class Kernel:
         return "\n".join(text.splitlines()[-lines:])
 
     def call(self, op, **arguments):
+        self.send(op, **arguments)
+        return self.receive()
+
+    def send(self, op, **arguments):
         body = json.dumps({"op": op, **arguments}).encode()
         try:
             self.socket.sendall(HEADER.pack(len(body)) + body)
+        except OSError as error:
+            self.failed = True
+            raise KernelError(f"Kernel connection failed. {self.tail()}") from error
+
+    def receive(self):
+        try:
             response = json.loads(self._receive())
         except (OSError, EOFError) as error:
             self.failed = True
@@ -140,6 +166,9 @@ class Kernel:
             self.failed = True
             raise KernelError(response["error"])
         return response.get("result")
+
+    def fileno(self):
+        return self.socket.fileno()
 
     def _receive(self):
         header = self._exactly(HEADER.size)
@@ -156,25 +185,34 @@ class Kernel:
         return buffer
 
     def close(self):
+        if self.listener is not None:
+            self.listener.close()
+            self.listener = None
+        graceful = False
         if self.socket is not None:
             try:
                 if not self.failed:
                     self.call("close")
+                    graceful = True
             except KernelError:
                 pass
             self.socket.close()
             self.socket = None
         if self.process is not None:
+            if not graceful and self.process.poll() is None:
+                os.killpg(self.process.pid, signal.SIGKILL)
             try:
                 self.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.failed = True
                 os.killpg(self.process.pid, signal.SIGKILL)
                 self.process.wait()
-            if self.process.returncode:
+            if graceful and self.process.returncode:
                 self.failed = True
             self.process = None
+        if getattr(self, "log", None) is not None:
             self.log.close()
+            self.log = None
         if not self.failed:
             shutil.rmtree(self.directory, ignore_errors=True)
 

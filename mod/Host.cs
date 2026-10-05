@@ -3,6 +3,8 @@ using System.Net.Sockets;
 using System.Text.Json;
 using Godot;
 using MegaCrit.Sts2.Core.Assets;
+using GameLogger = MegaCrit.Sts2.Core.Logging.Logger;
+using LogLevel = MegaCrit.Sts2.Core.Logging.LogLevel;
 using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Saves;
 using MegaCrit.Sts2.Core.Settings;
@@ -23,6 +25,8 @@ internal static class Host
         if (DisplayServer.GetName() != "headless" || !File.Exists(ProjectSettings.GlobalizePath("user://.ai4sts2-kernel")))
             throw new InvalidOperationException("The kernel requires an isolated headless profile.");
         Headless.Install();
+        GameLogger.GlobalLogLevel = LogLevel.Warn;
+        foreach (var type in GameLogger.logLevelTypeMap.Keys.ToArray()) GameLogger.logLevelTypeMap[type] = LogLevel.Warn;
         NGame.Instance!.StartOnMainMenu = false;
         _socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
         _socket.Connect(new UnixDomainSocketEndPoint(System.Environment.GetEnvironmentVariable("AI4STS2_SOCKET")
