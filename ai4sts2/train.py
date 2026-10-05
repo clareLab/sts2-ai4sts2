@@ -491,6 +491,7 @@ class Learner:
                     "cycle": round(now - cycle, 2),
                     "wait": round(waited, 2),
                     "actors": self.throughput(now - cycle),
+                    "memory": self.memory(),
                     "lag": round(lag, 2),
                     "episodes": self.episodes,
                     "failures": self.failures,
@@ -516,6 +517,16 @@ class Learner:
             for process in self.actors:
                 process.kill()
             self.weights_path.unlink(missing_ok=True)
+
+    def memory(self):
+        status = Path("/proc/self/status").read_text().split("\n")
+        fields = dict(
+            line.split(":", 1) for line in status if line.startswith(("RssAnon", "RssShmem"))
+        )
+        result = {k: int(v.split()[0]) >> 10 for k, v in fields.items()}
+        if self.device.type == "xpu":
+            result["reserved"] = torch.xpu.memory_reserved() >> 20
+        return result
 
     def throughput(self, elapsed):
         steps, inference, busy = self.activity
@@ -625,6 +636,8 @@ class Learner:
         self.updates += 1
         self.samples += count
         self.publish()
+        if self.device.type == "xpu":
+            torch.xpu.empty_cache()
         clock.append(time.perf_counter())
         result = {key: round(float(np.mean(value)), 5) for key, value in stats.items()}
         result["passes"] = passes
