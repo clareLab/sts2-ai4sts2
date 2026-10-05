@@ -397,7 +397,15 @@ internal static class Game
             var failed = Tasks.FirstOrDefault(t => t.IsFaulted);
             if (failed != null) throw new InvalidOperationException("Official game logic failed.", failed.Exception);
             _progress = false;
-            if ((Current = Capture()) != null) return Current;
+            if ((Current = Capture()) != null)
+            {
+                if (Current.Options.Length != 1) return Current;
+                var forced = Current.Options[0];
+                Current = null;
+                Track(forced.Execute());
+                timer.Restart();
+                continue;
+            }
             if (_progress) continue;
             if (timer.Elapsed.TotalSeconds > 30) throw new TimeoutException($"No decision in {Run?.CurrentRoom?.GetType().Name} at floor {Run?.TotalFloor}.");
             string reason = $"{Run?.CurrentRoom?.GetType().Name}|loading={Manager.NetService.IsGameLoading}|exec={Manager.ActionExecutor.IsRunning}|queues={QueuesEmpty}|tasks={Tasks.Count(t => !t.IsCompleted)}|frames={Frames.Count}|act={Book.ActChange}|combat={CombatManager.Instance.IsInProgress}";
