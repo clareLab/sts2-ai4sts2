@@ -1,8 +1,11 @@
+import json
 import random
+import re
 
 import numpy as np
 import pytest
 
+from ai4sts2.features import CATEGORICAL
 from ai4sts2.kernel import Kernel, engine
 
 pytestmark = pytest.mark.game
@@ -34,16 +37,15 @@ def play(kernel, character, seed, steps):
 
 
 def fingerprint(kernel, decision):
-    observation = decision["observation"]
     tables = []
-    for name, values in observation.items():
-        columns = kernel.schema[name]
-        named = values.copy()
-        for index, column in enumerate(columns):
-            if column in {"model", "zone", "kind", "key", "type", "character", "room", "decision"}:
-                named[:, index] = [hash(kernel.vocab[int(v)]) % 1000003 for v in values[:, index]]
-        tables.append((name, named.shape, named.tobytes()))
-    return tuple(tables)
+    for name, values in decision["observation"].items():
+        named = values.astype(object)
+        for index, column in enumerate(kernel.schema[name]):
+            if column in CATEGORICAL or re.fullmatch(r"var\d+", column):
+                named[:, index] = [kernel.vocab[int(v)] for v in values[:, index]]
+        tables.append((name, named.shape, tuple(map(tuple, named))))
+    state = json.dumps(decision["state"])
+    return decision["kind"], tuple(decision["options"]), state, tuple(tables)
 
 
 def test_observation_matches_schema(kernel):
@@ -91,3 +93,18 @@ def test_map_segments_match_official(monkeypatch):
         while decision["kind"] != "end":
             decision = instance.call("step", index=rng.randrange(len(decision["options"])))
         assert decision["state"]["act"] >= 2
+
+
+def test_processes_agree():
+    rng = random.Random(1)
+    with Kernel(engine()) as first, Kernel(engine()) as second:
+        for character in first.hello["characters"]:
+            arguments = {"character": character, "seed": f"PAIR-{character}", "ascension": 10}
+            a = first.call("begin", invincible=True, **arguments)
+            b = second.call("begin", invincible=True, **arguments)
+            while True:
+                assert fingerprint(first, a) == fingerprint(second, b)
+                if a["kind"] == "end":
+                    break
+                index = rng.randrange(len(a["options"]))
+                a, b = first.call("step", index=index), second.call("step", index=index)

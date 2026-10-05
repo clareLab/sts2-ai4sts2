@@ -1,4 +1,5 @@
 import ctypes
+import hashlib
 import json
 import os
 import shutil
@@ -44,30 +45,27 @@ def game_directory():
     return Path(os.environ.get("STS2_DIR", default)).resolve()
 
 
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+
+
 def engine():
     source = game_directory()
     binary = source / "SlayTheSpire2"
     package = ROOT / "artifacts/dist/ai4sts2"
     if not binary.is_file() or not (package / "ai4sts2.dll").is_file():
         raise FileNotFoundError("Install STS2 and run scripts/build.sh first.")
-    target = ROOT / "artifacts/engine"
-    target.mkdir(parents=True, exist_ok=True)
-    for item in source.iterdir():
-        if item.name in {"mods", "steam_appid.txt"} or item.name.startswith("libsentry"):
-            continue
-        destination = target / item.name
-        if item.name == binary.name:
-            if (
-                not destination.exists()
-                or destination.stat().st_mtime_ns != item.stat().st_mtime_ns
-            ):
-                shutil.copy2(item, destination)
-        elif not destination.is_symlink():
-            destination.symlink_to(item.resolve())
-    mods = target / "mods"
-    if mods.exists():
-        shutil.rmtree(mods)
-    shutil.copytree(package, mods / "ai4sts2")
+    game = digest(source / "data_sts2_linuxbsd_x86_64/sts2.dll")
+    target = ROOT / "artifacts/engine" / f"{game}-{digest(package / 'ai4sts2.dll')}"
+    if not (target / binary.name).exists():
+        staging = target.with_name(f"{target.name}.{os.getpid()}")
+        ignore = shutil.ignore_patterns("mods", "steam_appid.txt", "libsentry*")
+        shutil.copytree(source, staging, copy_function=os.link, ignore=ignore)
+        shutil.copytree(package, staging / "mods/ai4sts2")
+        try:
+            staging.rename(target)
+        except OSError:
+            shutil.rmtree(staging, ignore_errors=True)
     return target / binary.name
 
 
