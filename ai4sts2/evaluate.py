@@ -2,6 +2,7 @@ import argparse
 import collections
 import json
 import multiprocessing as mp
+import queue
 import random
 from pathlib import Path
 
@@ -123,7 +124,12 @@ def evaluate(args):
     done, failures = 0, 0
     with output.open("w") as stream:
         while done < len(workers):
-            kind, *payload = results.get()
+            try:
+                kind, *payload = results.get(timeout=60)
+            except queue.Empty:
+                if any(process.is_alive() for process in workers):
+                    continue
+                raise RuntimeError("Evaluation workers exited early.") from None
             if kind == "run":
                 stream.write(json.dumps(payload[0]) + "\n")
             elif kind == "failure":
