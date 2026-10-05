@@ -5,7 +5,9 @@ import math
 import multiprocessing as mp
 import queue
 import random
+import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -88,6 +90,18 @@ def wilson(successes, trials, z=1.959964):
     margin = z * math.sqrt(p * (1 - p) / trials + z * z / (4 * trials * trials))
     scale = 1 + z * z / trials
     return (centre - margin) / scale, (centre + margin) / scale
+
+
+def vtrace(values, after, rho, lam, utility):
+    targets = np.empty_like(values)
+    advantages = np.empty(len(values), np.float32)
+    following = proposed = after
+    for t in range(len(values) - 1, -1, -1):
+        value = values[t]
+        advantages[t] = utility @ (following - value)
+        following = value + rho[t] * (proposed - value + lam * (following - proposed))
+        targets[t], proposed = following, value
+    return targets, advantages
 
 
 def make_net(layout, outcome, args):
@@ -355,17 +369,13 @@ class Learner:
                 tail += 1
             else:
                 after = segment["target"]
-            utility = utilities[segment["group"]]
-            following = proposed = after
-            for t in range(stop - 1, start - 1, -1):
-                value = distributions[t]
-                advantages[t] = utility @ (following - value)
-                following = (
-                    value
-                    + rho[t] * (proposed - value)
-                    + self.args.lam * rho[t] * (following - proposed)
-                )
-                targets[t], proposed = following, value
+            targets[start:stop], advantages[start:stop] = vtrace(
+                distributions[start:stop],
+                after,
+                rho[start:stop],
+                self.args.lam,
+                utilities[segment["group"]],
+            )
         advantages[:count] /= np.sqrt(np.mean(advantages[:count] ** 2)) + 1e-8
         clock.append(time.perf_counter())
         stats = collections.defaultdict(list)
@@ -467,6 +477,7 @@ def main():
     parser.add_argument("--save-minutes", type=float, default=10)
     args = parser.parse_args()
     torch.set_num_threads(2)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     Learner(args).run()
 
 
