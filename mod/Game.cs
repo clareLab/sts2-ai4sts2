@@ -213,8 +213,6 @@ internal static class Game
         return await Settle();
     }
 
-    internal static bool Horizon { get; set; }
-
     private sealed record Saved(Snapshot Graph, object Turn, long WinTime);
 
     private static readonly Dictionary<int, Saved> Saves = [];
@@ -398,7 +396,6 @@ internal static class Game
         {
             case CombatRoom combat:
                 if (!combat.IsPreFinished) return null;
-                if (Horizon) return new Decision("horizon", []);
                 if (Mark(combat, "offered"))
                 {
                     if (combat.Encounter.ShouldGiveRewards) Track(combat.OfferRoomEndRewards());

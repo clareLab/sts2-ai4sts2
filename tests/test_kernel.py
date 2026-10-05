@@ -136,7 +136,7 @@ def test_determinize_keeps_the_observation_and_resamples_the_future(kernel):
 def branch(kernel, decision, seed, steps=40):
     rng = random.Random(seed)
     trace = []
-    while decision["kind"] not in ("end", "horizon") and len(trace) < steps:
+    while decision["kind"] != "end" and decision["state"]["combat"] and len(trace) < steps:
         decision = kernel.call("step", index=rng.randrange(len(decision["options"])))
         trace.append(fingerprint(kernel, decision))
     return trace
@@ -146,29 +146,25 @@ def test_snapshots_restore_in_place_and_match_replay(kernel):
     arguments = {"character": kernel.hello["characters"][1], "seed": "SNAPSHOT", "ascension": 10}
     rng = random.Random(7)
     prefix = []
-    kernel.call("horizon", enabled=True)
-    try:
-        decision = kernel.call("begin", **arguments)
-        while decision["kind"] != "combat" or len(decision["options"]) < 3:
-            prefix.append(rng.randrange(len(decision["options"])))
-            decision = kernel.call("step", index=prefix[-1])
-        root = fingerprint(kernel, decision)
-        snapshot = kernel.call("snapshot")["id"]
-        traces = {}
-        for _ in range(3):
-            for seed in range(4):
-                restored = kernel.call("restore", id=snapshot)
-                assert fingerprint(kernel, restored) == root
-                trace = branch(kernel, restored, seed)
-                assert traces.setdefault(seed, trace) == trace
-        assert any(trace and trace[-1][0] in ("end", "horizon") for trace in traces.values())
-        for seed, trace in traces.items():
-            kernel.call("begin", **arguments)
-            replayed = kernel.call("replay", actions=prefix)
-            assert fingerprint(kernel, replayed) == root
-            assert branch(kernel, replayed, seed) == trace
-    finally:
-        kernel.call("horizon", enabled=False)
+    decision = kernel.call("begin", **arguments)
+    while decision["kind"] != "combat" or len(decision["options"]) < 3:
+        prefix.append(rng.randrange(len(decision["options"])))
+        decision = kernel.call("step", index=prefix[-1])
+    root = fingerprint(kernel, decision)
+    snapshot = kernel.call("snapshot")["id"]
+    traces = {}
+    for _ in range(3):
+        for seed in range(4):
+            restored = kernel.call("restore", id=snapshot)
+            assert fingerprint(kernel, restored) == root
+            trace = branch(kernel, restored, seed)
+            assert traces.setdefault(seed, trace) == trace
+    assert any(trace and json.loads(trace[-1][2])["combat"] is False for trace in traces.values())
+    for seed, trace in traces.items():
+        kernel.call("begin", **arguments)
+        replayed = kernel.call("replay", actions=prefix)
+        assert fingerprint(kernel, replayed) == root
+        assert branch(kernel, replayed, seed) == trace
 
 
 def test_resampling_reaches_every_random_stream(kernel):

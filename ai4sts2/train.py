@@ -235,7 +235,8 @@ def actor(index, args, executable, weights_path, schedule, connection):
             if episode["restart"] is None:
                 if episode["start"] is not None and episode["start"]["room"] == "Monster":
                     remember(worker)
-                channel.send(("episode", segment["group"], segment["seed"], target, victory, state))
+                message = ("episode", segment["group"], segment["seed"], target, victory, state)
+                channel.send(message + (searcher,))
             else:
                 channel.send(("restart", episode["restart"]["room"], victory, state))
             start(worker)
@@ -310,6 +311,7 @@ def actor(index, args, executable, weights_path, schedule, connection):
                     evaluator = Evaluator(
                         kernel, net, layout, translators[worker], outcome, utility(segment["group"])
                     )
+                    kernel.socket.settimeout(pool.patience)
                     try:
                         action, target = search(
                             evaluator,
@@ -321,7 +323,9 @@ def actor(index, args, executable, weights_path, schedule, connection):
                     except Exception as error:
                         fail(worker, error)
                         continue
-                    logp = float(np.log(max(target[action], 1e-12)))
+                    finally:
+                        if kernel.socket is not None:
+                            kernel.socket.settimeout(None)
                 segment["steps"].append((decisions[worker], action, logp, target))
                 episode["actions"].append(action)
                 decisions[worker] = None
@@ -356,6 +360,7 @@ class Learner:
             "f", len(self.characters) * (TARGET + 1) * self.outcome.bins, lock=False
         )
         self.restarts = collections.defaultdict(lambda: [0, 0])
+        self.assisted = [0, 0]
         self.divergences = 0
         self.activity = np.zeros(3)
         self.net = make_net(self.layout, self.outcome, args).to(self.device)
@@ -438,10 +443,15 @@ class Learner:
             self.failures += 1
             print(json.dumps({"failure": payload[0]}), flush=True)
 
-    def record(self, group, seed, target, victory, state):
+    def record(self, group, seed, target, victory, state, searched):
         self.episodes += 1
-        self.statistics.add(group, target, victory)
+        if searched:
+            self.assisted[0] += victory
+            self.assisted[1] += 1
+        else:
+            self.statistics.add(group, target, victory)
         record = {"character": group[0], "ascension": group[1], "seed": seed, "victory": victory}
+        record["searched"] = searched
         record |= {k: state[k] for k in ("act", "floor", "won", "foe", "hp", "deck", "relics")}
         with (self.directory / "episodes.jsonl").open("a") as stream:
             stream.write(json.dumps(record) + "\n")
@@ -498,6 +508,7 @@ class Learner:
                     "respawns": self.respawns,
                     "restarts": {room: v for room, v in sorted(self.restarts.items())},
                     "divergences": self.divergences,
+                    "assisted": self.assisted,
                     **stats,
                     "characters": self.summary(),
                 }
@@ -564,7 +575,8 @@ class Learner:
                 logp = torch.log_softmax(logits.float(), -1).gather(1, taken[:, None])[:, 0]
                 current[chunk] = logp.cpu().numpy()
         clock.append(time.perf_counter())
-        rho = np.minimum(1.0, np.exp(current - behaviour))
+        searched = np.array([target is not None for target in imitation])
+        rho = np.where(searched, 1.0, np.minimum(1.0, np.exp(current - behaviour)))
         targets = np.zeros((count + len(tails), bins), np.float32)
         advantages = np.zeros(count + len(tails), np.float32)
         groups = {segment["group"] for segment in segments}
@@ -584,7 +596,8 @@ class Learner:
                 self.args.lam,
                 utilities[segment["group"]],
             )
-        scale = np.sqrt(np.mean(advantages[:count] ** 2))
+        policy_rows = ~searched[:count]
+        scale = np.sqrt(np.mean(advantages[:count][policy_rows] ** 2)) if policy_rows.any() else 0
         advantages[:count] = advantages[:count] / scale if scale > 1e-6 else 0
         clock.append(time.perf_counter())
         stats = collections.defaultdict(list)
@@ -597,9 +610,11 @@ class Learner:
                 chunk, batch = prepared[k]
                 if not (chunk < count).any():
                     continue
-                searched = np.array([imitation[i] is not None for i in chunk])
-                inside = torch.from_numpy((chunk < count) & ~searched).to(self.device)
+                assisted = searched[chunk]
+                inside = torch.from_numpy(chunk < count).to(self.device)
                 weight = inside.float() / self.args.minibatch
+                gradient = torch.from_numpy((chunk < count) & ~assisted).to(self.device)
+                policy_weight = gradient.float() / self.args.minibatch
                 logits, values = self.net(batch)
                 distribution = torch.distributions.Categorical(logits=logits)
                 taken = torch.from_numpy(actions[chunk]).to(self.device)
@@ -608,13 +623,13 @@ class Learner:
                 advantage = torch.from_numpy(advantages[chunk]).to(self.device)
                 clipped = torch.clamp(ratio, 1 - self.args.clip, 1 + self.args.clip)
                 surrogate = torch.min(ratio * advantage, clipped * advantage)
-                policy_loss = -(surrogate * weight).sum()
+                policy_loss = -(surrogate * policy_weight).sum()
                 target = torch.from_numpy(targets[chunk]).to(self.device)
                 value_loss = -((target * torch.log_softmax(values, -1)).sum(-1) * weight).sum()
-                entropy = (distribution.entropy() * weight).sum()
+                entropy = (distribution.entropy() * policy_weight).sum()
                 loss = policy_loss + value_loss - self.args.entropy * entropy
-                if searched.any():
-                    rows = np.flatnonzero(searched)
+                if assisted.any():
+                    rows = np.flatnonzero(assisted)
                     goal = np.zeros((len(rows), logits.shape[1]), np.float32)
                     for r, i in enumerate(chunk[rows]):
                         goal[r, : len(imitation[i])] = imitation[i]
@@ -632,7 +647,7 @@ class Learner:
                 stats["policy"].append(policy_loss.item())
                 stats["value"].append(value_loss.item())
                 stats["entropy"].append(entropy.item())
-                stats["clip"].append((clip * weight).sum().item())
+                stats["clip"].append((clip * policy_weight).sum().item())
         self.updates += 1
         self.samples += count
         self.publish()

@@ -58,7 +58,13 @@ def play(index, args, executable, jobs, results):
                 if net is None:
                     action = rng.randrange(count)
                 elif args.policy == "search" and decision["kind"] == "combat" and count > 1:
-                    utility = outcome.utility(statistics.mass((character, args.ascension)))
+                    mass = statistics.mass((character, args.ascension))
+                    mass = statistics.mass((character, TARGET)) if mass is None else mass
+                    if mass is None:
+                        raise ValueError(
+                            f"The checkpoint has no reference outcomes for {character}."
+                        )
+                    utility = outcome.utility(mass)
                     evaluator = Evaluator(kernel, net, layout, translator, outcome, utility)
                     action, _ = search(
                         evaluator, decision, args.simulations, args.width, generator, False
