@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from ai4sts2.features import CAPACITY, TOKENS
@@ -41,10 +42,25 @@ class Net(nn.Module):
                 tokens = tokens * item["weights"].unsqueeze(-1)
             flat = flat.index_add(0, item["position"], tokens)
         flat = flat.index_add(0, batch.receivers, flat[batch.senders])
-        hidden = flat.view(batch.size, batch.width, self.width)
-        hidden = self.norm(self.encoder(hidden, src_key_padding_mask=~batch.mask))
-        hidden = hidden.reshape(-1, self.width)
+        hidden = self.norm(self.encode(flat, batch))
         logits = self.policy(hidden[batch.option_positions]).squeeze(-1)
         logits = logits.masked_fill(~batch.option_mask, float("-inf"))
         value = self.value(hidden[batch.global_position])
         return logits, value
+
+    def encode(self, flat, batch):
+        x = flat[batch.tokens]
+        allowed = batch.mask[:, None, None, :]
+        for layer in self.encoder.layers:
+            attention = layer.self_attn
+            projected = F.linear(layer.norm1(x), attention.in_proj_weight, attention.in_proj_bias)
+            padded = projected.new_zeros(len(flat), 3 * self.width).index_copy(
+                0, batch.tokens, projected
+            )
+            q, k, v = padded.view(batch.size, batch.width, 3, attention.num_heads, -1).permute(
+                2, 0, 3, 1, 4
+            )
+            mixed = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed).transpose(1, 2)
+            x = x + attention.out_proj(mixed.reshape(len(flat), self.width)[batch.tokens])
+            x = x + layer.linear2(F.relu(layer.linear1(layer.norm2(x))))
+        return flat.new_zeros(flat.shape).index_copy(0, batch.tokens, x)
