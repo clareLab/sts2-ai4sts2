@@ -31,7 +31,7 @@ def engine():
     target = ROOT / "artifacts/engine"
     target.mkdir(parents=True, exist_ok=True)
     for item in source.iterdir():
-        if item.name in {"mods", "steam_appid.txt"}:
+        if item.name in {"mods", "steam_appid.txt"} or item.name.startswith("libsentry"):
             continue
         destination = target / item.name
         if item.name == binary.name:
@@ -99,8 +99,6 @@ class Kernel:
             "--force-steam=off",
             "--ai4sts2-kernel",
         ]
-        if shutil.which("steam-run"):
-            command.insert(0, "steam-run")
         self.log = (self.directory / "game.log").open("wb")
         self.process = subprocess.Popen(
             command,

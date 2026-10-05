@@ -24,7 +24,9 @@ internal static class Host
     {
         if (DisplayServer.GetName() != "headless" || !File.Exists(ProjectSettings.GlobalizePath("user://.ai4sts2-kernel")))
             throw new InvalidOperationException("The kernel requires an isolated headless profile.");
+        System.Runtime.CompilerServices.RuntimeHelpers.RunClassConstructor(typeof(MegaCrit.Sts2.Core.AutoSlay.AutoSlayer).TypeHandle);
         Headless.Install();
+        Patches.Install();
         GameLogger.GlobalLogLevel = LogLevel.Warn;
         foreach (var type in GameLogger.logLevelTypeMap.Keys.ToArray()) GameLogger.logLevelTypeMap[type] = LogLevel.Warn;
         NGame.Instance!.StartOnMainMenu = false;

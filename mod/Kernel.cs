@@ -6,30 +6,42 @@ namespace ai4sts2;
 
 internal static class Kernel
 {
-    internal static async Task<object> Handle(string op, JsonElement request)
+    internal static async Task<object> Handle(string op, JsonElement request) => op switch
     {
-        switch (op)
+        "hello" => new
         {
-            case "hello":
-                return new
-                {
-                    game = ReleaseInfoManager.Instance.ReleaseInfo?.Version,
-                    commit = ReleaseInfoManager.Instance.ReleaseInfo?.Commit,
-                    characters = ModelDb.AllCharacters.Select(c => c.Id.Entry).ToArray()
-                };
-            case "begin":
-                await Session.Begin(request.GetProperty("character").GetString()!, request.GetProperty("seed").GetString()!, request.GetProperty("ascension").GetInt32());
-                return new { room = Session.Run!.CurrentRoom?.RoomType.ToString(), floor = Session.Run.TotalFloor };
-            case "combat":
-                await Session.EnterCombat();
-                return Session.Combat();
-            case "act":
-                await Session.Act(request.GetProperty("index").GetInt32(), request.GetProperty("choice").GetInt32());
-                return Session.Combat();
-            case "frames":
-                return Session.Frames;
-            default:
-                throw new ArgumentException($"Unknown operation: {op}");
+            game = ReleaseInfoManager.Instance.ReleaseInfo?.Version,
+            commit = ReleaseInfoManager.Instance.ReleaseInfo?.Commit,
+            characters = ModelDb.AllCharacters.Select(c => c.Id.Entry).ToArray()
+        },
+        "begin" => Describe(await Game.Begin(request.GetProperty("character").GetString()!, request.GetProperty("seed").GetString()!,
+            request.GetProperty("ascension").GetInt32(), request.TryGetProperty("invincible", out var invincible) && invincible.GetBoolean())),
+        "step" => Describe(await Game.Step(request.GetProperty("index").GetInt32())),
+        "waits" => Game.Waits,
+        "probe_nre" => ProbeNre(),
+        _ => throw new ArgumentException($"Unknown operation: {op}")
+    };
+
+    private static object ProbeNre()
+    {
+        try
+        {
+            object? value = request_null;
+            return value!.GetHashCode();
+        }
+        catch (NullReferenceException)
+        {
+            return "caught";
         }
     }
+
+    private static readonly object? request_null = null;
+
+    private static object Describe(Decision decision) => new
+    {
+        kind = decision.Kind,
+        victory = decision.Victory,
+        state = Game.Summary(),
+        options = decision.Options.Select(o => new { kind = o.Kind, data = o.Payload }).ToArray()
+    };
 }
