@@ -531,10 +531,13 @@ class Learner:
 
     def memory(self):
         status = Path("/proc/self/status").read_text().split("\n")
-        fields = dict(
-            line.split(":", 1) for line in status if line.startswith(("RssAnon", "RssShmem"))
-        )
-        result = {k: int(v.split()[0]) >> 10 for k, v in fields.items()}
+        anon = next(line for line in status if line.startswith("RssAnon"))
+        result = {"learner": int(anon.split()[1]) >> 10}
+        cgroup = Path("/proc/self/cgroup").read_text().split("::")[-1].strip("/\n")
+        group = Path("/sys/fs/cgroup") / cgroup
+        if (group / "memory.stat").exists():
+            stat = dict(line.split() for line in (group / "memory.stat").read_text().splitlines())
+            result |= {k: int(stat[k]) >> 20 for k in ("anon", "shmem")}
         if self.device.type == "xpu":
             result["reserved"] = torch.xpu.memory_reserved() >> 20
         return result
