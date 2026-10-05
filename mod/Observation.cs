@@ -3,6 +3,7 @@ using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Players;
+using MegaCrit.Sts2.Core.HoverTips;
 using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.MonsterMoves.Intents;
@@ -101,7 +102,7 @@ internal sealed class Encoder
         new("node", "row", "column", "type", "visited", "current", "next"),
         new("edge", "parent", "child"),
         new("cell", "x", "y", "hidden", "revealed", "item"),
-        new("option", "kind", "card", "creature", "relic", "potion", "node", "cell", "key", "value")
+        new("option", "kind", "card", "creature", "relic", "potion", "node", "cell", "key", "tip0", "tip1", "value")
     ];
 
     private readonly Dictionary<string, Table> _tables = Schema.ToDictionary(t => t.Name, t => new Table(t.Name, t.Columns));
@@ -248,10 +249,12 @@ internal sealed class Encoder
     internal int NextOption => T("option").Rows;
 
     internal int Option(string kind, int card = -1, int creature = -1, int relic = -1, int potion = -1, int node = -1, int cell = -1, string? key = null,
-        double value = 0)
+        double value = 0, IEnumerable<IHoverTip>? tips = null)
     {
         if (kind == "play") T("card").Set(card, "playable", 1);
-        return T("option").Add(Vocab.Id("option.", kind), card, creature, relic, potion, node, cell, Vocab.Id(key), (float)value);
+        var models = (tips ?? []).Select(t => t.CanonicalModel?.Id).Where(id => id != null).Distinct().Take(2).Select(Vocab.Id).ToArray();
+        return T("option").Add(Vocab.Id("option.", kind), card, creature, relic, potion, node, cell, Vocab.Id(key),
+            models.ElementAtOrDefault(0), models.ElementAtOrDefault(1), (float)value);
     }
 
     internal object Layout() => _tables.Values.ToDictionary(t => t.Name, t => t.Rows);

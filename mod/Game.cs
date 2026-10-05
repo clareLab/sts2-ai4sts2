@@ -473,7 +473,7 @@ internal static class Game
                 var choices = ev.CurrentOptions.Select((o, i) => (Option: o, Index: i))
                     .Where(x => !x.Option.IsLocked && !x.Option.IsProceed && !(DisableOnChosen(x.Option) && x.Option.WasChosen))
                     .Select(x => new Option("event", e => e.Option("event", relic: x.Option.Relic == null ? -1 : e.Relic(x.Option.Relic, "offer", e.NextOption),
-                        key: "event." + x.Option.TextKey), () =>
+                        key: "event." + x.Option.TextKey, tips: x.Option.HoverTips), () =>
                     {
                         Manager.EventSynchronizer.ChooseLocalOption(x.Index);
                         return Task.CompletedTask;

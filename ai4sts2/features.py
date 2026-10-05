@@ -28,6 +28,8 @@ CATEGORICAL = {
     "item",
     "kind",
     "key",
+    "tip0",
+    "tip1",
 }
 REFERENCES = {
     "power": {"owner": "creature"},
