@@ -1,4 +1,5 @@
 import random
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -76,6 +77,24 @@ def test_wilson_interval_brackets_the_estimate():
     low, high = wilson(30, 100)
     assert low < 0.3 < high
     assert wilson(0, 0) == (0.0, 1.0)
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_encoder_matches_the_official_transformer(training):
+    torch.manual_seed(0)
+    net = Net(SimpleNamespace(width=lambda table: 1), 9).train(training)
+    lengths = torch.tensor([5, 1, 9, 3])
+    width = int(lengths.max())
+    mask = torch.arange(width)[None, :] < lengths[:, None]
+    tokens = mask.reshape(-1).nonzero().squeeze(1)
+    batch = SimpleNamespace(size=len(lengths), width=width, mask=mask, tokens=tokens)
+    flat = torch.randn(len(lengths) * width, net.width) * mask.reshape(-1, 1)
+    with torch.set_grad_enabled(training):
+        hidden = flat.view(len(lengths), width, net.width)
+        official = net.encoder(hidden, src_key_padding_mask=~mask).reshape(-1, net.width)
+        packed = net.encode(flat, batch)
+    assert torch.allclose(packed[tokens], official[tokens], atol=1e-5)
+    assert not packed[~mask.reshape(-1)].any()
 
 
 @pytest.mark.game

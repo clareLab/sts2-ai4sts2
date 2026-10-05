@@ -3,6 +3,7 @@ using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Players;
+using MegaCrit.Sts2.Core.Hooks;
 using MegaCrit.Sts2.Core.HoverTips;
 using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
@@ -90,7 +91,7 @@ internal sealed class Encoder
     [
         new("global", "character", "ascension", "act", "act_floor", "floor", "gold", "hp", "max_hp", "block", "energy", "max_energy", "stars", "turn",
             "potion_slots", "orb_slots", "room", "decision", "in_combat", "draw", "discard", "exhaust", "deck", "boss", "second_boss", "act_model",
-            "event", "selection_min", "selection_max", "selection_chosen"),
+            "event", "selection_min", "selection_max", "selection_chosen", "extra_turn"),
         new("card", ["zone", "model", "upgrades", "cost", "base_cost", "x_cost", "star_cost", "type", "rarity", "target", "keywords", "enchantment",
             "enchantment_amount", "affliction", "affliction_amount", "playable", "selected", "offer", .. VarColumns]),
         new("relic", "zone", "model", "counter", "status", "used_up", "offer"),
@@ -127,7 +128,8 @@ internal sealed class Encoder
             Vocab.Id(run.CurrentRoom?.RoomType.ToString()), Vocab.Id("decision.", decision), inCombat ? 1 : 0,
             inCombat ? combat!.DrawPile.Cards.Count : 0, inCombat ? combat!.DiscardPile.Cards.Count : 0, inCombat ? combat!.ExhaustPile.Cards.Count : 0,
             player.Deck.Cards.Count, Vocab.Id(run.Act.BossEncounter?.Id), Vocab.Id(run.Act.SecondBossEncounter?.Id), Vocab.Id(run.Act.Id),
-            Vocab.Id(eventModel?.Id), selection?.Minimum ?? 0, selection?.Maximum ?? 0, selection?.Chosen.Count ?? 0);
+            Vocab.Id(eventModel?.Id), selection?.Minimum ?? 0, selection?.Maximum ?? 0, selection?.Chosen.Count ?? 0,
+            inCombat && Hook.ShouldTakeExtraTurn(player.Creature.CombatState!, player) ? 1 : 0);
         if (inCombat)
         {
             foreach (var card in combat!.Hand.Cards) Card(card, "hand");
@@ -252,7 +254,8 @@ internal sealed class Encoder
         double value = 0, IEnumerable<IHoverTip>? tips = null)
     {
         if (kind == "play") T("card").Set(card, "playable", 1);
-        var models = (tips ?? []).Select(t => t.CanonicalModel?.Id).Where(id => id != null).Distinct().Take(2).Select(Vocab.Id).ToArray();
+        var models = (tips ?? []).Select(t => t.CanonicalModel).OfType<AbstractModel>().DistinctBy(m => m.Id).OrderBy(m => m is RelicModel ? 0 : 1)
+            .Take(2).Select(m => Vocab.Id(m.Id)).ToArray();
         return T("option").Add(Vocab.Id("option.", kind), card, creature, relic, potion, node, cell, Vocab.Id(key),
             models.ElementAtOrDefault(0), models.ElementAtOrDefault(1), (float)value);
     }
