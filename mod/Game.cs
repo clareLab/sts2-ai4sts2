@@ -152,6 +152,15 @@ internal static class Game
         foreach (var enemy in state.Enemies) Foes[enemy] = Math.Max(Foes.GetValueOrDefault(enemy), enemy.MaxHp);
     }
 
+    private static int Won()
+    {
+        var run = Run!;
+        if (run.CurrentActIndex >= run.MapPointHistory.Count) return 0;
+        int count = run.MapPointHistory[run.CurrentActIndex].Sum(e => e.Rooms.Count(r => r.RoomType is RoomType.Monster or RoomType.Elite or RoomType.Boss));
+        if (run.CurrentRoom is CombatRoom && (CombatManager.Instance.IsInProgress || run.IsGameOver)) count--;
+        return Math.Max(0, count);
+    }
+
     private static float? Foe()
     {
         if (Run!.CurrentRoom is not CombatRoom || _combat == null || Foes.Count == 0) return null;
@@ -588,6 +597,7 @@ internal static class Game
             gold = player.Gold,
             deck = player.Deck.Cards.Count,
             relics = player.Relics.Count,
+            won = Won(),
             foe = Foe()
         };
     }

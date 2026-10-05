@@ -1,0 +1,473 @@
+import argparse
+import collections
+import json
+import math
+import multiprocessing as mp
+import queue
+import random
+import subprocess
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from ai4sts2.features import Batch, Layout, Translator, length
+from ai4sts2.kernel import ROOT, Kernel, KernelError, die_with_parent, engine
+from ai4sts2.model import Net
+from ai4sts2.pool import Pool
+
+ACTS = 3
+COMBATS = 18
+FLOORS = 64
+TARGET = 10
+SEED_ALPHABET = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+
+
+class Outcome:
+    def __init__(self, name):
+        self.name = name
+        self.cells = ACTS * COMBATS if name == "wkch" else FLOORS
+        self.bins = 2 * self.cells + 1
+
+    def target(self, state, victory):
+        result = np.zeros(self.bins, np.float32)
+        if victory:
+            result[-1] = 1
+            return result
+        if self.name == "wkch":
+            cell = min(state["act"], ACTS - 1) * COMBATS + min(state["won"], COMBATS - 1)
+        else:
+            cell = min(state["floor"], FLOORS - 1)
+        foe = state["foe"]
+        h = 0.0 if self.name == "floor" or foe is None else 1.0 - foe
+        result[2 * cell], result[2 * cell + 1] = 1 - h, h
+        return result
+
+    def utility(self, mass):
+        if self.name == "floor":
+            cells = np.arange(self.cells, dtype=np.float32)
+            return np.append(np.stack([cells, cells + 1], 1).reshape(-1), self.cells)
+        if mass is None:
+            return np.full(self.bins, 0.5, np.float32)
+        cells = mass[:-1:2] + mass[1:-1:2]
+        below = np.cumsum(cells) - cells
+        utility = np.stack([below, below + cells], 1).reshape(-1)
+        return np.append(utility, 1 - mass[-1] / 2).astype(np.float32)
+
+
+class Statistics:
+    def __init__(self, size, state=()):
+        self.history = collections.defaultdict(lambda: collections.deque(maxlen=size))
+        for group, records in state:
+            self.history[tuple(group)].extend((np.asarray(t), v) for t, v in records)
+
+    def add(self, group, target, victory):
+        self.history[group].append((target, victory))
+
+    def mass(self, group):
+        records = self.history.get(group)
+        return np.mean([target for target, _ in records], axis=0) if records else None
+
+    def wins(self, group):
+        records = self.history.get(group, ())
+        return sum(victory for _, victory in records), len(records)
+
+    def state(self):
+        return [
+            [list(group), [[t.tolist(), v] for t, v in records]]
+            for group, records in self.history.items()
+        ]
+
+
+def wilson_lower(successes, trials, z=1.959964):
+    if trials == 0:
+        return 0.0
+    p = successes / trials
+    centre = p + z * z / (2 * trials)
+    margin = z * math.sqrt(p * (1 - p) / trials + z * z / (4 * trials * trials))
+    return (centre - margin) / (1 + z * z / trials)
+
+
+def make_net(layout, outcome, args):
+    return Net(layout, outcome.bins, width=args.width, depth=args.depth)
+
+
+def actor(index, args, executable, published, version, lock, schedule, channel):
+    die_with_parent()
+    torch.set_num_threads(1)
+    rng = random.Random(f"{args.seed}:{index}:{time.time_ns()}")
+    outcome = Outcome(args.outcome)
+    pool = Pool(args.kernels, executable)
+    schema, characters = pool.kernels[0].schema, pool.kernels[0].hello["characters"]
+    layout = Layout.from_schema(schema)
+    net = make_net(layout, outcome, args)
+    seen = -1
+    translators = [Translator() for _ in range(len(pool))]
+    segments = [None] * len(pool)
+    decisions = [None] * len(pool)
+    weights, frontier = schedule
+
+    def begin(worker):
+        with weights.get_lock():
+            mix = list(weights[:])
+        c = rng.choices(range(len(characters)), weights=mix)[0]
+        ascension = frontier[c] if frontier[c] < TARGET and rng.random() < 0.5 else TARGET
+        seed = "".join(rng.choice(SEED_ALPHABET) for _ in range(10))
+        group = (characters[c], ascension)
+        segments[worker] = {"group": group, "seed": seed, "version": seen, "steps": []}
+        pool.send(worker, "begin", character=group[0], seed=seed, ascension=ascension)
+
+    def flush(worker, **ending):
+        segment = segments[worker]
+        if segment["steps"]:
+            channel.put(("segment", {**segment, **ending}))
+
+    def absorb(worker, decision):
+        if isinstance(decision, KernelError):
+            channel.put(("failure", str(decision)[-2000:]))
+            pool.restart(worker)
+            translators[worker] = Translator()
+            decisions[worker] = None
+            begin(worker)
+            return
+        translators[worker].sync(pool.kernels[worker].vocab)
+        segment = segments[worker]
+        if decision["kind"] == "end":
+            state, victory = decision["state"], bool(decision["victory"])
+            target = outcome.target(state, victory)
+            flush(worker, target=target)
+            channel.put(("episode", segment["group"], segment["seed"], target, victory, state))
+            begin(worker)
+            return
+        observation = translators[worker].canonical(decision["observation"], layout)
+        if len(segment["steps"]) >= args.segment:
+            flush(worker, bootstrap=observation)
+            segments[worker] = {**segment, "version": seen, "steps": []}
+        decisions[worker] = observation
+
+    for worker in range(len(pool)):
+        begin(worker)
+    while True:
+        if version.value != seen:
+            with lock:
+                net.load_state_dict(published.state_dict())
+                seen = version.value
+        idle = [w for w, d in enumerate(decisions) if d is not None and w not in pool.pending]
+        if idle:
+            batch = Batch([decisions[w] for w in idle], layout)
+            with torch.no_grad():
+                distribution = torch.distributions.Categorical(logits=net(batch)[0])
+                actions = distribution.sample()
+                logps = distribution.log_prob(actions)
+            for row, worker in enumerate(idle):
+                action = int(actions[row])
+                segments[worker]["steps"].append((decisions[worker], action, float(logps[row])))
+                decisions[worker] = None
+                try:
+                    pool.send(worker, "step", index=action)
+                except KernelError as error:
+                    absorb(worker, error)
+        for worker, decision in pool.receive(timeout=0 if idle else None):
+            absorb(worker, decision)
+
+
+class Learner:
+    def __init__(self, args):
+        self.args = args
+        self.directory = Path(args.output)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.device = torch.device("xpu" if torch.xpu.is_available() else "cpu")
+        torch.manual_seed(args.seed)
+        self.outcome = Outcome(args.outcome)
+        self.executable = engine()
+        with Kernel(self.executable) as kernel:
+            self.schema, self.hello = kernel.schema, kernel.hello
+        self.characters = self.hello["characters"]
+        self.layout = Layout.from_schema(self.schema)
+        self.context = mp.get_context("spawn")
+        self.channel = self.context.Queue(maxsize=2 * args.rollout // args.segment)
+        self.version = self.context.Value("q", 0, lock=False)
+        self.lock = self.context.Lock()
+        self.weights = self.context.Array("d", [1.0] * len(self.characters))
+        self.frontier = self.context.Array(
+            "i", [0 if args.frontier else TARGET] * len(self.characters), lock=False
+        )
+        self.net = make_net(self.layout, self.outcome, args)
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=args.lr)
+        self.updates = self.samples = self.episodes = self.failures = 0
+        statistics = ()
+        path = self.directory / "model.pt"
+        if path.exists():
+            state = torch.load(path, weights_only=True)
+            self.net.load_state_dict(state["net"])
+            self.optimizer.load_state_dict(state["optimizer"])
+            self.updates, self.samples = state["updates"], state["samples"]
+            self.episodes, statistics = state["episodes"], state["statistics"]
+            self.frontier[:] = state["frontier"]
+        self.statistics = Statistics(args.reference, statistics)
+        self.net.to(self.device)
+        self.published = make_net(self.layout, self.outcome, args).share_memory()
+        self.publish()
+        self.commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True
+        ).stdout.strip()
+        self.actors = [
+            self.context.Process(
+                target=actor,
+                args=(
+                    i,
+                    args,
+                    self.executable,
+                    self.published,
+                    self.version,
+                    self.lock,
+                    (self.weights, self.frontier),
+                    self.channel,
+                ),
+                daemon=True,
+            )
+            for i in range(args.actors)
+        ]
+        self.pending, self.size = [], 0
+
+    def publish(self):
+        with self.lock:
+            for target, source in zip(
+                self.published.parameters(), self.net.parameters(), strict=True
+            ):
+                target.data.copy_(source.data)
+            self.version.value = self.updates
+
+    def receive(self, block):
+        try:
+            kind, *payload = self.channel.get(timeout=60) if block else self.channel.get_nowait()
+        except queue.Empty:
+            if block and not all(process.is_alive() for process in self.actors):
+                raise RuntimeError("An actor process exited.") from None
+            return False
+        if kind == "segment":
+            self.pending.append(payload[0])
+            self.size += len(payload[0]["steps"])
+        elif kind == "episode":
+            self.record(*payload)
+        elif kind == "failure":
+            self.failures += 1
+            print(json.dumps({"failure": payload[0]}), flush=True)
+        return True
+
+    def record(self, group, seed, target, victory, state):
+        self.episodes += 1
+        self.statistics.add(group, target, victory)
+        record = {"character": group[0], "ascension": group[1], "seed": seed, "victory": victory}
+        record |= {k: state[k] for k in ("act", "floor", "won", "foe", "hp", "deck", "relics")}
+        with (self.directory / "episodes.jsonl").open("a") as stream:
+            stream.write(json.dumps(record) + "\n")
+
+    def schedule(self):
+        losses = []
+        for c, character in enumerate(self.characters):
+            wins, trials = self.statistics.wins((character, TARGET))
+            losses.append(1 - wins / trials if trials else 1.0)
+            while self.frontier[c] < TARGET:
+                wins, trials = self.statistics.wins((character, self.frontier[c]))
+                if trials < self.args.reference or wilson_lower(wins, trials) < 0.5:
+                    break
+                self.frontier[c] += 1
+        total = sum(losses)
+        share = [loss / total if total else 1 / len(losses) for loss in losses]
+        with self.weights.get_lock():
+            self.weights[:] = [0.5 / len(losses) + 0.5 * s for s in share]
+
+    def run(self):
+        for process in self.actors:
+            process.start()
+        deadline = time.monotonic() + self.args.minutes * 60
+        saved = time.monotonic()
+        try:
+            while time.monotonic() < deadline:
+                started = time.monotonic()
+                while self.size < self.args.rollout:
+                    self.receive(block=True)
+                waited = time.monotonic() - started
+                block, self.pending, self.size = self.pending, [], 0
+                lag = float(np.mean([self.updates - s["version"] for s in block]))
+                stats = self.update(block)
+                self.schedule()
+                report = {
+                    "update": self.updates,
+                    "samples": self.samples,
+                    "wait": round(waited, 2),
+                    "lag": round(lag, 2),
+                    "episodes": self.episodes,
+                    "failures": self.failures,
+                    **stats,
+                    "characters": self.summary(),
+                }
+                print(json.dumps(report), flush=True)
+                with (self.directory / "log.jsonl").open("a") as stream:
+                    stream.write(json.dumps(report) + "\n")
+                if time.monotonic() - saved > self.args.save_minutes * 60:
+                    self.save()
+                    saved = time.monotonic()
+        finally:
+            self.save()
+            for process in self.actors:
+                process.kill()
+
+    def batches(self, observations):
+        order = np.argsort([length(o) for o in observations], kind="stable")
+        for begin in range(0, len(order), self.args.minibatch):
+            chunk = order[begin : begin + self.args.minibatch]
+            yield chunk, Batch([observations[i] for i in chunk], self.layout).to(self.device)
+
+    def update(self, segments):
+        clock = [time.perf_counter()]
+        steps = [step for segment in segments for step in segment["steps"]]
+        count = len(steps)
+        tails = [s["bootstrap"] for s in segments if "bootstrap" in s]
+        actions = np.array([action for _, action, _ in steps] + [0] * len(tails))
+        behaviour = np.array([logp for _, _, logp in steps] + [0] * len(tails), np.float32)
+        prepared = list(self.batches([observation for observation, _, _ in steps] + tails))
+        clock.append(time.perf_counter())
+        bins = self.outcome.bins
+        current = np.zeros(count + len(tails), np.float32)
+        distributions = np.zeros((count + len(tails), bins), np.float32)
+        with torch.no_grad():
+            for chunk, batch in prepared:
+                logits, values = self.net(batch)
+                distributions[chunk] = torch.softmax(values.float(), -1).cpu().numpy()
+                taken = torch.from_numpy(actions[chunk]).to(self.device)
+                logp = torch.log_softmax(logits.float(), -1).gather(1, taken[:, None])[:, 0]
+                current[chunk] = logp.cpu().numpy()
+        clock.append(time.perf_counter())
+        rho = np.minimum(1.0, np.exp(current - behaviour))
+        targets = np.zeros((count + len(tails), bins), np.float32)
+        advantages = np.zeros(count + len(tails), np.float32)
+        groups = {segment["group"] for segment in segments}
+        utilities = {g: self.outcome.utility(self.statistics.mass(g)) for g in groups}
+        stop, tail = 0, count
+        for segment in segments:
+            start, stop = stop, stop + len(segment["steps"])
+            if "bootstrap" in segment:
+                after = distributions[tail]
+                tail += 1
+            else:
+                after = segment["target"]
+            utility = utilities[segment["group"]]
+            following = proposed = after
+            for t in range(stop - 1, start - 1, -1):
+                value = distributions[t]
+                advantages[t] = utility @ (following - value)
+                following = (
+                    value
+                    + rho[t] * (proposed - value)
+                    + self.args.lam * rho[t] * (following - proposed)
+                )
+                targets[t], proposed = following, value
+        advantages[:count] /= np.sqrt(np.mean(advantages[:count] ** 2)) + 1e-8
+        clock.append(time.perf_counter())
+        stats = collections.defaultdict(list)
+        passes = 0
+        while passes < self.args.passes and (passes == 0 or self.size < self.args.rollout):
+            passes += 1
+            for k in np.random.permutation(len(prepared)):
+                while self.size < self.args.rollout and self.receive(block=False):
+                    pass
+                chunk, batch = prepared[k]
+                inside = torch.from_numpy(chunk < count).to(self.device)
+                weight = inside.float() / inside.float().sum()
+                logits, values = self.net(batch)
+                distribution = torch.distributions.Categorical(logits=logits)
+                taken = torch.from_numpy(actions[chunk]).to(self.device)
+                old = torch.from_numpy(behaviour[chunk]).to(self.device)
+                ratio = torch.exp(distribution.log_prob(taken) - old)
+                advantage = torch.from_numpy(advantages[chunk]).to(self.device)
+                clipped = torch.clamp(ratio, 1 - self.args.clip, 1 + self.args.clip)
+                surrogate = torch.min(ratio * advantage, clipped * advantage)
+                policy_loss = -(surrogate * weight).sum()
+                target = torch.from_numpy(targets[chunk]).to(self.device)
+                value_loss = -((target * torch.log_softmax(values, -1)).sum(-1) * weight).sum()
+                entropy = (distribution.entropy() * weight).sum()
+                loss = policy_loss + value_loss - self.args.entropy * entropy
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), 0.5)
+                self.optimizer.step()
+                clip = ((ratio - 1).abs() > self.args.clip).float()
+                stats["policy"].append(policy_loss.item())
+                stats["value"].append(value_loss.item())
+                stats["entropy"].append(entropy.item())
+                stats["clip"].append((clip * weight).sum().item())
+        self.updates += 1
+        self.samples += count
+        self.publish()
+        clock.append(time.perf_counter())
+        result = {key: round(float(np.mean(value)), 5) for key, value in stats.items()}
+        result["passes"] = passes
+        result["rho"] = round(float(rho[:count].mean()), 4)
+        result["time"] = [round(b - a, 2) for a, b in zip(clock, clock[1:], strict=False)]
+        return result
+
+    def summary(self):
+        result = {}
+        for c, character in enumerate(self.characters):
+            records = self.statistics.history.get((character, TARGET), ())
+            if not records:
+                continue
+            targets = np.array([target for target, _ in list(records)[-200:]])
+            result[character] = {"win": round(float(targets[:, -1].mean()), 4)}
+            result[character]["frontier"] = self.frontier[c]
+            if self.outcome.name == "wkch":
+                cells = (targets[:, :-1:2] + targets[:, 1:-1:2]).reshape(-1, ACTS, COMBATS)
+                acts, won = cells.sum(2) @ np.arange(ACTS), cells.sum(1) @ np.arange(COMBATS)
+                result[character] |= {"act": round(float(acts.mean()), 3)}
+                result[character] |= {"won": round(float(won.mean()), 2)}
+        return result
+
+    def save(self):
+        state = {
+            "net": self.net.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "updates": self.updates,
+            "samples": self.samples,
+            "episodes": self.episodes,
+            "statistics": self.statistics.state(),
+            "frontier": list(self.frontier),
+            "game": self.hello.get("game"),
+            "commit": self.commit,
+            "args": vars(self.args),
+        }
+        temporary = self.directory / "model.pt.tmp"
+        torch.save(state, temporary)
+        temporary.replace(self.directory / "model.pt")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", default=str(ROOT / "artifacts/runs/train"))
+    parser.add_argument("--outcome", choices=("wkch", "wfh", "floor"), default="wkch")
+    parser.add_argument("--frontier", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--actors", type=int, default=4)
+    parser.add_argument("--kernels", type=int, default=3)
+    parser.add_argument("--minutes", type=float, default=60)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--width", type=int, default=128)
+    parser.add_argument("--depth", type=int, default=3)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--rollout", type=int, default=4096)
+    parser.add_argument("--segment", type=int, default=64)
+    parser.add_argument("--minibatch", type=int, default=512)
+    parser.add_argument("--passes", type=int, default=4)
+    parser.add_argument("--clip", type=float, default=0.2)
+    parser.add_argument("--entropy", type=float, default=0.01)
+    parser.add_argument("--lam", type=float, default=0.95)
+    parser.add_argument("--reference", type=int, default=1024)
+    parser.add_argument("--save-minutes", type=float, default=10)
+    args = parser.parse_args()
+    torch.set_num_threads(2)
+    Learner(args).run()
+
+
+if __name__ == "__main__":
+    main()

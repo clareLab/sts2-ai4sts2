@@ -1,16 +1,16 @@
 import torch
 from torch import nn
 
-from ai4sts2.features import TOKENS
+from ai4sts2.features import CAPACITY, TOKENS
 
 
 class Net(nn.Module):
-    def __init__(self, layout, capacity=16384, width=128, depth=3, heads=4):
+    def __init__(self, layout, bins, width=128, depth=3, heads=4):
         super().__init__()
         self.width = width
-        self.embed = nn.Embedding(capacity, width, padding_idx=0)
+        self.embed = nn.Embedding(CAPACITY, width, padding_idx=0)
         self.kind = nn.Embedding(len(TOKENS), width)
-        widths = {table: layout.width(table) for table in TOKENS if table != "pile"} | {"pile": 1}
+        widths = {table: layout.width(table) for table in TOKENS}
         self.numeric = nn.ModuleDict(
             {table: nn.Linear(size, width) for table, size in widths.items() if size}
         )
@@ -21,7 +21,7 @@ class Net(nn.Module):
         self.encoder = nn.TransformerEncoder(layer, depth, enable_nested_tensor=False)
         self.norm = nn.LayerNorm(width)
         self.policy = nn.Linear(width, 1)
-        self.value = nn.Sequential(nn.Linear(width, width), nn.GELU(), nn.Linear(width, 1))
+        self.value = nn.Sequential(nn.Linear(width, width), nn.GELU(), nn.Linear(width, bins))
 
     def forward(self, batch):
         flat = self.embed.weight.new_zeros(batch.size * batch.width, self.width)
@@ -37,7 +37,7 @@ class Net(nn.Module):
                 tokens = tokens + self.numeric[table](item["numeric"])
             if table == "card":
                 gates = torch.tanh(self.variable(item["variable_values"]))
-                tokens = tokens + (self.embed(item["variables"]) * gates).sum(1)
+                tokens = tokens + (self.embed(item["variables"]).sum(2) * gates).sum(1)
                 tokens = tokens * item["weights"].unsqueeze(-1)
             flat = flat.index_add(0, item["position"], tokens)
         flat = flat.index_add(0, batch.receivers, flat[batch.senders])
@@ -46,5 +46,5 @@ class Net(nn.Module):
         hidden = hidden.reshape(-1, self.width)
         logits = self.policy(hidden[batch.option_positions]).squeeze(-1)
         logits = logits.masked_fill(~batch.option_mask, float("-inf"))
-        value = self.value(hidden[batch.global_position]).squeeze(-1)
+        value = self.value(hidden[batch.global_position])
         return logits, value

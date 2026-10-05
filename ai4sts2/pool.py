@@ -1,15 +1,15 @@
 import selectors
 
-from ai4sts2.kernel import Kernel, engine
+from ai4sts2.kernel import Kernel, KernelError, engine
 
 
 class Pool:
     def __init__(self, count, executable=None):
-        executable = executable or engine()
+        self.executable = executable or engine()
         self.kernels = []
         try:
             for _ in range(count):
-                self.kernels.append(Kernel(executable, connect=False))
+                self.kernels.append(Kernel(self.executable, connect=False))
             for kernel in self.kernels:
                 kernel.connect()
         except BaseException:
@@ -34,8 +34,18 @@ class Pool:
             worker = key.data
             self.selector.unregister(key.fileobj)
             self.pending.discard(worker)
-            results.append((worker, self.kernels[worker].receive()))
+            try:
+                results.append((worker, self.kernels[worker].receive()))
+            except KernelError as error:
+                results.append((worker, error))
         return results
+
+    def restart(self, worker):
+        if worker in self.pending:
+            self.selector.unregister(self.kernels[worker])
+            self.pending.discard(worker)
+        self.kernels[worker].close()
+        self.kernels[worker] = Kernel(self.executable)
 
     def close(self):
         for kernel in self.kernels:

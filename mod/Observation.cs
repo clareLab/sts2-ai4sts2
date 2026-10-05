@@ -94,8 +94,8 @@ internal sealed class Encoder
             "enchantment_amount", "affliction", "affliction_amount", "playable", "selected", "offer", .. VarColumns]),
         new("relic", "zone", "model", "counter", "status", "used_up", "offer"),
         new("potion", "zone", "model", "slot", "usage", "offer"),
-        new("creature", "side", "model", "hp", "max_hp", "block", "alive", "hittable", "pet", "intent", "intent_damage", "intent_hits", "intent2",
-            "intent2_damage", "intent2_hits", "intents"),
+        new("creature", "side", "model", "hp", "max_hp", "hp_hidden", "block", "alive", "hittable", "pet", "intent", "intent_damage", "intent_hits",
+            "intent2", "intent2_damage", "intent2_hits", "intents"),
         new("power", "owner", "model", "amount", "type"),
         new("orb", "model", "passive", "evoke", "position"),
         new("node", "row", "column", "type", "visited", "current", "next"),
@@ -226,7 +226,9 @@ internal sealed class Encoder
         var (first, firstDamage, firstHits) = Intent(0);
         var (second, secondDamage, secondHits) = Intent(1);
         var model = creature.Monster?.Id ?? creature.Player?.Character.Id;
-        int row = T("creature").Add(Vocab.Id(creature.Side), Vocab.Id(model), creature.CurrentHp, creature.MaxHp, creature.Block,
+        bool hidden = creature.HpDisplay == HpDisplay.InfiniteWithoutNumbers || creature.Monster?.IsHealthBarVisible == false;
+        int row = T("creature").Add(Vocab.Id(creature.Side), Vocab.Id(model), hidden ? 0 : creature.CurrentHp, hidden ? 0 : creature.MaxHp,
+            hidden ? 1 : 0, creature.Block,
             creature.IsAlive ? 1 : 0, creature.IsHittable ? 1 : 0, creature.IsPet ? 1 : 0, first, firstDamage, firstHits, second, secondDamage,
             secondHits, intents.Length);
         _rows[creature] = row;
