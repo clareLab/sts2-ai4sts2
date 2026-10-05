@@ -181,7 +181,10 @@ def calibration(pairs, bins=10):
 
 
 def order(record):
-    return (record["victory"], record["act"], record["won"], 1 - (record["foe"] or 1))
+    if record["victory"]:
+        return (1,)
+    foe = record["foe"]
+    return (0, record["act"], record["won"], 0.0 if foe is None else 1.0 - foe)
 
 
 def compare(first, second):

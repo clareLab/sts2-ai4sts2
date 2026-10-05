@@ -150,7 +150,8 @@ internal static class Game
             _combat = state;
             Foes.Clear();
         }
-        foreach (var enemy in state.Enemies) Foes[enemy] = Math.Max(Foes.GetValueOrDefault(enemy), enemy.MaxHp);
+        foreach (var enemy in state.Enemies)
+            if (enemy.HpDisplay != HpDisplay.InfiniteWithoutNumbers) Foes[enemy] = Math.Max(Foes.GetValueOrDefault(enemy), enemy.MaxHp);
     }
 
     private static int Won()
@@ -165,7 +166,8 @@ internal static class Game
     private static float? Foe()
     {
         if (Run!.CurrentRoom is not CombatRoom || _combat == null || Foes.Count == 0) return null;
-        return (float)_combat.Enemies.Where(e => e.IsAlive && Foes.ContainsKey(e)).Sum(e => e.CurrentHp) / Math.Max(1, Foes.Values.Sum());
+        return (float)_combat.Enemies.Where(e => e.IsAlive && Foes.ContainsKey(e) && e.HpDisplay != HpDisplay.InfiniteWithoutNumbers)
+            .Sum(e => e.CurrentHp) / Math.Max(1, Foes.Values.Sum());
     }
 
     private static void Awarded(List<RelicPickingResult> results)
