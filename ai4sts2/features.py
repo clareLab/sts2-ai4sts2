@@ -89,6 +89,18 @@ class Translator:
     def __call__(self, values):
         return self.table[values.astype(np.int64)]
 
+    def canonical(self, observation, layout):
+        result = {}
+        for table, values in observation.items():
+            columns = layout.categorical.get(table, [])
+            if table == "card":
+                columns = columns + [v[0] for v in layout.variables]
+            if columns and len(values):
+                values = values.copy()
+                values[:, columns] = self.table[values[:, columns].astype(np.int64)]
+            result[table] = values
+        return result
+
 
 @dataclass
 class Layout:
@@ -144,7 +156,7 @@ def length(observation, schema):
 
 
 class Batch:
-    def __init__(self, observations, translators, layout, schema, vocabulary, combat_map=False):
+    def __init__(self, observations, layout, schema, vocabulary, combat_map=False):
         self.size = len(observations)
         card_columns = schema["card"]
         zone_column = card_columns.index("zone")
@@ -154,15 +166,15 @@ class Batch:
         in_combat = schema["global"].index("in_combat")
         entries = []
         counts = np.zeros((self.size, len(TOKENS)), dtype=np.int64)
-        for b, (observation, translate) in enumerate(zip(observations, translators, strict=True)):
-            entry = {"translate": translate}
+        for b, observation in enumerate(observations):
+            entry = {}
             for table in ORDER:
                 values = observation[table]
                 if table == "node" and observation["global"][0, in_combat] > 0 and not combat_map:
                     values = values[:0]
                 entry[table] = values
             cards = entry["card"]
-            zones = translate(cards[:, zone_column]) if len(cards) else np.zeros(0, np.int64)
+            zones = cards[:, zone_column].astype(np.int64)
             keep = ~np.isin(zones, pooled_ids) | (cards[:, offer_column] >= 0)
             referenced = entry["option"][:, option_card].astype(np.int64)
             keep[referenced[(referenced >= 0) & (referenced < len(cards))]] = True
@@ -207,12 +219,7 @@ class Batch:
             else:
                 slots = np.arange(len(stacked)) - row_starts[table][batch_index]
             positions[table] = starts[batch_index, t] + slots
-            categorical = np.concatenate(
-                [
-                    entry["translate"](entry[table][:, layout.categorical[table]])
-                    for entry in entries
-                ]
-            )
+            categorical = stacked[:, layout.categorical[table]]
             numeric = symlog(stacked[:, layout.numeric[table]]).astype(np.float32)
             item = {
                 "categorical": torch.from_numpy(categorical.astype(np.int64)),
@@ -224,9 +231,7 @@ class Batch:
                 bits = ((keywords[:, None] >> np.arange(KEYWORD_BITS)) & 1).astype(np.float32)
                 item["numeric"] = torch.from_numpy(np.concatenate([numeric, bits], axis=1))
                 columns = [v[0] for v in layout.variables]
-                variables = np.concatenate(
-                    [entry["translate"](entry["card"][:, columns]) for entry in entries]
-                )
+                variables = stacked[:, columns]
                 values = np.stack([stacked[:, [v[1], v[2]]] for v in layout.variables], axis=1)
                 item["variables"] = torch.from_numpy(variables.astype(np.int64))
                 item["variable_values"] = torch.from_numpy(symlog(values).astype(np.float32))
@@ -280,3 +285,14 @@ class Batch:
         valid = np.arange(width)[None, :] < self.options[:, None]
         self.option_positions = torch.from_numpy(base[:, None] + np.where(valid, index, 0))
         self.option_mask = torch.from_numpy(valid)
+
+    def to(self, device):
+        for item in self.tables.values():
+            for key, value in item.items():
+                if key == "references":
+                    item[key] = [(r.to(device, non_blocking=True), t) for r, t in value]
+                else:
+                    item[key] = value.to(device, non_blocking=True)
+        for key in ("global_position", "mask", "option_positions", "option_mask"):
+            setattr(self, key, getattr(self, key).to(device, non_blocking=True))
+        return self

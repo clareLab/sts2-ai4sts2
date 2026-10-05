@@ -108,12 +108,14 @@ class Trainer:
             self.decisions[worker] = None
             self.begin(worker)
             return
+        decision["observation"] = self.translators[worker].canonical(
+            decision["observation"], self.layout
+        )
         self.decisions[worker] = decision
 
     def act(self, workers):
         batch = Batch(
             [self.decisions[w]["observation"] for w in workers],
-            [self.translators[w] for w in workers],
             self.layout,
             self.schema,
             self.vocabulary,
@@ -134,7 +136,6 @@ class Trainer:
             trajectory.append(
                 {
                     "observation": self.decisions[worker]["observation"],
-                    "translator": self.translators[worker],
                     "action": action,
                     "logp": float(logps[row]),
                     "value": float(values[row]) * self.returns.std + self.returns.mean,
@@ -167,7 +168,6 @@ class Trainer:
         if waiting:
             batch = Batch(
                 [self.decisions[w]["observation"] for w in waiting],
-                [self.translators[w] for w in waiting],
                 self.layout,
                 self.schema,
                 self.vocabulary,
@@ -226,7 +226,6 @@ class Trainer:
             for chunk in chunks:
                 batch = Batch(
                     [samples[i]["observation"] for i in chunk],
-                    [samples[i]["translator"] for i in chunk],
                     self.layout,
                     self.schema,
                     self.vocabulary,

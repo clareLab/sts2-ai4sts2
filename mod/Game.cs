@@ -53,6 +53,8 @@ internal static class Game
     private static readonly AccessTools.FieldRef<ActionQueueSet, System.Collections.IList> ActionQueues =
         AccessTools.FieldRefAccess<ActionQueueSet, System.Collections.IList>("_actionQueues");
     private static readonly FieldInfo QueuedActions = AccessTools.Field(AccessTools.Inner(typeof(ActionQueueSet), "ActionQueue"), "actions");
+    private static readonly Dictionary<Creature, int> Foes = new(ReferenceEqualityComparer.Instance);
+    private static CombatState? _combat;
     private static IDisposable? _selectorScope;
     private static Exception? _fault;
     private static int? _actChange;
@@ -124,6 +126,8 @@ internal static class Game
         Tasks.Clear();
         Frames.Clear();
         Marks.Clear();
+        Foes.Clear();
+        _combat = null;
         _fault = null;
         _actChange = null;
         Run = null;
@@ -136,7 +140,23 @@ internal static class Game
     [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_pendingOptionTasks")]
     private static extern ref List<Task> PendingOptionTasks(EventSynchronizer synchronizer);
 
-    private static void AfterAction(GameAction action) => _fault ??= action.Exception;
+    private static void AfterAction(GameAction action)
+    {
+        _fault ??= action.Exception;
+        if (CombatManager.Instance.DebugOnlyGetState() is not { } state) return;
+        if (state != _combat)
+        {
+            _combat = state;
+            Foes.Clear();
+        }
+        foreach (var enemy in state.Enemies) Foes[enemy] = Math.Max(Foes.GetValueOrDefault(enemy), enemy.MaxHp);
+    }
+
+    private static float? Foe()
+    {
+        if (Run!.CurrentRoom is not CombatRoom || _combat == null || Foes.Count == 0) return null;
+        return (float)_combat.Enemies.Where(e => e.IsAlive && Foes.ContainsKey(e)).Sum(e => e.CurrentHp) / Math.Max(1, Foes.Values.Sum());
+    }
 
     private static void Awarded(List<RelicPickingResult> results)
     {
@@ -567,7 +587,8 @@ internal static class Game
             max_hp = player.Creature.MaxHp,
             gold = player.Gold,
             deck = player.Deck.Cards.Count,
-            relics = player.Relics.Count
+            relics = player.Relics.Count,
+            foe = Foe()
         };
     }
 }
