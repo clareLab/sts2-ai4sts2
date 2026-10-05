@@ -1,5 +1,7 @@
 using System.Reflection;
 using System.Reflection.Emit;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Godot;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Combat;
@@ -11,6 +13,7 @@ using MegaCrit.Sts2.Core.Entities.Merchant;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Events.Custom.CrystalSphereEvent;
 using MegaCrit.Sts2.Core.Hooks;
+using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Models.Events;
 using MegaCrit.Sts2.Core.Models.Potions;
@@ -41,7 +44,7 @@ internal static class Patches
         {
             typeof(SelectionContractPatch), typeof(BundleChoice), typeof(SphereScreen), typeof(MerchantRemoval), typeof(RealRules),
             typeof(Persistence), typeof(CancelWithoutFrame), typeof(NoRealDelay), typeof(TrialHeadless),
-            typeof(FoulPotionTarget), typeof(FoulPotionThrow), typeof(CosmeticOnly)
+            typeof(FoulPotionTarget), typeof(FoulPotionThrow), typeof(CosmeticOnly), typeof(MapSegments)
         })
             harmony.CreateClassProcessor(type).Patch();
     }
@@ -200,5 +203,83 @@ internal static class Patches
         }
 
         private static void Finalizer(bool __state) => TestMode.IsOn = __state;
+    }
+
+    [HarmonyPatch(typeof(MapPathPruning), nameof(MapPathPruning.FindMatchingSegments))]
+    private static class MapSegments
+    {
+        private static readonly Func<IReadOnlyList<MapPoint>, string> Key =
+            AccessTools.MethodDelegate<Func<IReadOnlyList<MapPoint>, string>>(AccessTools.Method(typeof(MapPathPruning), "GenerateSegmentKey"));
+        private static readonly Func<IEnumerable<MapPoint[]>, IReadOnlyList<MapPoint>, bool> Overlaps =
+            AccessTools.MethodDelegate<Func<IEnumerable<MapPoint[]>, IReadOnlyList<MapPoint>, bool>>(AccessTools.Method(typeof(MapPathPruning), "AnyOverlappingSegments"));
+        private static readonly bool Verify = System.Environment.GetEnvironmentVariable("AI4STS2_VERIFY_MAPS") == "1";
+        private static bool _original;
+
+        private static bool Prefix(MapPoint startingMapPoint, ref List<List<MapPoint[]>> __result)
+        {
+            if (_original) return true;
+            __result = Segments(startingMapPoint);
+            if (!Verify) return false;
+            _original = true;
+            try
+            {
+                var expected = MapPathPruning.FindMatchingSegments(startingMapPoint);
+                if (expected.Count != __result.Count || !expected.Zip(__result).All(p => p.First.Count == p.Second.Count
+                    && p.First.Zip(p.Second).All(s => s.First.SequenceEqual(s.Second))))
+                    throw new InvalidOperationException("Map segment search diverged from the official implementation.");
+            }
+            finally { _original = false; }
+            return false;
+        }
+
+        private static List<List<MapPoint[]>> Segments(MapPoint start)
+        {
+            var segments = new SortedDictionary<string, List<MapPoint[]>>(StringComparer.Ordinal);
+            var seen = new Dictionary<ulong, List<MapPoint[]>>();
+            var path = new List<MapPoint>();
+            var hashes = new List<ulong>();
+
+            void Visit(MapPoint point)
+            {
+                path.Add(point);
+                if (point.PointType == MapPointType.Boss) Emit();
+                else foreach (var child in point.Children) Visit(child);
+                path.RemoveAt(path.Count - 1);
+            }
+
+            void Emit()
+            {
+                int count = path.Count;
+                for (int i = 0; i < count - 1; i++)
+                {
+                    var first = path[i];
+                    if (first.Children.Count <= 1 && first.coord.row != 0) continue;
+                    ulong hash = (ulong)RuntimeHelpers.GetHashCode(first);
+                    for (int k = i + 1; k < count; k++)
+                    {
+                        hash = hash * 0x100000001b3UL ^ (ulong)RuntimeHelpers.GetHashCode(path[k]);
+                        if (k - i < 2 || path[k].parents.Count < 2) continue;
+                        var span = CollectionsMarshal.AsSpan(path).Slice(i, k - i + 1);
+                        if (seen.TryGetValue(hash, out var bucket) && Contains(bucket, span)) continue;
+                        var segment = span.ToArray();
+                        if (bucket == null) seen[hash] = bucket = [];
+                        bucket.Add(segment);
+                        string key = Key(segment);
+                        if (!segments.TryGetValue(key, out var list)) segments[key] = [segment];
+                        else if (!Overlaps(list, segment)) list.Add(segment);
+                    }
+                }
+            }
+
+            Visit(start);
+            return segments.Values.Where(list => list.Count > 1).ToList();
+        }
+
+        private static bool Contains(List<MapPoint[]> bucket, ReadOnlySpan<MapPoint> span)
+        {
+            foreach (var segment in bucket)
+                if (span.SequenceEqual(segment)) return true;
+            return false;
+        }
     }
 }

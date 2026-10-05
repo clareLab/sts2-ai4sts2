@@ -73,3 +73,21 @@ def test_every_character_reaches_a_decision(kernel):
     for character in kernel.hello["characters"]:
         trace, decision = play(kernel, character, f"SMOKE-{character}", 60)
         assert trace or decision["kind"] == "end"
+
+
+def test_map_segments_match_official(monkeypatch):
+    monkeypatch.setenv("AI4STS2_VERIFY_MAPS", "1")
+    rng = random.Random(0)
+    with Kernel(engine()) as instance:
+        characters = instance.hello["characters"]
+        for index in range(40):
+            seed = f"MAPS-{index}"
+            instance.call(
+                "begin", character=characters[index % len(characters)], seed=seed, ascension=10
+            )
+        decision = instance.call(
+            "begin", character=characters[0], seed="MAPS-ACTS", ascension=10, invincible=True
+        )
+        while decision["kind"] != "end":
+            decision = instance.call("step", index=rng.randrange(len(decision["options"])))
+        assert decision["state"]["act"] >= 2
