@@ -60,7 +60,7 @@ internal static class Game
     private static Player Me => Run!.Players[0];
     internal static RunState? Run { get; private set; }
     internal static Decision? Current { get; private set; }
-    internal static long Waits { get; private set; }
+    internal static Dictionary<string, int> Waits { get; } = new();
 
     static Game() => TaskHelper.UnobservedFault += error => _fault ??= error;
 
@@ -149,8 +149,11 @@ internal static class Game
         if (success && Run?.CurrentRoom is RestSiteRoom room) Marks.Add((room, "rested"));
     }
 
+    private static bool _progress;
+
     private static void Track(Task task)
     {
+        _progress = true;
         if (task.IsFaulted) throw new InvalidOperationException("Official game logic failed.", task.Exception);
         if (!task.IsCompleted) Tasks.Add(task);
     }
@@ -184,9 +187,12 @@ internal static class Game
             if (_fault != null) throw new InvalidOperationException("Official game logic failed.", _fault);
             var failed = Tasks.FirstOrDefault(t => t.IsFaulted);
             if (failed != null) throw new InvalidOperationException("Official game logic failed.", failed.Exception);
+            _progress = false;
             if ((Current = Capture()) != null) return Current;
+            if (_progress) continue;
             if (timer.Elapsed.TotalSeconds > 30) throw new TimeoutException($"No decision in {Run?.CurrentRoom?.GetType().Name} at floor {Run?.TotalFloor}.");
-            Waits++;
+            string reason = $"{Run?.CurrentRoom?.GetType().Name}|loading={Manager.NetService.IsGameLoading}|exec={Manager.ActionExecutor.IsRunning}|queues={QueuesEmpty}|tasks={Tasks.Count(t => !t.IsCompleted)}|frames={Frames.Count}|act={_actChange}|combat={CombatManager.Instance.IsInProgress}";
+            Waits[reason] = Waits.GetValueOrDefault(reason) + 1;
             await Host.Frame();
         }
     }

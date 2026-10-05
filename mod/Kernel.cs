@@ -17,7 +17,7 @@ internal static class Kernel
         "begin" => Describe(await Game.Begin(request.GetProperty("character").GetString()!, request.GetProperty("seed").GetString()!,
             request.GetProperty("ascension").GetInt32(), request.TryGetProperty("invincible", out var invincible) && invincible.GetBoolean())),
         "step" => Describe(await Game.Step(request.GetProperty("index").GetInt32())),
-        "waits" => Game.Waits,
+        "waits" => new { frames = Game.Waits, timings = Probe.Timings.ToDictionary(t => t.Key, t => new { count = t.Value.Count, ms = t.Value.Milliseconds }), gc = new[] { GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2) }, heap = GC.GetTotalMemory(false) },
         "probe_nre" => ProbeNre(),
         _ => throw new ArgumentException($"Unknown operation: {op}")
     };
