@@ -4,28 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ai4sts2"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.12,<3.13"
 authors = [{ name = "clareLab", email = "yaho@clarelab.moe" }]
-dependencies = [
-    "filelock>=4,<5",
-    "matplotlib>=3.10,<4",
-    "ray[tune]>=2.49,<3",
-    "sb3-contrib>=2.7,<3",
-    "scipy>=1.16,<2",
-    "syllabus-rl==0.7",
-    "torch>=2.8,<3",
-    "torchrl>=0.14,<0.15",
-]
-
-[project.scripts]
-ai4sts2 = "ai4sts2.cli:main"
+dependencies = ["numpy>=2,<3", "torch>=2.8,<3"]
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "ruff>=0.13,<1"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["training/ai4sts2"]
+packages = ["ai4sts2"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
@@ -38,11 +26,10 @@ explicit = true
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-include = ["training/**/*.py", "tests/test_*.py", "scripts/*.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-python_files = ["test_*.py"]
+markers = ["game: requires the installed game"]
