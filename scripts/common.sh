@@ -17,5 +17,7 @@ ai4sts2_game_paths() {
 ai4sts2_contained() {
   systemctl --user set-property --runtime ai4sts2.slice MemoryMax=20G MemorySwapMax=0 \
     ManagedOOMMemoryPressure=kill ManagedOOMMemoryPressureLimit=50%
-  exec systemd-run --user --scope --quiet --slice=ai4sts2.slice "$@"
+  local properties=()
+  while [[ "${1:-}" == -p ]]; do properties+=("$1" "$2"); shift 2; done
+  exec systemd-run --user --scope --quiet --slice=ai4sts2.slice "${properties[@]}" choom -n 1000 -- "$@"
 }
