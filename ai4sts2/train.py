@@ -25,35 +25,25 @@ from ai4sts2.search import Evaluator, search
 
 ACTS = 3
 COMBATS = 18
-FLOORS = 64
 TARGET = 10
 SEED_ALPHABET = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 
 
 class Outcome:
-    def __init__(self, name):
-        self.name = name
-        self.cells = ACTS * COMBATS if name == "wkch" else FLOORS
-        self.bins = 2 * self.cells + 1
+    cells = ACTS * COMBATS
+    bins = 2 * cells + 1
 
     def target(self, state, victory):
         result = np.zeros(self.bins, np.float32)
         if victory:
             result[-1] = 1
             return result
-        if self.name == "wkch":
-            cell = min(state["act"], ACTS - 1) * COMBATS + min(state["won"], COMBATS - 1)
-        else:
-            cell = min(state["floor"], FLOORS - 1)
-        foe = state["foe"]
-        h = 0.0 if self.name == "floor" or foe is None else 1.0 - foe
+        cell = min(state["act"], ACTS - 1) * COMBATS + min(state["won"], COMBATS - 1)
+        h = 0.0 if state["foe"] is None else 1.0 - state["foe"]
         result[2 * cell], result[2 * cell + 1] = 1 - h, h
         return result
 
     def utility(self, mass):
-        if self.name == "floor":
-            cells = np.arange(self.cells, dtype=np.float32)
-            return np.append(np.stack([cells, cells + 1], 1).reshape(-1), self.cells)
         if mass is None:
             return np.zeros(self.bins, np.float32)
         cells = mass[:-1:2] + mass[1:-1:2]
@@ -65,24 +55,24 @@ class Outcome:
 class Statistics:
     def __init__(self, size, state=()):
         self.history = collections.defaultdict(lambda: collections.deque(maxlen=size))
-        for group, records in state:
-            self.history[tuple(group)].extend((np.asarray(t), v) for t, v in records)
+        for character, records in state:
+            self.history[character].extend((np.asarray(t), v) for t, v in records)
 
-    def add(self, group, target, victory):
-        self.history[group].append((target, victory))
+    def add(self, character, target, victory):
+        self.history[character].append((target, victory))
 
-    def mass(self, group):
-        records = self.history.get(group)
+    def mass(self, character):
+        records = self.history.get(character)
         return np.mean([target for target, _ in records], axis=0) if records else None
 
-    def wins(self, group):
-        records = self.history.get(group, ())
+    def wins(self, character):
+        records = self.history.get(character, ())
         return sum(victory for _, victory in records), len(records)
 
     def state(self):
         return [
-            [list(group), [[t.tolist(), v] for t, v in records]]
-            for group, records in self.history.items()
+            [character, [[t.tolist(), v] for t, v in records]]
+            for character, records in self.history.items()
         ]
 
 
@@ -145,7 +135,7 @@ def actor(index, args, executable, weights_path, schedule, connection):
     channel = Outbox(connection, max(1, 2 * args.rollout // args.segment // args.actors))
     torch.set_num_threads(1)
     rng = random.Random(f"{args.seed}:{index}:{time.time_ns()}")
-    outcome = Outcome(args.outcome)
+    outcome = Outcome()
     searcher = index < args.searchers
     pool = Pool(1 if searcher else args.kernels, executable)
     schema, characters = pool.kernels[0].schema, pool.kernels[0].hello["characters"]
@@ -157,24 +147,21 @@ def actor(index, args, executable, weights_path, schedule, connection):
     segments = [None] * len(pool)
     decisions = [None] * len(pool)
     contexts = [None] * len(pool)
-    weights, frontier, utilities = schedule
+    weights, utilities = schedule
     archive = collections.deque(maxlen=args.archive)
     generator = np.random.default_rng([args.seed, index, time.time_ns()])
 
     def begin(worker):
         if archive and rng.random() < args.restarts:
             entry = rng.choices(archive, weights=[e["spread"] + 1e-6 for e in archive])[0]
-            group, seed = entry["group"], entry["seed"]
+            character, seed = entry["character"], entry["seed"]
             episodes[worker] = {"restart": entry, "phase": "replay", "actions": []}
         else:
-            mix = list(weights[:])
-            c = rng.choices(range(len(characters)), weights=mix)[0]
-            ascension = frontier[c] if frontier[c] < TARGET and rng.random() < 0.5 else TARGET
+            character = rng.choices(characters, weights=list(weights[:]))[0]
             seed = "".join(rng.choice(SEED_ALPHABET) for _ in range(10))
-            group = (characters[c], ascension)
             episodes[worker] = {"restart": None, "phase": None, "actions": [], "start": None}
-        segments[worker] = {"group": group, "seed": seed, "version": seen, "steps": []}
-        pool.send(worker, "begin", character=group[0], seed=seed, ascension=group[1])
+        segments[worker] = {"character": character, "seed": seed, "version": seen, "steps": []}
+        pool.send(worker, "begin", character=character, seed=seed, ascension=TARGET)
 
     def send(worker, op, **arguments):
         try:
@@ -220,7 +207,7 @@ def actor(index, args, executable, weights_path, schedule, connection):
 
     def remember(worker):
         start, segment = episodes[worker]["start"], segments[worker]
-        archive.append({"group": segment["group"], "seed": segment["seed"]} | start)
+        archive.append({"character": segment["character"], "seed": segment["seed"]} | start)
 
     def absorb(worker, decision):
         if isinstance(decision, Exception):
@@ -237,7 +224,7 @@ def actor(index, args, executable, weights_path, schedule, connection):
             observation = translators[worker].canonical(decision["observation"], layout)
             expected = episode["restart"]["observation"]
             if any(not np.array_equal(observation[k], expected[k]) for k in expected):
-                channel.send(("divergence", segment["group"], segment["seed"]))
+                channel.send(("divergence", segment["character"], segment["seed"]))
                 start(worker)
                 return
             send(worker, "determinize", seed=rng.getrandbits(63))
@@ -250,7 +237,7 @@ def actor(index, args, executable, weights_path, schedule, connection):
             if episode["restart"] is None:
                 if episode["start"] is not None and episode["start"]["room"] == "Monster":
                     remember(worker)
-                message = ("episode", segment["group"], segment["seed"], target, victory, state)
+                message = ("episode", segment["character"], segment["seed"], target, victory, state)
                 channel.send(message + (searcher,))
             else:
                 channel.send(("restart", episode["restart"]["room"], victory, state))
@@ -283,13 +270,12 @@ def actor(index, args, executable, weights_path, schedule, connection):
             and len(decision["options"]) > 1
         )
 
-    def utility(group):
-        c = characters.index(group[0])
-        offset = (c * (TARGET + 1) + group[1]) * outcome.bins
+    def utility(character):
+        offset = characters.index(character) * outcome.bins
         return np.frombuffer(utilities, np.float32)[offset : offset + outcome.bins].copy()
 
-    def spread(group, logits):
-        values = utility(group)
+    def spread(character, logits):
+        values = utility(character)
         probabilities = torch.softmax(logits, -1).numpy()
         mean = probabilities @ values
         return float(np.sqrt(max(probabilities @ values**2 - mean**2, 0.0)))
@@ -317,14 +303,19 @@ def actor(index, args, executable, weights_path, schedule, connection):
                 episode, segment = episodes[worker], segments[worker]
                 opening = episode.get("start")
                 if opening is not None and opening["spread"] is None:
-                    opening["spread"] = spread(segment["group"], values[row])
+                    opening["spread"] = spread(segment["character"], values[row])
                     if opening["room"] in ("Elite", "Boss"):
                         remember(worker)
                 action, logp, target = int(actions[row]), float(logps[row]), None
                 if searcher and eligible(worker):
                     kernel = pool.kernels[worker]
                     evaluator = Evaluator(
-                        kernel, net, layout, translators[worker], outcome, utility(segment["group"])
+                        kernel,
+                        net,
+                        layout,
+                        translators[worker],
+                        outcome,
+                        utility(segment["character"]),
                     )
                     kernel.socket.settimeout(pool.patience)
                     try:
@@ -359,7 +350,7 @@ class Learner:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.device = torch.device("xpu" if torch.xpu.is_available() else "cpu")
         torch.manual_seed(args.seed)
-        self.outcome = Outcome(args.outcome)
+        self.outcome = Outcome()
         self.executable = engine()
         with Kernel(self.executable) as kernel:
             self.schema, self.hello = kernel.schema, kernel.hello
@@ -368,11 +359,8 @@ class Learner:
         self.context = mp.get_context("spawn")
         self.weights_path = Path("/dev/shm") / f"ai4sts2-{os.getpid()}.pt"
         self.weights = self.context.Array("d", [1.0] * len(self.characters), lock=False)
-        self.frontier = self.context.Array(
-            "i", [0 if args.frontier else TARGET] * len(self.characters), lock=False
-        )
         self.utilities = self.context.Array(
-            "f", len(self.characters) * (TARGET + 1) * self.outcome.bins, lock=False
+            "f", len(self.characters) * self.outcome.bins, lock=False
         )
         self.restarts = collections.defaultdict(lambda: [0, 0])
         self.assisted = [0, 0]
@@ -389,8 +377,6 @@ class Learner:
             self.optimizer.load_state_dict(state["optimizer"])
             self.updates, self.samples = state["updates"], state["samples"]
             self.episodes, statistics = state["episodes"], state["statistics"]
-            if args.frontier:
-                self.frontier[:] = state["frontier"]
         self.statistics = Statistics(args.reference, statistics)
         self.publish()
         self.commit = subprocess.run(
@@ -401,7 +387,7 @@ class Learner:
         self.pending, self.size, self.respawns = [], 0, 0
 
     def spawn(self, index):
-        shared = (self.weights, self.frontier, self.utilities)
+        shared = (self.weights, self.utilities)
         reader, writer = self.context.Pipe(duplex=False)
         process = self.context.Process(
             target=actor,
@@ -458,14 +444,14 @@ class Learner:
             self.failures += 1
             print(json.dumps({"failure": payload[0]}), flush=True)
 
-    def record(self, group, seed, target, victory, state, searched):
+    def record(self, character, seed, target, victory, state, searched):
         self.episodes += 1
         if searched:
             self.assisted[0] += victory
             self.assisted[1] += 1
         else:
-            self.statistics.add(group, target, victory)
-        record = {"character": group[0], "ascension": group[1], "seed": seed, "victory": victory}
+            self.statistics.add(character, target, victory)
+        record = {"character": character, "seed": seed, "victory": victory}
         record["searched"] = searched
         record |= {k: state[k] for k in ("act", "floor", "won", "foe", "hp", "deck", "relics")}
         with (self.directory / "episodes.jsonl").open("a") as stream:
@@ -473,24 +459,14 @@ class Learner:
 
     def schedule(self):
         losses = []
-        for c, character in enumerate(self.characters):
-            wins, trials = self.statistics.wins((character, TARGET))
+        for character in self.characters:
+            wins, trials = self.statistics.wins(character)
             losses.append(1 - wins / trials if trials else 1.0)
-            while self.frontier[c] < TARGET:
-                wins, trials = self.statistics.wins((character, self.frontier[c]))
-                if trials < self.args.reference or wilson(wins, trials)[0] < 0.5:
-                    break
-                self.frontier[c] += 1
         total = sum(losses)
         share = [loss / total if total else 1 / len(losses) for loss in losses]
         self.weights[:] = [0.5 / len(losses) + 0.5 * s for s in share]
-        table = np.zeros((len(self.characters), TARGET + 1, self.outcome.bins), np.float32)
-        for c, character in enumerate(self.characters):
-            for ascension in range(TARGET + 1):
-                table[c, ascension] = self.outcome.utility(
-                    self.statistics.mass((character, ascension))
-                )
-        np.frombuffer(self.utilities, np.float32)[:] = table.reshape(-1)
+        table = [self.outcome.utility(self.statistics.mass(c)) for c in self.characters]
+        np.frombuffer(self.utilities, np.float32)[:] = np.concatenate(table)
 
     def run(self):
         deadline = time.monotonic() + self.args.minutes * 60
@@ -596,8 +572,8 @@ class Learner:
         rho = np.where(searched, 1.0, np.minimum(1.0, np.exp(current - behaviour)))
         targets = np.zeros((count + len(tails), bins), np.float32)
         advantages = np.zeros(count + len(tails), np.float32)
-        groups = {segment["group"] for segment in segments}
-        utilities = {g: self.outcome.utility(self.statistics.mass(g)) for g in groups}
+        characters = {segment["character"] for segment in segments}
+        utilities = {c: self.outcome.utility(self.statistics.mass(c)) for c in characters}
         stop, tail = 0, count
         for segment in segments:
             start, stop = stop, stop + len(segment["steps"])
@@ -611,7 +587,7 @@ class Learner:
                 after,
                 rho[start:stop],
                 self.args.lam,
-                utilities[segment["group"]],
+                utilities[segment["character"]],
             )
         policy_rows = ~searched[:count]
         scale = np.sqrt(np.mean(advantages[:count][policy_rows] ** 2)) if policy_rows.any() else 0
@@ -680,21 +656,19 @@ class Learner:
 
     def summary(self):
         result = {}
-        for c, character in enumerate(self.characters):
-            records = self.statistics.history.get((character, TARGET), ())
+        for character in self.characters:
+            records = self.statistics.history.get(character, ())
             if not records:
                 continue
             targets = np.array([target for target, _ in list(records)[-200:]])
             result[character] = {"win": round(float(targets[:, -1].mean()), 4)}
-            result[character]["frontier"] = self.frontier[c]
-            if self.outcome.name == "wkch":
-                losses = targets[:, -1] < 1
-                if losses.any():
-                    cells = targets[losses, :-1:2] + targets[losses, 1:-1:2]
-                    cells = cells.reshape(-1, ACTS, COMBATS)
-                    acts, won = cells.sum(2) @ np.arange(ACTS), cells.sum(1) @ np.arange(COMBATS)
-                    result[character] |= {"act": round(float(acts.mean()), 3)}
-                    result[character] |= {"won": round(float(won.mean()), 2)}
+            losses = targets[:, -1] < 1
+            if losses.any():
+                cells = targets[losses, :-1:2] + targets[losses, 1:-1:2]
+                cells = cells.reshape(-1, ACTS, COMBATS)
+                acts, won = cells.sum(2) @ np.arange(ACTS), cells.sum(1) @ np.arange(COMBATS)
+                result[character] |= {"act": round(float(acts.mean()), 3)}
+                result[character] |= {"won": round(float(won.mean()), 2)}
         return result
 
     def save(self, path=None):
@@ -705,7 +679,6 @@ class Learner:
             "samples": self.samples,
             "episodes": self.episodes,
             "statistics": self.statistics.state(),
-            "frontier": list(self.frontier),
             "game": self.hello.get("game"),
             "commit": self.commit,
             "args": vars(self.args),
@@ -720,8 +693,6 @@ class Learner:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default=str(ROOT / "artifacts/runs/train"))
-    parser.add_argument("--outcome", choices=("wkch", "wfh", "floor"), default="wkch")
-    parser.add_argument("--frontier", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--actors", type=int, default=4)
     parser.add_argument("--kernels", type=int, default=4)
     parser.add_argument("--minutes", type=float, default=60)

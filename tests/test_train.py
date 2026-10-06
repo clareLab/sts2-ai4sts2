@@ -50,9 +50,8 @@ def test_vtrace_targets_stay_distributions():
     assert np.isfinite(advantages).all()
 
 
-@pytest.mark.parametrize("name", ["wkch", "wfh"])
-def test_utility_is_monotone_in_outcome_order(name):
-    outcome = Outcome(name)
+def test_utility_is_monotone_in_outcome_order():
+    outcome = Outcome()
     rng = np.random.default_rng(3)
     mass = rng.random(outcome.bins)
     utility = outcome.utility(mass / mass.sum())
@@ -62,7 +61,7 @@ def test_utility_is_monotone_in_outcome_order(name):
 
 
 def test_outcome_targets_split_within_a_cell():
-    outcome = Outcome("wkch")
+    outcome = Outcome()
     state = {"act": 1, "won": 4, "floor": 22, "foe": 0.25}
     target = outcome.target(state, False)
     cell = COMBATS + 4
@@ -142,7 +141,7 @@ def test_search_leaves_the_real_game_untouched():
     with Kernel(engine()) as kernel:
         arguments["character"] = kernel.hello["characters"][2]
         layout = Layout.from_schema(kernel.schema)
-        outcome = Outcome("wkch")
+        outcome = Outcome()
         net = Net(layout, outcome.bins).eval()
         evaluator = Evaluator(
             kernel, net, layout, Translator(), outcome, np.linspace(0, 1, outcome.bins)

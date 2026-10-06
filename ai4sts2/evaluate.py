@@ -23,7 +23,7 @@ def load(checkpoint, layout):
         return None, None, None
     state = torch.load(checkpoint, weights_only=True)
     args = argparse.Namespace(**state["args"])
-    outcome = Outcome(args.outcome)
+    outcome = Outcome()
     net = make_net(layout, outcome, args)
     net.load_state_dict(state["net"])
     return net.eval(), outcome, Statistics(args.reference, state["statistics"])
@@ -58,8 +58,7 @@ def play(index, args, executable, jobs, results):
                 if net is None:
                     action = rng.randrange(count)
                 elif args.policy == "search" and decision["kind"] == "combat" and count > 1:
-                    mass = statistics.mass((character, args.ascension))
-                    mass = statistics.mass((character, TARGET)) if mass is None else mass
+                    mass = statistics.mass(character)
                     if mass is None:
                         raise ValueError(
                             f"The checkpoint has no reference outcomes for {character}."
@@ -73,7 +72,7 @@ def play(index, args, executable, jobs, results):
                     observation = translator.canonical(decision["observation"], layout)
                     with torch.no_grad():
                         logits, values = net(Batch([observation], layout))
-                    if start is None and outcome.name == "wkch":
+                    if start is None:
                         mass = torch.softmax(values[0], -1).numpy()
                         start = float(mass[2 * COMBATS : -1].sum() + mass[-1])
                     if args.policy != "sample":
