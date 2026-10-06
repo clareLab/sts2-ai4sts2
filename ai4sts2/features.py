@@ -28,6 +28,8 @@ CATEGORICAL = {
     "item",
     "kind",
     "key",
+    "tip0",
+    "tip1",
 }
 REFERENCES = {
     "power": {"owner": "creature"},
@@ -129,7 +131,15 @@ def length(observation):
 
 
 class Batch:
-    FIELDS = ("global_position", "mask", "option_positions", "option_mask", "receivers", "senders")
+    FIELDS = (
+        "global_position",
+        "mask",
+        "tokens",
+        "option_positions",
+        "option_mask",
+        "receivers",
+        "senders",
+    )
 
     def __init__(self, observations, layout):
         self.size = len(observations)
@@ -271,7 +281,9 @@ class Batch:
         }
         self.options = counts[:, option]
         self.global_position = torch.from_numpy(base + offsets[:, 0])
-        self.mask = torch.from_numpy(np.arange(self.width)[None, :] < self.lengths[:, None])
+        mask = np.arange(self.width)[None, :] < self.lengths[:, None]
+        self.mask = torch.from_numpy(mask)
+        self.tokens = torch.from_numpy(np.flatnonzero(mask))
         width = int(self.options.max())
         index = offsets[:, option][:, None] + np.arange(width)[None, :]
         valid = np.arange(width)[None, :] < self.options[:, None]

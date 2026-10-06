@@ -21,6 +21,7 @@ using MegaCrit.Sts2.Core.Helpers;
 using MegaCrit.Sts2.Core.Hooks;
 using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Models.Events;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
 using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Random;
@@ -213,8 +214,6 @@ internal static class Game
         return await Settle();
     }
 
-    internal static bool Horizon { get; set; }
-
     private sealed record Saved(Snapshot Graph, object Turn, long WinTime);
 
     private static readonly Dictionary<int, Saved> Saves = [];
@@ -257,12 +256,13 @@ internal static class Game
             if (timer.Elapsed.TotalSeconds > 30) throw new TimeoutException("The previous turn loop did not stop.");
             await Host.Frame();
         }
+        if (previous is { IsFaulted: true }) throw new InvalidOperationException("The previous turn loop failed.", previous.Exception);
         ((CancellationTokenSource)SourceField.GetValue(saved.Turn)!).Dispose();
         saved.Graph.Restore();
         Manager.WinTime = saved.WinTime;
         SourceField.SetValue(saved.Turn, new CancellationTokenSource());
         foreach (var signal in Signals) signal.SetValue(saved.Turn, Activator.CreateInstance(signal.PropertyType));
-        LoopField.SetValue(manager, Resume(saved.Turn));
+        LoopField.SetValue(manager, TaskHelper.RunSafely(Resume(saved.Turn)));
         Current = null;
         _fault = null;
         return await Settle();
@@ -296,19 +296,22 @@ internal static class Game
     }
 
     private static readonly AccessTools.FieldRef<RunRngSet, ulong> RunSeed = AccessTools.FieldRefAccess<RunRngSet, ulong>("<Seed>k__BackingField");
-    private static (object? Combat, Rng[] Streams) _streams;
+    private static (object? Combat, uint Newest, Rng[] Streams) _streams;
+    private static readonly AccessTools.FieldRef<PlayerRngSet, ulong> PlayerSeed = AccessTools.FieldRefAccess<PlayerRngSet, ulong>("<Seed>k__BackingField");
 
     internal static Decision Determinize(ulong seed)
     {
         var decision = Current ?? throw new InvalidOperationException("No decision is pending.");
         var run = Run!;
         var source = new Rng(seed);
-        if (!ReferenceEquals(_streams.Combat, Book.Combat) || _streams.Streams == null)
-            _streams = (Book.Combat, Snapshot.Reachable(typeof(Rng), run, CombatManager.Instance, Manager).Select(r => (Rng)r.Value).ToArray());
+        uint newest = Book.Combat?.Creatures.Max(c => c.CombatId ?? 0) ?? 0;
+        if (!ReferenceEquals(_streams.Combat, Book.Combat) || _streams.Newest != newest || _streams.Streams == null)
+            _streams = (Book.Combat, newest, Snapshot.Reachable(typeof(Rng), run, CombatManager.Instance, Manager).Select(r => (Rng)r.Value).ToArray());
         foreach (var rng in _streams.Streams) Reseed(rng, source);
         RunSeed(run.Rng) = source.NextUnsignedLong();
         foreach (var player in run.Players)
         {
+            PlayerSeed(player.PlayerRng) = source.NextUnsignedLong();
             if (player.PlayerCombatState?.DrawPile is not { } pile) continue;
             var cards = PileCards(pile);
             for (int i = cards.Count - 1; i > 0; i--)
@@ -320,18 +323,64 @@ internal static class Game
         return decision;
     }
 
-    internal static object Audit(ulong seed)
+    internal static readonly bool Audited = System.Environment.GetEnvironmentVariable("AI4STS2_AUDIT") == "1";
+    private static bool _auditing;
+    private static readonly HashSet<Rng> Drawn = new(ReferenceEqualityComparer.Instance);
+    private static readonly HashSet<Rng> Created = new(ReferenceEqualityComparer.Instance);
+    private static readonly Dictionary<Rng, string> Traces = new(ReferenceEqualityComparer.Instance);
+
+    internal static void Instrument(Harmony harmony)
     {
-        var rngs = Snapshot.Reachable(typeof(Rng), Run!, CombatManager.Instance, Manager);
-        var fields = new System.Text.Json.JsonSerializerOptions { IncludeFields = true };
-        var before = rngs.Select(r => System.Text.Json.JsonSerializer.Serialize(((Rng)r.Value).ToSerializable(), fields)).ToArray();
-        var graph = new Snapshot(Run!, CombatManager.Instance, Book, Manager, Manager.ActionQueueSet, Manager.ActionQueueSynchronizer,
-            Manager.PlayerChoiceSynchronizer, Manager.ActionExecutor, NetCombatCardDb.Instance, SaveManager.Instance.Progress);
-        Determinize(seed);
-        var untouched = rngs.Where((r, i) => System.Text.Json.JsonSerializer.Serialize(((Rng)r.Value).ToSerializable(), fields) == before[i])
-            .Select(r => r.Path).ToArray();
-        graph.Restore();
-        return new { total = rngs.Count, sample = before[0], untouched };
+        var draw = new HarmonyMethod(typeof(Game), nameof(OnDraw));
+        foreach (var method in typeof(Rng).GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.DeclaredOnly))
+            if (method.Name.StartsWith("Next") && !method.IsGenericMethodDefinition) harmony.Patch(method, prefix: draw);
+        var made = new HarmonyMethod(typeof(Game), nameof(OnCreate));
+        foreach (var constructor in typeof(Rng).GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+            harmony.Patch(constructor, postfix: made);
+    }
+
+    private static void OnDraw(Rng __instance)
+    {
+        if (_auditing && Drawn.Add(__instance)) Traces[__instance] = System.Environment.StackTrace;
+    }
+
+    private static void OnCreate(Rng __instance)
+    {
+        if (_auditing) Created.Add(__instance);
+    }
+
+    internal static async Task<object> Audit(ulong seed)
+    {
+        if (!Audited) throw new InvalidOperationException("Start the kernel with AI4STS2_AUDIT=1.");
+        int root = Save();
+        var random = new System.Random((int)seed);
+        Drawn.Clear();
+        Created.Clear();
+        Traces.Clear();
+        _auditing = true;
+        int steps = 0;
+        try
+        {
+            Determinize(seed);
+            var reseeded = new HashSet<Rng>(_streams.Streams, ReferenceEqualityComparer.Instance);
+            Created.Clear();
+            Drawn.Clear();
+            Traces.Clear();
+            var decision = Current!;
+            while (decision.Kind != "end" && CombatManager.Instance.IsInProgress && steps++ < 300)
+                decision = await Step(random.Next(decision.Options.Length));
+            _auditing = false;
+            var leaks = Drawn.Where(r => !reseeded.Contains(r) && !Created.Contains(r) && !ReferenceEquals(r, Rng.Chaotic))
+                .Select(r => string.Join(" < ", Traces[r].Split('\n').Select(l => l.Trim()).Where(l => l.StartsWith("at MegaCrit") && !l.StartsWith("at MegaCrit.Sts2.Core.Random"))
+                    .Take(5))).ToArray();
+            return new { reseeded = reseeded.Count, drawn = Drawn.Count, created = Created.Count, steps, chaotic = Drawn.Contains(Rng.Chaotic), leaks };
+        }
+        finally
+        {
+            _auditing = false;
+            await Load(root);
+            Drop(root);
+        }
     }
 
     private static void Reseed(Rng rng, Rng source) => rng.LoadFromSerializable(new Rng(source.NextUnsignedLong()).ToSerializable());
@@ -349,7 +398,15 @@ internal static class Game
             var failed = Tasks.FirstOrDefault(t => t.IsFaulted);
             if (failed != null) throw new InvalidOperationException("Official game logic failed.", failed.Exception);
             _progress = false;
-            if ((Current = Capture()) != null) return Current;
+            if ((Current = Capture()) != null)
+            {
+                if (Current.Options.Length != 1) return Current;
+                var forced = Current.Options[0];
+                Current = null;
+                Track(forced.Execute());
+                timer.Restart();
+                continue;
+            }
             if (_progress) continue;
             if (timer.Elapsed.TotalSeconds > 30) throw new TimeoutException($"No decision in {Run?.CurrentRoom?.GetType().Name} at floor {Run?.TotalFloor}.");
             string reason = $"{Run?.CurrentRoom?.GetType().Name}|loading={Manager.NetService.IsGameLoading}|exec={Manager.ActionExecutor.IsRunning}|queues={QueuesEmpty}|tasks={Tasks.Count(t => !t.IsCompleted)}|frames={Frames.Count}|act={Book.ActChange}|combat={CombatManager.Instance.IsInProgress}";
@@ -398,7 +455,6 @@ internal static class Game
         {
             case CombatRoom combat:
                 if (!combat.IsPreFinished) return null;
-                if (Horizon) return new Decision("horizon", []);
                 if (Mark(combat, "offered"))
                 {
                     if (combat.Encounter.ShouldGiveRewards) Track(combat.OfferRoomEndRewards());
@@ -410,11 +466,14 @@ internal static class Game
                 if (PendingOptionTasks(Manager.EventSynchronizer).Any(t => !t.IsCompleted)) return null;
                 var ev = Manager.EventSynchronizer.GetLocalEvent();
                 if (ev.Id != eventRoom.CanonicalEvent.Id) return null;
+                if (Marked(eventRoom, "left")) return Map(run);
+                if (ev is FakeMerchant fake) return new Decision("shop",
+                    [.. fake.StartedFight ? [] : Relics(fake.Inventory), new Option("leave", e => e.Option("leave"), () => Leave(eventRoom)), .. Potions(false)]);
                 if (ev.IsFinished) return Map(run);
                 var choices = ev.CurrentOptions.Select((o, i) => (Option: o, Index: i))
                     .Where(x => !x.Option.IsLocked && !x.Option.IsProceed && !(DisableOnChosen(x.Option) && x.Option.WasChosen))
                     .Select(x => new Option("event", e => e.Option("event", relic: x.Option.Relic == null ? -1 : e.Relic(x.Option.Relic, "offer", e.NextOption),
-                        key: "event." + x.Option.TextKey), () =>
+                        key: "event." + x.Option.TextKey, tips: x.Option.HoverTips), () =>
                     {
                         Manager.EventSynchronizer.ChooseLocalOption(x.Index);
                         return Task.CompletedTask;
@@ -566,9 +625,15 @@ internal static class Game
         return new Decision("map", [.. options, .. Potions(false)]);
     }
 
-    private static Decision Rewards(RewardsSet frame)
+    private static Decision? Rewards(RewardsSet frame)
     {
         var synchronizer = Manager.RewardsSetSynchronizer;
+        foreach (var reward in frame.Rewards.OfType<CardReward>())
+            if (!reward.SuccessfullySelected && Mark(reward, "peeked"))
+            {
+                Track(Pick(reward, -1, null));
+                return null;
+            }
         var options = new List<Option>();
         foreach (var reward in frame.Rewards.Where(r => !r.SuccessfullySelected))
         {
@@ -586,6 +651,7 @@ internal static class Game
             }
             else if (reward is not PotionReward || Me.HasOpenPotionSlots)
                 options.Add(new Option("reward", e => e.Option("reward", key: "reward." + reward.GetType().Name,
+                    card: reward is SpecialCardReward special && SpecialCard(special) is { } card ? e.Card(card, "offer", e.NextOption) : -1,
                     relic: reward is RelicReward { Relic: { } relic } ? e.Relic(relic, "offer", e.NextOption) : -1,
                     potion: reward is PotionReward { Potion: { } potion } ? e.Potion(potion, "offer", -1, e.NextOption) : -1,
                     value: reward is GoldReward gold ? gold.Amount : 0), () => synchronizer.SelectLocalReward(reward)));
@@ -600,6 +666,8 @@ internal static class Game
             }));
         return new Decision("rewards", [.. options, .. Potions(false)]);
     }
+
+    private static readonly AccessTools.FieldRef<SpecialCardReward, CardModel?> SpecialCard = AccessTools.FieldRefAccess<SpecialCardReward, CardModel?>("_card");
 
     private static Task Pick(CardReward reward, int card, string? alternative)
     {
@@ -630,10 +698,7 @@ internal static class Game
             if (entry is { IsStocked: true, EnoughGold: true, CreationResult: { } result } && Hook.ShouldAddToDeck(run, result.Card, out _))
                 options.Add(new Option("buy_card", e => e.Option("buy_card", card: e.Card(result.Card, "offer", e.NextOption), value: entry.Cost),
                     () => entry.OnTryPurchaseWrapper(inventory)));
-        foreach (var entry in inventory.RelicEntries)
-            if (entry is { IsStocked: true, EnoughGold: true, Model: { } relic })
-                options.Add(new Option("buy_relic", e => e.Option("buy_relic", relic: e.Relic(relic, "offer", e.NextOption), value: entry.Cost),
-                    () => entry.OnTryPurchaseWrapper(inventory)));
+        options.AddRange(Relics(inventory));
         foreach (var entry in inventory.PotionEntries)
             if (entry is { IsStocked: true, EnoughGold: true, Model: { } potion } && player.HasOpenPotionSlots && Hook.ShouldProcurePotion(run, null, potion, player))
                 options.Add(new Option("buy_potion", e => e.Option("buy_potion", potion: e.Potion(potion, "offer", -1, e.NextOption), value: entry.Cost),
@@ -643,6 +708,11 @@ internal static class Game
         options.Add(new Option("leave", e => e.Option("leave"), () => Leave(shop)));
         return new Decision("shop", [.. options, .. Potions(false)]);
     }
+
+    private static IEnumerable<Option> Relics(MerchantInventory inventory) =>
+        inventory.RelicEntries.Where(entry => entry is { IsStocked: true, EnoughGold: true, Model: not null }).Select(entry =>
+            new Option("buy_relic", e => e.Option("buy_relic", relic: e.Relic(entry.Model!, "offer", e.NextOption), value: entry.Cost),
+                () => entry.OnTryPurchaseWrapper(inventory)));
 
     private static Decision Select(Selection selection)
     {
@@ -686,15 +756,11 @@ internal static class Game
         int width = sphere.cells.GetLength(0), height = sphere.cells.GetLength(1);
         for (int x = 0; x < width; x++)
             for (int y = 0; y < height; y++)
-            {
-                var cell = sphere.cells[x, y];
-                bool near = false;
-                for (int dx = -1; dx <= 1 && !near; dx++)
-                    for (int dy = -1; dy <= 1 && !near; dy++)
-                        near = x + dx >= 0 && x + dx < width && y + dy >= 0 && y + dy < height && sphere.cells[x + dx, y + dy].IsHidden;
-                if (cell.IsHidden) options.Add(SphereOption(sphere, CrystalSphereMinigame.CrystalSphereToolType.Small, cell, x, y));
-                if (near) options.Add(SphereOption(sphere, CrystalSphereMinigame.CrystalSphereToolType.Big, cell, x, y));
-            }
+                if (sphere.cells[x, y].IsHidden)
+                {
+                    options.Add(SphereOption(sphere, CrystalSphereMinigame.CrystalSphereToolType.Small, sphere.cells[x, y], x, y));
+                    options.Add(SphereOption(sphere, CrystalSphereMinigame.CrystalSphereToolType.Big, sphere.cells[x, y], x, y));
+                }
         return new Decision("sphere", options.ToArray(), Prelude: e =>
         {
             var revealed = sphere.cells.Cast<CrystalSphereCell>().Where(c => c.Item != null).GroupBy(c => c.Item).Where(g => g.All(c => !c.IsHidden))
@@ -703,7 +769,8 @@ internal static class Game
                 for (int y = 0; y < height; y++)
                 {
                     var cell = sphere.cells[x, y];
-                    e.Cell(x, y, cell.IsHidden, cell.Item != null && revealed.Contains(cell.Item) ? cell.Item.GetType().Name : null);
+                    var item = cell.IsHidden ? null : cell.Item;
+                    e.Cell(x, y, cell.IsHidden, item != null && revealed.Contains(item), item?.GetType().Name);
                 }
         });
     }

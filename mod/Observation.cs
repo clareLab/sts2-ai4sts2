@@ -3,6 +3,8 @@ using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Players;
+using MegaCrit.Sts2.Core.Hooks;
+using MegaCrit.Sts2.Core.HoverTips;
 using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.MonsterMoves.Intents;
@@ -89,7 +91,7 @@ internal sealed class Encoder
     [
         new("global", "character", "ascension", "act", "act_floor", "floor", "gold", "hp", "max_hp", "block", "energy", "max_energy", "stars", "turn",
             "potion_slots", "orb_slots", "room", "decision", "in_combat", "draw", "discard", "exhaust", "deck", "boss", "second_boss", "act_model",
-            "event", "selection_min", "selection_max", "selection_chosen"),
+            "event", "selection_min", "selection_max", "selection_chosen", "extra_turn"),
         new("card", ["zone", "model", "upgrades", "cost", "base_cost", "x_cost", "star_cost", "type", "rarity", "target", "keywords", "enchantment",
             "enchantment_amount", "affliction", "affliction_amount", "playable", "selected", "offer", .. VarColumns]),
         new("relic", "zone", "model", "counter", "status", "used_up", "offer"),
@@ -100,8 +102,8 @@ internal sealed class Encoder
         new("orb", "model", "passive", "evoke", "position"),
         new("node", "row", "column", "type", "visited", "current", "next"),
         new("edge", "parent", "child"),
-        new("cell", "x", "y", "hidden", "item"),
-        new("option", "kind", "card", "creature", "relic", "potion", "node", "cell", "key", "value")
+        new("cell", "x", "y", "hidden", "revealed", "item"),
+        new("option", "kind", "card", "creature", "relic", "potion", "node", "cell", "key", "tip0", "tip1", "value")
     ];
 
     private readonly Dictionary<string, Table> _tables = Schema.ToDictionary(t => t.Name, t => new Table(t.Name, t.Columns));
@@ -126,7 +128,8 @@ internal sealed class Encoder
             Vocab.Id(run.CurrentRoom?.RoomType.ToString()), Vocab.Id("decision.", decision), inCombat ? 1 : 0,
             inCombat ? combat!.DrawPile.Cards.Count : 0, inCombat ? combat!.DiscardPile.Cards.Count : 0, inCombat ? combat!.ExhaustPile.Cards.Count : 0,
             player.Deck.Cards.Count, Vocab.Id(run.Act.BossEncounter?.Id), Vocab.Id(run.Act.SecondBossEncounter?.Id), Vocab.Id(run.Act.Id),
-            Vocab.Id(eventModel?.Id), selection?.Minimum ?? 0, selection?.Maximum ?? 0, selection?.Chosen.Count ?? 0);
+            Vocab.Id(eventModel?.Id), selection?.Minimum ?? 0, selection?.Maximum ?? 0, selection?.Chosen.Count ?? 0,
+            inCombat && Hook.ShouldTakeExtraTurn(player.Creature.CombatState!, player) ? 1 : 0);
         if (inCombat)
         {
             foreach (var card in combat!.Hand.Cards) Card(card, "hand");
@@ -232,7 +235,7 @@ internal sealed class Encoder
             creature.IsAlive ? 1 : 0, creature.IsHittable ? 1 : 0, creature.IsPet ? 1 : 0, first, firstDamage, firstHits, second, secondDamage,
             secondHits, intents.Length);
         _rows[creature] = row;
-        foreach (var power in creature.Powers) T("power").Add(row, Vocab.Id(power.Id), power.Amount, Vocab.Id(power.Type));
+        foreach (var power in creature.Powers.Where(p => p.IsVisible)) T("power").Add(row, Vocab.Id(power.Id), power.Amount, Vocab.Id(power.Type));
         return row;
     }
 
@@ -243,15 +246,18 @@ internal sealed class Encoder
         return row;
     }
 
-    internal int Cell(int x, int y, bool hidden, string? item) => T("cell").Add(x, y, hidden ? 1 : 0, Vocab.Id(item));
+    internal int Cell(int x, int y, bool hidden, bool revealed, string? item) => T("cell").Add(x, y, hidden ? 1 : 0, revealed ? 1 : 0, Vocab.Id(item));
 
     internal int NextOption => T("option").Rows;
 
     internal int Option(string kind, int card = -1, int creature = -1, int relic = -1, int potion = -1, int node = -1, int cell = -1, string? key = null,
-        double value = 0)
+        double value = 0, IEnumerable<IHoverTip>? tips = null)
     {
         if (kind == "play") T("card").Set(card, "playable", 1);
-        return T("option").Add(Vocab.Id("option.", kind), card, creature, relic, potion, node, cell, Vocab.Id(key), (float)value);
+        var models = (tips ?? []).Select(t => t.CanonicalModel).OfType<AbstractModel>().DistinctBy(m => m.Id).OrderBy(m => m is RelicModel ? 0 : 1)
+            .Take(2).Select(m => Vocab.Id(m.Id)).ToArray();
+        return T("option").Add(Vocab.Id("option.", kind), card, creature, relic, potion, node, cell, Vocab.Id(key),
+            models.ElementAtOrDefault(0), models.ElementAtOrDefault(1), (float)value);
     }
 
     internal object Layout() => _tables.Values.ToDictionary(t => t.Name, t => t.Rows);

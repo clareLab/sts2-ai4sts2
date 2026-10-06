@@ -7,6 +7,7 @@ from ai4sts2.features import Batch
 
 VISIT = 50
 SCALE = 0.1
+LINKS = ("card", "creature", "relic", "potion", "node", "cell")
 
 
 class Evaluator:
@@ -14,9 +15,12 @@ class Evaluator:
         self.kernel, self.net, self.layout = kernel, net, layout
         self.translator, self.outcome, self.utility = translator, outcome, utility
 
-    def forward(self, decision):
+    def observe(self, decision):
         self.translator.sync(self.kernel.vocab)
-        observation = self.translator.canonical(decision["observation"], self.layout)
+        return self.translator.canonical(decision["observation"], self.layout)
+
+    def forward(self, decision, observation=None):
+        observation = observation or self.observe(decision)
         with torch.inference_mode():
             logits, values = self.net(Batch([observation], self.layout))
         return logits[0].numpy(), float(self.utility @ torch.softmax(values[0], -1).numpy())
@@ -30,7 +34,7 @@ class Evaluator:
         self.kernel.call("restore", id=root)
         self.kernel.call("determinize", seed=seed)
         decision = self.kernel.call("step", index=action)
-        while decision["kind"] not in ("end", "horizon"):
+        while decision["kind"] != "end" and decision["state"]["combat"]:
             if decision["kind"] == "combat" and decision["state"]["turn"] > turn:
                 break
             logits, _ = self.forward(decision)
@@ -38,6 +42,37 @@ class Evaluator:
             action = int(rng.choice(len(weights), p=weights / weights.sum()))
             decision = self.kernel.call("step", index=action)
         return self.leaf(decision)
+
+
+def groups(observation, layout):
+    options = observation["option"]
+    columns = layout.columns["option"]
+    keys = {}
+    links = [columns[link] for link in LINKS]
+    for index, row in enumerate(options):
+        plain = row.copy()
+        plain[links] = 0
+        key = [plain.tobytes()]
+        for link, column in zip(LINKS, links, strict=True):
+            target = int(row[column])
+            key.append(observation[link][target].tobytes() if target >= 0 else b"-")
+        keys.setdefault(b"|".join(key), []).append(index)
+    return list(keys.values())
+
+
+def schedule(considered, simulations):
+    if considered <= 1:
+        return list(range(simulations))
+    rounds = math.ceil(math.log2(considered))
+    sequence, visits = [], [0] * considered
+    while len(sequence) < simulations:
+        extra = max(1, int(simulations / (rounds * considered)))
+        for _ in range(extra):
+            sequence.extend(visits[:considered])
+            for i in range(considered):
+                visits[i] += 1
+        considered = max(2, considered // 2)
+    return sequence[:simulations]
 
 
 def completed(values, visits, prior, value):
@@ -53,38 +88,49 @@ def completed(values, visits, prior, value):
 
 
 def search(evaluator, decision, simulations, width, rng, noise=True):
-    logits, value = evaluator.forward(decision)
-    count = len(logits)
-    if count == 1:
+    observation = evaluator.observe(decision)
+    raw, value = evaluator.forward(decision, observation)
+    members = groups(observation, evaluator.layout)
+    count = len(members)
+    if len(raw) == 1:
         return 0, np.ones(1)
+    logits = np.array([np.logaddexp.reduce(raw[m]) for m in members])
     prior = np.exp(logits - logits.max())
     prior /= prior.sum()
     gumbel = rng.gumbel(size=count) if noise else np.zeros(count)
-    candidates = list(np.argsort(-(gumbel + logits))[: min(width, count)])
+    considered = min(width, count)
     totals, visits = np.zeros(count), np.zeros(count)
+    seeds = {}
     root = evaluator.kernel.call("snapshot")["id"]
-    evaluator.kernel.call("horizon", enabled=True)
     turn = decision["state"]["turn"]
-    rounds = max(1, math.ceil(math.log2(len(candidates))))
+
+    def sigma():
+        values = np.divide(totals, visits, out=np.zeros(count), where=visits > 0)
+        return (VISIT + visits.max()) * SCALE * completed(values, visits, prior, value)
+
     try:
-        for _ in range(rounds):
-            share = max(1, simulations // (rounds * len(candidates)))
-            for _ in range(share):
-                seed = int(rng.integers(1 << 62))
-                for action in candidates:
-                    totals[action] += evaluator.simulate(root, int(action), seed, turn, rng)
-                    visits[action] += 1
-            if len(candidates) == 1:
-                break
-            values = np.divide(totals, visits, out=np.zeros(count), where=visits > 0)
-            sigma = (VISIT + visits.max()) * SCALE * completed(values, visits, prior, value)
-            score = gumbel + logits + sigma
-            candidates = sorted(candidates, key=lambda a: -score[a])[: max(1, len(candidates) // 2)]
+        top = set(np.argsort(-(gumbel + logits))[:considered].tolist())
+        for visit in schedule(considered, simulations if count > 1 else 0):
+            score = gumbel + logits + sigma()
+            eligible = [a for a in top if visits[a] == visit]
+            if not eligible:
+                continue
+            action = max(eligible, key=lambda a: score[a])
+            if visit not in seeds:
+                seeds[visit] = int(rng.integers(1 << 62))
+            real = members[action][0]
+            totals[action] += evaluator.simulate(root, real, seeds[visit], turn, rng)
+            visits[action] += 1
         evaluator.kernel.call("restore", id=root)
     finally:
-        evaluator.kernel.call("horizon", enabled=False)
-        evaluator.kernel.call("release", id=root)
-    values = np.divide(totals, visits, out=np.zeros(count), where=visits > 0)
-    sigma = (VISIT + visits.max()) * SCALE * completed(values, visits, prior, value)
-    improved = np.exp(logits + sigma - (logits + sigma).max())
-    return int(candidates[0]), improved / improved.sum()
+        if not evaluator.kernel.failed:
+            evaluator.kernel.call("release", id=root)
+    score = gumbel + logits + sigma()
+    most = visits.max()
+    choice = max((a for a in top if visits[a] == most), key=lambda a: score[a])
+    improved = np.exp(logits + sigma() - (logits + sigma()).max())
+    improved /= improved.sum()
+    policy = np.zeros(len(raw))
+    for group, mass in zip(members, improved, strict=True):
+        policy[group] = mass / len(group)
+    return members[choice][0], policy

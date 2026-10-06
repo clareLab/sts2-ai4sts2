@@ -23,10 +23,9 @@ internal static class Kernel
         "replay" => Describe(await Game.Replay(request.GetProperty("actions").EnumerateArray().Select(a => a.GetInt32()).ToArray())),
         "determinize" => Describe(Game.Determinize(request.GetProperty("seed").GetUInt64())),
         "snapshot" => new { id = Game.Save() },
-        "audit" => Game.Audit(request.GetProperty("seed").GetUInt64()),
+        "audit" => await Game.Audit(request.GetProperty("seed").GetUInt64()),
         "restore" => Describe(await Game.Load(request.GetProperty("id").GetInt32())),
         "release" => Release(request.GetProperty("id").GetInt32()),
-        "horizon" => Horizon(request.GetProperty("enabled").GetBoolean()),
         "waits" => new { frames = Game.Waits, timings = Probe.Timings.ToDictionary(t => t.Key, t => new { count = t.Value.Count, ms = t.Value.Milliseconds }), gc = new[] { GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2) }, heap = GC.GetTotalMemory(false) },
         _ => throw new ArgumentException($"Unknown operation: {op}")
     };
@@ -34,12 +33,6 @@ internal static class Kernel
     private static object Release(int id)
     {
         Game.Drop(id);
-        return new { };
-    }
-
-    private static object Horizon(bool enabled)
-    {
-        Game.Horizon = enabled;
         return new { };
     }
 
