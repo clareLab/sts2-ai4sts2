@@ -107,6 +107,21 @@ def vtrace(values, after, rho, lam, utility):
     return targets, advantages
 
 
+def chunks(lengths, size, cells):
+    order = np.argsort(lengths, kind="stable")
+    begin = 0
+    while begin < len(order):
+        end = begin + 1
+        while (
+            end < len(order)
+            and end - begin < size
+            and (end - begin + 1) * lengths[order[end]] ** 2 <= cells
+        ):
+            end += 1
+        yield order[begin:end]
+        begin = end
+
+
 def make_net(layout, outcome, args):
     return Net(layout, outcome.bins, width=args.width, depth=args.depth)
 
@@ -505,9 +520,8 @@ class Learner:
         }
 
     def batches(self, observations):
-        order = np.argsort([length(o) for o in observations], kind="stable")
-        for begin in range(0, len(order), self.args.minibatch):
-            chunk = order[begin : begin + self.args.minibatch]
+        lengths = [length(o) for o in observations]
+        for chunk in chunks(lengths, self.args.minibatch, self.args.cells):
             yield chunk, Batch([observations[i] for i in chunk], self.layout).to(self.device)
 
     def update(self, segments):
@@ -653,6 +667,7 @@ def main():
     parser.add_argument("--rollout", type=int, default=4096)
     parser.add_argument("--segment", type=int, default=64)
     parser.add_argument("--minibatch", type=int, default=512)
+    parser.add_argument("--cells", type=int, default=1 << 23)
     parser.add_argument("--passes", type=int, default=4)
     parser.add_argument("--clip", type=float, default=0.2)
     parser.add_argument("--entropy", type=float, default=0.01)

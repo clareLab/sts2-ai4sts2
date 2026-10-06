@@ -8,7 +8,7 @@ from ai4sts2.features import Batch, Layout, Translator
 from ai4sts2.kernel import Kernel, engine
 from ai4sts2.model import Net
 from ai4sts2.search import Evaluator, search
-from ai4sts2.train import ACTS, COMBATS, Outcome, vtrace, wilson
+from ai4sts2.train import ACTS, COMBATS, Outcome, chunks, vtrace, wilson
 from tests.test_kernel import branch, fingerprint
 
 
@@ -70,6 +70,18 @@ def test_outcome_targets_split_within_a_cell():
     assert target[2 * cell + 1] == pytest.approx(0.75)
     assert outcome.target(state, True)[-1] == 1
     assert outcome.bins == 2 * ACTS * COMBATS + 1
+
+
+def test_chunks_bound_attention_cells_and_cover_every_observation():
+    rng = np.random.default_rng(0)
+    lengths = np.concatenate([rng.integers(10, 120, 4000), [400, 900, 3000]]).tolist()
+    parts = list(chunks(lengths, 512, 1 << 23))
+    assert sorted(np.concatenate(parts).tolist()) == list(range(len(lengths)))
+    for part in parts:
+        longest = max(lengths[i] for i in part)
+        assert len(part) <= 512
+        assert len(part) == 1 or len(part) * longest**2 <= 1 << 23
+    assert max(len(p) for p in parts) == 512
 
 
 def test_wilson_interval_brackets_the_estimate():
