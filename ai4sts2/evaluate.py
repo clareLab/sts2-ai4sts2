@@ -37,6 +37,9 @@ def play(index, args, executable, jobs, results):
     net, outcome, statistics = load(args.checkpoint, layout)
     generator = np.random.default_rng(index)
     for character, seed in jobs:
+        if kernel.bloated():
+            kernel.close()
+            kernel = Kernel(executable)
         rng = random.Random(f"{args.policy}:{character}:{seed}")
         translator = Translator()
         record = {"character": character, "seed": seed, "steps": 0, "elite": False}

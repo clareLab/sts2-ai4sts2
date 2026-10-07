@@ -171,6 +171,10 @@ def actor(index, args, executable, weights_path, schedule, connection):
 
     def start(worker):
         try:
+            if pool.kernels[worker].bloated():
+                channel.send(("recycle",))
+                pool.restart(worker)
+                translators[worker] = Translator()
             begin(worker)
         except Exception as error:
             fail(worker, error)
@@ -368,7 +372,7 @@ class Learner:
         self.activity = np.zeros(3)
         self.net = make_net(self.layout, self.outcome, args).to(self.device)
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=args.lr)
-        self.updates = self.samples = self.episodes = self.failures = 0
+        self.updates = self.samples = self.episodes = self.failures = self.recycles = 0
         statistics = ()
         path = self.directory / "model.pt"
         if path.exists():
@@ -440,6 +444,8 @@ class Learner:
             self.divergences += 1
         elif kind == "actor":
             self.activity += payload[0]
+        elif kind == "recycle":
+            self.recycles += 1
         elif kind == "failure":
             self.failures += 1
             print(json.dumps({"failure": payload[0]}), flush=True)
@@ -497,6 +503,7 @@ class Learner:
                     "episodes": self.episodes,
                     "failures": self.failures,
                     "respawns": self.respawns,
+                    "recycles": self.recycles,
                     "restarts": {room: v for room, v in sorted(self.restarts.items())},
                     "divergences": self.divergences,
                     "assisted": self.assisted,
