@@ -26,6 +26,7 @@ from ai4sts2.search import Evaluator, search
 ACTS = 3
 COMBATS = 18
 TARGET = 10
+STEPS = 5000
 SEED_ALPHABET = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 
 
@@ -171,10 +172,6 @@ def actor(index, args, executable, weights_path, schedule, connection):
 
     def start(worker):
         try:
-            if pool.kernels[worker].bloated():
-                channel.send(("recycle",))
-                pool.restart(worker)
-                translators[worker] = Translator()
             begin(worker)
         except Exception as error:
             fail(worker, error)
@@ -234,15 +231,16 @@ def actor(index, args, executable, weights_path, schedule, connection):
             send(worker, "determinize", seed=rng.getrandbits(63))
             return
         state = decision["state"]
-        if decision["kind"] == "end":
-            victory = bool(decision["victory"])
+        stalled = decision["kind"] != "end" and len(episode["actions"]) >= STEPS
+        if decision["kind"] == "end" or stalled:
+            victory = not stalled and bool(decision["victory"])
             target = outcome.target(state, victory)
             flush(worker, target=target)
             if episode["restart"] is None:
                 if episode["start"] is not None and episode["start"]["room"] == "Monster":
                     remember(worker)
                 message = ("episode", segment["character"], segment["seed"], target, victory, state)
-                channel.send(message + (searcher,))
+                channel.send(message + (searcher, stalled))
             else:
                 channel.send(("restart", episode["restart"]["room"], victory, state))
             start(worker)
@@ -372,7 +370,7 @@ class Learner:
         self.activity = np.zeros(3)
         self.net = make_net(self.layout, self.outcome, args).to(self.device)
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=args.lr)
-        self.updates = self.samples = self.episodes = self.failures = self.recycles = 0
+        self.updates = self.samples = self.episodes = self.failures = self.stalls = 0
         statistics = ()
         path = self.directory / "model.pt"
         if path.exists():
@@ -444,21 +442,20 @@ class Learner:
             self.divergences += 1
         elif kind == "actor":
             self.activity += payload[0]
-        elif kind == "recycle":
-            self.recycles += 1
         elif kind == "failure":
             self.failures += 1
             print(json.dumps({"failure": payload[0]}), flush=True)
 
-    def record(self, character, seed, target, victory, state, searched):
+    def record(self, character, seed, target, victory, state, searched, stalled):
         self.episodes += 1
+        self.stalls += stalled
         if searched:
             self.assisted[0] += victory
             self.assisted[1] += 1
         else:
             self.statistics.add(character, target, victory)
         record = {"character": character, "seed": seed, "victory": victory}
-        record["searched"] = searched
+        record["searched"], record["stalled"] = searched, stalled
         record |= {k: state[k] for k in ("act", "floor", "won", "foe", "hp", "deck", "relics")}
         with (self.directory / "episodes.jsonl").open("a") as stream:
             stream.write(json.dumps(record) + "\n")
@@ -503,7 +500,7 @@ class Learner:
                     "episodes": self.episodes,
                     "failures": self.failures,
                     "respawns": self.respawns,
-                    "recycles": self.recycles,
+                    "stalls": self.stalls,
                     "restarts": {room: v for room, v in sorted(self.restarts.items())},
                     "divergences": self.divergences,
                     "assisted": self.assisted,

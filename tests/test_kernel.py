@@ -95,12 +95,6 @@ def test_map_segments_match_official(monkeypatch):
         assert decision["state"]["act"] >= 2
 
 
-def test_bloated_measures_anonymous_memory(kernel, monkeypatch):
-    assert not kernel.bloated()
-    monkeypatch.setattr("ai4sts2.kernel.BLOATED", 0)
-    assert kernel.bloated()
-
-
 def test_processes_agree():
     rng = random.Random(1)
     with Kernel(engine()) as first, Kernel(engine()) as second:

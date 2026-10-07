@@ -38,8 +38,6 @@ def sweep(parent):
 
 
 REQUEST = struct.Struct("<i")
-PAGE = os.sysconf("SC_PAGE_SIZE")
-BLOATED = 768 << 20
 
 
 class KernelError(RuntimeError):
@@ -172,10 +170,6 @@ class Kernel:
             self.failed = True
             self.close()
             raise
-
-    def bloated(self):
-        statm = Path(f"/proc/{self.process.pid}/statm").read_text().split()
-        return (int(statm[1]) - int(statm[2])) * PAGE > BLOATED
 
     def tail(self, lines=40):
         path = self.directory / "game.log"

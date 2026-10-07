@@ -13,7 +13,7 @@ from scipy import stats
 from ai4sts2.features import Batch, Layout, Translator
 from ai4sts2.kernel import Kernel, KernelError, die_with_parent, engine
 from ai4sts2.search import Evaluator, search
-from ai4sts2.train import ACTS, COMBATS, TARGET, Outcome, Statistics, make_net, wilson
+from ai4sts2.train import ACTS, COMBATS, STEPS, TARGET, Outcome, Statistics, make_net, wilson
 
 COMBAT_NODES = {"MapPointType.Monster", "MapPointType.Elite", "MapPointType.Boss"}
 
@@ -37,9 +37,6 @@ def play(index, args, executable, jobs, results):
     net, outcome, statistics = load(args.checkpoint, layout)
     generator = np.random.default_rng(index)
     for character, seed in jobs:
-        if kernel.bloated():
-            kernel.close()
-            kernel = Kernel(executable)
         rng = random.Random(f"{args.policy}:{character}:{seed}")
         translator = Translator()
         record = {"character": character, "seed": seed, "steps": 0, "elite": False}
@@ -246,7 +243,7 @@ def main():
     run.add_argument("--runs", type=int, default=200)
     run.add_argument("--ascension", type=int, default=TARGET)
     run.add_argument("--workers", type=int, default=8)
-    run.add_argument("--cap", type=int, default=20000)
+    run.add_argument("--cap", type=int, default=STEPS)
     run.add_argument("--invincible", action="store_true")
     run.add_argument("--output", required=True)
     pair = commands.add_parser("compare")
