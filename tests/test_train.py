@@ -1,3 +1,4 @@
+import os
 import random
 from types import SimpleNamespace
 
@@ -6,7 +7,7 @@ import pytest
 import torch
 
 from ai4sts2.features import Batch, Layout, Translator
-from ai4sts2.kernel import Kernel, engine
+from ai4sts2.kernel import Kernel, engine, sweep
 from ai4sts2.model import Net
 from ai4sts2.search import Evaluator, search
 from ai4sts2.train import ACTS, COMBATS, Outcome, chunks, vtrace, wilson
@@ -82,6 +83,16 @@ def test_chunks_bound_attention_cells_and_cover_every_observation():
         assert len(part) <= 512
         assert len(part) == 1 or len(part) * longest**2 <= 1 << 23
     assert max(len(p) for p in parts) == 512
+
+
+def test_sweep_keeps_live_and_fresh_kernel_directories(tmp_path):
+    for name, pid in (("live", os.getpid()), ("dead", 2**22 + 1), ("fresh", None)):
+        directory = tmp_path / f"kernel-{name}"
+        directory.mkdir()
+        if pid is not None:
+            (directory / "pid").write_text(str(pid))
+    sweep(tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["kernel-fresh", "kernel-live"]
 
 
 def test_wilson_interval_brackets_the_estimate():

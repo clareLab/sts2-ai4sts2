@@ -27,9 +27,13 @@ def sweep(parent):
         pid = directory / "pid"
         try:
             alive = pid.exists() and Path(f"/proc/{int(pid.read_text())}").exists()
-        except ValueError:
+        except (ValueError, FileNotFoundError):
             alive = False
-        if not alive and (pid.exists() or time.time() - directory.stat().st_mtime > 3600):
+        try:
+            stale = not alive and (pid.exists() or time.time() - directory.stat().st_mtime > 3600)
+        except FileNotFoundError:
+            continue
+        if stale:
             shutil.rmtree(directory, ignore_errors=True)
 
 
@@ -141,7 +145,9 @@ class Kernel:
             start_new_session=True,
             preexec_fn=die_with_parent,
         )
-        (self.directory / "pid").write_text(str(self.process.pid))
+        temporary = self.directory / "pid.tmp"
+        temporary.write_text(str(self.process.pid))
+        temporary.replace(self.directory / "pid")
         self.started = time.monotonic()
 
     def connect(self):
