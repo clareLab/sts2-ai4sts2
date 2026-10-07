@@ -13,7 +13,17 @@ from scipy import stats
 from ai4sts2.features import Batch, Layout, Translator
 from ai4sts2.kernel import Kernel, KernelError, die_with_parent, engine
 from ai4sts2.search import Evaluator, search
-from ai4sts2.train import ACTS, COMBATS, STEPS, TARGET, Outcome, Statistics, make_net, wilson
+from ai4sts2.train import (
+    ACTS,
+    COMBATS,
+    STEPS,
+    TARGET,
+    Outcome,
+    Progress,
+    Statistics,
+    make_net,
+    wilson,
+)
 
 COMBAT_NODES = {"MapPointType.Monster", "MapPointType.Elite", "MapPointType.Boss"}
 
@@ -41,6 +51,7 @@ def play(index, args, executable, jobs, results):
         translator = Translator()
         record = {"character": character, "seed": seed, "steps": 0, "elite": False}
         farming, available, start = 0, 0, None
+        progress = Progress()
         try:
             decision = kernel.call(
                 "begin",
@@ -52,6 +63,8 @@ def play(index, args, executable, jobs, results):
             while decision["kind"] != "end" and record["steps"] < args.cap:
                 translator.sync(kernel.vocab)
                 state = decision["state"]
+                if progress.stalled(state):
+                    break
                 if decision["kind"] == "rewards" and state["room"] == "Elite":
                     record["elite"] = True
                 count = len(decision["options"])

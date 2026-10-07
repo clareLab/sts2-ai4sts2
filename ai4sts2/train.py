@@ -26,7 +26,8 @@ from ai4sts2.search import Evaluator, search
 ACTS = 3
 COMBATS = 18
 TARGET = 10
-STEPS = 5000
+STEPS = 100_000
+IDLE = 1000
 SEED_ALPHABET = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 
 
@@ -51,6 +52,18 @@ class Outcome:
         below = np.cumsum(cells) - cells
         utility = np.stack([below, below + cells], 1).reshape(-1)
         return np.append(utility, 1 - mass[-1] / 2).astype(np.float32)
+
+
+class Progress:
+    def __init__(self):
+        self.idle, self.floor, self.foe = 0, None, None
+
+    def stalled(self, state):
+        foe = state["foe"]
+        hit = foe is not None and self.foe is not None and foe < self.foe
+        self.idle = 0 if hit or state["floor"] != self.floor else self.idle + 1
+        self.floor, self.foe = state["floor"], foe
+        return self.idle >= IDLE
 
 
 class Statistics:
@@ -161,6 +174,7 @@ def actor(index, args, executable, weights_path, schedule, connection):
             character = rng.choices(characters, weights=list(weights[:]))[0]
             seed = "".join(rng.choice(SEED_ALPHABET) for _ in range(10))
             episodes[worker] = {"restart": None, "phase": None, "actions": [], "start": None}
+        episodes[worker]["progress"] = Progress()
         segments[worker] = {"character": character, "seed": seed, "version": seen, "steps": []}
         pool.send(worker, "begin", character=character, seed=seed, ascension=TARGET)
 
@@ -231,7 +245,9 @@ def actor(index, args, executable, weights_path, schedule, connection):
             send(worker, "determinize", seed=rng.getrandbits(63))
             return
         state = decision["state"]
-        stalled = decision["kind"] != "end" and len(episode["actions"]) >= STEPS
+        stalled = decision["kind"] != "end" and (
+            episode["progress"].stalled(state) or len(episode["actions"]) >= STEPS
+        )
         if decision["kind"] == "end" or stalled:
             victory = not stalled and bool(decision["victory"])
             target = outcome.target(state, victory)

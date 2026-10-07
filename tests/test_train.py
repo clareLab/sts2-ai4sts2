@@ -10,7 +10,7 @@ from ai4sts2.features import Batch, Layout, Translator
 from ai4sts2.kernel import Kernel, engine, sweep
 from ai4sts2.model import Net
 from ai4sts2.search import Evaluator, search
-from ai4sts2.train import ACTS, COMBATS, Outcome, chunks, vtrace, wilson
+from ai4sts2.train import ACTS, COMBATS, IDLE, Outcome, Progress, chunks, vtrace, wilson
 from tests.test_kernel import branch, fingerprint
 
 
@@ -93,6 +93,14 @@ def test_sweep_keeps_live_and_fresh_kernel_directories(tmp_path):
             (directory / "pid").write_text(str(pid))
     sweep(tmp_path)
     assert sorted(p.name for p in tmp_path.iterdir()) == ["kernel-fresh", "kernel-live"]
+
+
+def test_progress_tolerates_damaging_loops_and_flags_idle_ones():
+    progress = Progress()
+    assert not any(progress.stalled({"floor": 1, "foe": 1 - i / 1e5}) for i in range(5 * IDLE))
+    assert not progress.stalled({"floor": 2, "foe": None})
+    flags = [progress.stalled({"floor": 2, "foe": 0.5}) for _ in range(IDLE)]
+    assert flags[-1] and not any(flags[:-1])
 
 
 def test_wilson_interval_brackets_the_estimate():
