@@ -129,6 +129,7 @@ internal static class Game
         Frames.Clear();
         Marks.Clear();
         Foes.Clear();
+        Book.Skips.Clear();
         Book.Combat = null;
         Saves.Clear();
         _streams = default;
@@ -205,6 +206,8 @@ internal static class Game
     private static bool Mark(object item, string flag) => Marks.Add((item, flag));
 
     private static bool Marked(object item, string flag) => Marks.Contains((item, flag));
+
+    internal static void Skip(RoomSet rooms, int slot, HashSet<ModelId> fits) => Book.Skips.Add((rooms, slot, fits));
 
     internal static async Task<Decision> Step(int index)
     {
@@ -318,8 +321,6 @@ internal static class Game
     private static readonly FieldInfo FallbackField = AccessTools.Field(typeof(RelicGrabBag), "_mpFallbackDequeue");
     private static readonly MethodInfo DrawEncounter = AccessTools.Method(typeof(ActModel), "AddWithoutRepeatingTags");
     private static readonly PropertyInfo WeakEncounters = AccessTools.Property(typeof(ActModel), "NumberOfWeakEncounters");
-    private static readonly AccessTools.FieldRef<ActModel, List<AncientEventModel>?> SharedAncients =
-        AccessTools.FieldRefAccess<ActModel, List<AncientEventModel>?>("_sharedAncientSubset");
     private static readonly AccessTools.FieldRef<PlayerRngSet, ulong> PlayerSeed = AccessTools.FieldRefAccess<PlayerRngSet, ulong>("<Seed>k__BackingField");
 
     internal static Decision Determinize(ulong seed)
@@ -355,28 +356,60 @@ internal static class Game
         int weak = (int)WeakEncounters.GetValue(act)!;
         Redraw(rooms.normalEncounters, rooms.normalEncountersVisited, i => i < weak ? act.AllWeakEncounters : act.AllRegularEncounters, i => i == 0 || i == weak, source);
         Redraw(rooms.eliteEncounters, rooms.eliteEncountersVisited, _ => act.AllEliteEncounters, i => i == 0, source);
-        Permute(rooms.events, Enumerable.Range(0, rooms.events.Count)
-            .Where(i => i >= rooms.eventsVisited || !run.VisitedEventIds.Contains(rooms.events[i].Id)).ToList(), source);
+        var slots = Enumerable.Range(0, rooms.events.Count).Where(i => i >= rooms.eventsVisited || !run.VisitedEventIds.Contains(rooms.events[i].Id)).ToList();
+        var fits = slots.Select(i => Book.Skips.LastOrDefault(s => ReferenceEquals(s.Rooms, rooms) && s.Slot == i).Fits).ToList();
+        for (int attempt = 0; attempt < 1000; attempt++)
+        {
+            var drawn = slots.Select(i => rooms.events[i]).ToList();
+            Permute(drawn, source);
+            if (!slots.Select((_, k) => fits[k] == null || fits[k].Contains(drawn[k].Id)).All(ok => ok)) continue;
+            for (int k = 0; k < slots.Count; k++) rooms.events[slots[k]] = drawn[k];
+            break;
+        }
         foreach (var bag in run.Players.Select(p => p.RelicGrabBag).Append(run.SharedRelicGrabBag))
         {
             foreach (System.Collections.IList deque in ((System.Collections.IDictionary)DequesField.GetValue(bag)!).Values) Permute(deque, source);
             Permute((System.Collections.IList)FallbackField.GetValue(bag)!, source);
         }
-        var claimed = run.Acts.Take(run.CurrentActIndex + 1).SelectMany(a => SharedAncients(a) ?? []).ToHashSet();
-        var shared = run.UnlockState.SharedAncients.Where(a => !claimed.Contains(a)).ToList();
-        Permute(shared, source);
+        var subsets = Subsets(run, source);
         for (int index = run.CurrentActIndex + 1; index < run.Acts.Count; index++)
         {
             var future = run.Acts[index];
             bool doubled = ActRooms(future).SecondBoss != null;
-            int count = source.NextInt(shared.Count + 1);
-            future.SetSharedAncientSubset(shared.Take(count).ToList());
-            shared = shared.Skip(count).ToList();
+            if (subsets != null) future.SetSharedAncientSubset(subsets[index - 1]);
             ActRooms(future) = new RoomSet();
             var rng = new Rng(source.NextUnsignedLong());
             future.GenerateRooms(rng, run.UnlockState);
             if (doubled) future.SetSecondBossEncounter(rng.NextItem(future.AllBossEncounters.Where(e => e.Id != future.BossEncounter.Id))!);
         }
+    }
+
+    private static List<List<AncientEventModel>>? Subsets(RunState run, Rng source)
+    {
+        var shared = run.UnlockState.SharedAncients.ToList();
+        for (int attempt = 0; attempt < 1000; attempt++)
+        {
+            var rest = shared.ToList();
+            Permute(rest, source);
+            var subsets = new List<List<AncientEventModel>>();
+            for (int index = 1; index < run.Acts.Count; index++)
+            {
+                int count = source.NextInt(rest.Count + 1);
+                subsets.Add(rest.Take(count).ToList());
+                rest = rest.Skip(count).ToList();
+            }
+            double accept = 1;
+            for (int index = 1; index <= run.CurrentActIndex && index < run.Acts.Count; index++)
+            {
+                var rooms = ActRooms(run.Acts[index]);
+                if (!rooms.HasAncient) continue;
+                var own = run.Acts[index].GetUnlockedAncients(run.UnlockState).ToList();
+                var options = own.Concat(subsets[index - 1]).ToList();
+                accept *= options.Any(a => a.Id == rooms.Ancient.Id) ? (double)Math.Max(own.Count, 1) / options.Count : 0;
+            }
+            if (source.NextDouble() < accept) return subsets;
+        }
+        return null;
     }
 
     private static void Redraw(List<EncounterModel> list, int visited, Func<int, IEnumerable<EncounterModel>> pool, Func<int, bool> starts, Rng source)
@@ -419,6 +452,7 @@ internal static class Game
             events = rooms.events.Select(e => e.Id.Entry).ToArray(),
             events_visited = rooms.eventsVisited,
             seen = rooms.events.Select(e => Run.VisitedEventIds.Contains(e.Id)).ToArray(),
+            skipped = Book.Skips.Where(s => ReferenceEquals(s.Rooms, rooms)).Select(s => new { slot = s.Slot, fits = s.Fits.Select(id => id.Entry).ToArray() }).ToArray(),
             boss = rooms.Boss.Id.Entry,
             second = rooms.SecondBoss?.Id.Entry,
             ancient = rooms.HasAncient ? rooms.Ancient.Id.Entry : null
@@ -912,6 +946,7 @@ internal sealed class Ledger
     internal readonly List<Task> Tasks = [];
     internal readonly HashSet<(object Item, string Flag)> Marks = new(new Game.MarkComparer());
     internal readonly Dictionary<Creature, int> Foes = new(ReferenceEqualityComparer.Instance);
+    internal readonly List<(RoomSet Rooms, int Slot, HashSet<ModelId> Fits)> Skips = [];
     internal CombatState? Combat;
     internal int? ActChange;
 }

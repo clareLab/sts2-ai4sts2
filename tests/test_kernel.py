@@ -237,9 +237,12 @@ def test_determinize_conditions_hidden_rooms_on_what_was_seen(kernel):
     arguments = {"character": kernel.hello["characters"][2], "seed": "HIDDEN", "ascension": 10}
     rng = random.Random(5)
     decision = kernel.call("begin", invincible=True, **arguments)
-    while not (
-        decision["snapshot"] and decision["kind"] != "combat" and decision["state"]["floor"] >= 10
-    ):
+    while True:
+        quiet = decision["snapshot"] and decision["kind"] != "combat"
+        if quiet and decision["state"]["floor"] >= 10:
+            rooms = kernel.call("rooms")
+            if rooms["acts"][rooms["current"]]["skipped"]:
+                break
         decision = kernel.call("step", index=rng.randrange(len(decision["options"])))
     root = kernel.call("snapshot")["id"]
     before = kernel.call("rooms")
@@ -268,6 +271,7 @@ def test_determinize_conditions_hidden_rooms_on_what_was_seen(kernel):
         assert all(len(set(c)) == len(c) for c in cycles(now["normal"], weak, regular))
         assert all(len(set(c)) == len(c) for c in cycles(now["elite"], 0, elites))
         assert sorted(now["events"]) == sorted(real["events"])
+        assert all(now["events"][skip["slot"]] in skip["fits"] for skip in real["skipped"])
         assert all(
             n == r
             for n, r, seen in zip(now["events"], real["events"], real["seen"], strict=True)
