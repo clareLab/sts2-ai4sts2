@@ -129,7 +129,7 @@ internal static class Game
         Frames.Clear();
         Marks.Clear();
         Foes.Clear();
-        Book.Skips.Clear();
+        Book.Pulls.Clear();
         Book.Combat = null;
         Saves.Clear();
         _streams = default;
@@ -207,7 +207,27 @@ internal static class Game
 
     private static bool Marked(object item, string flag) => Marks.Contains((item, flag));
 
-    internal static void Skip(RoomSet rooms, int slot, HashSet<ModelId> fits) => Book.Skips.Add((rooms, slot, fits));
+    internal static void Pulling(ActModel act, RunState run)
+    {
+        var rooms = ActRooms(act);
+        var fits = rooms.events.Where(e => !e.IsAllowed(run) || run.VisitedEventIds.Contains(e.Id)).Select(e => e.Id).ToHashSet();
+        Book.Pulls.Add((rooms, fits, null, false, false));
+    }
+
+    internal static void Pulled(ActModel act, EventModel result)
+    {
+        var rooms = ActRooms(act);
+        int last = Book.Pulls.FindLastIndex(p => ReferenceEquals(p.Rooms, rooms));
+        var pull = Book.Pulls[last];
+        Book.Pulls[last] = pull with { Seen = result.Id, Replaced = result.Id != rooms.NextEvent.Id };
+    }
+
+    internal static void Consumed(RoomSet rooms)
+    {
+        int last = Book.Pulls.FindLastIndex(p => ReferenceEquals(p.Rooms, rooms));
+        if (last >= 0 && Book.Pulls[last] is { Fits: not null, Consumed: false } pull) Book.Pulls[last] = pull with { Consumed = true };
+        else Book.Pulls.Add((rooms, null, null, false, true));
+    }
 
     internal static async Task<Decision> Step(int index)
     {
@@ -356,16 +376,7 @@ internal static class Game
         int weak = (int)WeakEncounters.GetValue(act)!;
         Redraw(rooms.normalEncounters, rooms.normalEncountersVisited, i => i < weak ? act.AllWeakEncounters : act.AllRegularEncounters, i => i == 0 || i == weak, source);
         Redraw(rooms.eliteEncounters, rooms.eliteEncountersVisited, _ => act.AllEliteEncounters, i => i == 0, source);
-        var slots = Enumerable.Range(0, rooms.events.Count).Where(i => i >= rooms.eventsVisited || !run.VisitedEventIds.Contains(rooms.events[i].Id)).ToList();
-        var fits = slots.Select(i => Book.Skips.LastOrDefault(s => ReferenceEquals(s.Rooms, rooms) && s.Slot == i).Fits).ToList();
-        for (int attempt = 0; attempt < 1000; attempt++)
-        {
-            var drawn = slots.Select(i => rooms.events[i]).ToList();
-            Permute(drawn, source);
-            if (!slots.Select((_, k) => fits[k] == null || fits[k].Contains(drawn[k].Id)).All(ok => ok)) continue;
-            for (int k = 0; k < slots.Count; k++) rooms.events[slots[k]] = drawn[k];
-            break;
-        }
+        RedrawEvents(rooms, source);
         foreach (var bag in run.Players.Select(p => p.RelicGrabBag).Append(run.SharedRelicGrabBag))
         {
             foreach (System.Collections.IList deque in ((System.Collections.IDictionary)DequesField.GetValue(bag)!).Values) Permute(deque, source);
@@ -412,6 +423,48 @@ internal static class Game
         return null;
     }
 
+    private static void RedrawEvents(RoomSet rooms, Rng source)
+    {
+        var pulls = Book.Pulls.Where(p => ReferenceEquals(p.Rooms, rooms)).ToList();
+        var remaining = rooms.events.ToList();
+        var drawn = new List<EventModel>();
+        int pointer = 0;
+        for (int t = 0; t < pulls.Count; t++)
+        {
+            var pull = pulls[t];
+            var later = pulls.Skip(t + 1).Where(p => p is { Seen: not null, Replaced: false }).Select(p => p.Seen!).ToHashSet();
+            var free = remaining.Where(e => !later.Contains(e.Id)).ToList();
+            if (pull.Fits == null)
+            {
+                if (free.Count == 0) return;
+                drawn.Add(Take(remaining, free[source.NextInt(free.Count)]));
+                pointer = drawn.Count;
+                continue;
+            }
+            var fitting = free.Where(e => pull.Fits.Contains(e.Id)).ToList();
+            int skipped = 0;
+            while (skipped < fitting.Count && source.NextDouble() * (free.Count - skipped) < fitting.Count - skipped) skipped++;
+            Permute(fitting, source);
+            foreach (var skip in fitting.Take(skipped)) drawn.Add(Take(remaining, skip));
+            var open = free.Where(e => !pull.Fits.Contains(e.Id)).ToList();
+            var stop = pull.Replaced ? open.Count > 0 ? open[source.NextInt(open.Count)] : null : open.FirstOrDefault(e => e.Id == pull.Seen);
+            if (stop == null) return;
+            drawn.Add(Take(remaining, stop));
+            pointer = pull.Consumed ? drawn.Count : drawn.Count - 1;
+        }
+        Permute(remaining, source);
+        drawn.AddRange(remaining);
+        rooms.events.Clear();
+        rooms.events.AddRange(drawn);
+        rooms.eventsVisited = pointer;
+    }
+
+    private static T Take<T>(List<T> list, T item)
+    {
+        list.Remove(item);
+        return item;
+    }
+
     private static void Redraw(List<EncounterModel> list, int visited, Func<int, IEnumerable<EncounterModel>> pool, Func<int, bool> starts, Rng source)
     {
         if (visited >= list.Count) return;
@@ -451,8 +504,7 @@ internal static class Game
             elite_visited = rooms.eliteEncountersVisited,
             events = rooms.events.Select(e => e.Id.Entry).ToArray(),
             events_visited = rooms.eventsVisited,
-            seen = rooms.events.Select(e => Run.VisitedEventIds.Contains(e.Id)).ToArray(),
-            skipped = Book.Skips.Where(s => ReferenceEquals(s.Rooms, rooms)).Select(s => new { slot = s.Slot, fits = s.Fits.Select(id => id.Entry).ToArray() }).ToArray(),
+            pulls = Book.Pulls.Where(p => ReferenceEquals(p.Rooms, rooms)).Select(p => new { fits = p.Fits?.Select(id => id.Entry).ToArray(), seen = p.Seen?.Entry, replaced = p.Replaced, consumed = p.Consumed }).ToArray(),
             boss = rooms.Boss.Id.Entry,
             second = rooms.SecondBoss?.Id.Entry,
             ancient = rooms.HasAncient ? rooms.Ancient.Id.Entry : null
@@ -946,7 +998,7 @@ internal sealed class Ledger
     internal readonly List<Task> Tasks = [];
     internal readonly HashSet<(object Item, string Flag)> Marks = new(new Game.MarkComparer());
     internal readonly Dictionary<Creature, int> Foes = new(ReferenceEqualityComparer.Instance);
-    internal readonly List<(RoomSet Rooms, int Slot, HashSet<ModelId> Fits)> Skips = [];
+    internal readonly List<(RoomSet Rooms, HashSet<ModelId>? Fits, ModelId? Seen, bool Replaced, bool Consumed)> Pulls = [];
     internal CombatState? Combat;
     internal int? ActChange;
 }

@@ -229,6 +229,20 @@ def test_resampling_covers_every_stream_drawn(monkeypatch):
     assert [audit["leaks"] for audit in audits if audit["leaks"]] == []
 
 
+def replay(events, pulls):
+    pointer = 0
+    for pull in pulls:
+        if pull["fits"] is None:
+            pointer += 1
+            continue
+        while events[pointer] in pull["fits"]:
+            pointer += 1
+        assert events[pointer] not in pull["fits"]
+        assert pull["replaced"] or events[pointer] == pull["seen"]
+        pointer += pull["consumed"]
+    return pointer
+
+
 def cycles(sequence, start, size):
     return [sequence[i : i + size] for i in range(start, len(sequence), size)]
 
@@ -241,7 +255,9 @@ def test_determinize_conditions_hidden_rooms_on_what_was_seen(kernel):
         quiet = decision["snapshot"] and decision["kind"] != "combat"
         if quiet and decision["state"]["floor"] >= 10:
             rooms = kernel.call("rooms")
-            if rooms["acts"][rooms["current"]]["skipped"]:
+            act = rooms["acts"][rooms["current"]]
+            pulls = [p for p in act["pulls"] if p["fits"] is not None]
+            if len(pulls) >= 2 and replay(act["events"], act["pulls"]) > len(act["pulls"]):
                 break
         decision = kernel.call("step", index=rng.randrange(len(decision["options"])))
     root = kernel.call("snapshot")["id"]
@@ -252,7 +268,8 @@ def test_determinize_conditions_hidden_rooms_on_what_was_seen(kernel):
     weak = 3
     regular = len(set(real["normal"][weak:]))
     elites = len(set(real["elite"]))
-    futures = set()
+    assert replay(real["events"], real["pulls"]) == real["events_visited"]
+    futures, pasts = set(), set()
     for seed in range(12):
         kernel.call("restore", id=root)
         kernel.call("determinize", seed=seed)
@@ -271,12 +288,8 @@ def test_determinize_conditions_hidden_rooms_on_what_was_seen(kernel):
         assert all(len(set(c)) == len(c) for c in cycles(now["normal"], weak, regular))
         assert all(len(set(c)) == len(c) for c in cycles(now["elite"], 0, elites))
         assert sorted(now["events"]) == sorted(real["events"])
-        assert all(now["events"][skip["slot"]] in skip["fits"] for skip in real["skipped"])
-        assert all(
-            n == r
-            for n, r, seen in zip(now["events"], real["events"], real["seen"], strict=True)
-            if seen
-        )
+        assert replay(now["events"], real["pulls"]) == now["events_visited"]
+        pasts.add(tuple(now["events"][: now["events_visited"]]))
         assert (now["boss"], now["second"], now["ancient"]) == (
             real["boss"],
             real["second"],
@@ -284,7 +297,7 @@ def test_determinize_conditions_hidden_rooms_on_what_was_seen(kernel):
         )
         assert acts[:act] == before["acts"][:act]
         futures.add(tuple((a["boss"], a["second"], a["ancient"]) for a in acts[act + 1 :]))
-    assert len(futures) > 1
+    assert len(futures) > 1 and len(pasts) > 1
     kernel.call("restore", id=root)
     assert kernel.call("rooms") == before
 

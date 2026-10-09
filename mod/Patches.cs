@@ -46,7 +46,7 @@ internal static class Patches
         {
             typeof(SelectionContractPatch), typeof(BundleChoice), typeof(SphereScreen), typeof(MerchantRemoval), typeof(RealRules),
             typeof(Persistence), typeof(CancelWithoutFrame), typeof(NoRealDelay), typeof(TrialHeadless),
-            typeof(FoulPotionTarget), typeof(FoulPotionThrow), typeof(CosmeticOnly), typeof(MapSegments), typeof(BoulderHits), typeof(SkippedEvents)
+            typeof(FoulPotionTarget), typeof(FoulPotionThrow), typeof(CosmeticOnly), typeof(MapSegments), typeof(BoulderHits), typeof(EventPulls), typeof(EventVisits)
         })
             harmony.CreateClassProcessor(type).Patch();
         if (Game.Audited) Game.Instrument(harmony);
@@ -87,16 +87,20 @@ internal static class Patches
         private static bool Prefix() => false;
     }
 
-    [HarmonyPatch(typeof(RoomSet), nameof(RoomSet.EnsureNextEventIsValid))]
-    private static class SkippedEvents
+    [HarmonyPatch(typeof(ActModel), nameof(ActModel.PullNextEvent))]
+    private static class EventPulls
     {
-        private static void Prefix(RoomSet __instance, out int __state) => __state = __instance.eventsVisited;
+        private static void Prefix(ActModel __instance, RunState runState) => Game.Pulling(__instance, runState);
 
-        private static void Postfix(RoomSet __instance, RunState runState, int __state)
+        private static void Postfix(ActModel __instance, EventModel __result) => Game.Pulled(__instance, __result);
+    }
+
+    [HarmonyPatch(typeof(RoomSet), nameof(RoomSet.MarkVisited))]
+    private static class EventVisits
+    {
+        private static void Postfix(RoomSet __instance, RoomType roomType)
         {
-            if (__instance.eventsVisited == __state) return;
-            var fits = __instance.events.Where(e => !e.IsAllowed(runState) || runState.VisitedEventIds.Contains(e.Id)).Select(e => e.Id).ToHashSet();
-            for (int slot = __state; slot < __instance.eventsVisited; slot++) Game.Skip(__instance, slot, fits);
+            if (roomType == RoomType.Event) Game.Consumed(__instance);
         }
     }
 
