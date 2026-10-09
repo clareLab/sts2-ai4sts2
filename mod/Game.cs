@@ -316,6 +316,10 @@ internal static class Game
     private static readonly AccessTools.FieldRef<ActModel, RoomSet> ActRooms = AccessTools.FieldRefAccess<ActModel, RoomSet>("_rooms");
     private static readonly FieldInfo DequesField = AccessTools.Field(typeof(RelicGrabBag), "_deques");
     private static readonly FieldInfo FallbackField = AccessTools.Field(typeof(RelicGrabBag), "_mpFallbackDequeue");
+    private static readonly MethodInfo DrawEncounter = AccessTools.Method(typeof(ActModel), "AddWithoutRepeatingTags");
+    private static readonly PropertyInfo WeakEncounters = AccessTools.Property(typeof(ActModel), "NumberOfWeakEncounters");
+    private static readonly AccessTools.FieldRef<ActModel, List<AncientEventModel>?> SharedAncients =
+        AccessTools.FieldRefAccess<ActModel, List<AncientEventModel>?>("_sharedAncientSubset");
     private static readonly AccessTools.FieldRef<PlayerRngSet, ulong> PlayerSeed = AccessTools.FieldRefAccess<PlayerRngSet, ulong>("<Seed>k__BackingField");
 
     internal static Decision Determinize(ulong seed)
@@ -346,34 +350,80 @@ internal static class Game
 
     private static void Resample(RunState run, Rng source)
     {
-        var rooms = ActRooms(run.Act);
-        var fresh = new RoomSet();
-        ActRooms(run.Act) = fresh;
-        try { run.Act.GenerateRooms(new Rng(source.NextUnsignedLong()), UnlockState.all); }
-        finally { ActRooms(run.Act) = rooms; }
-        Splice(rooms.normalEncounters, rooms.normalEncountersVisited, fresh.normalEncounters);
-        Splice(rooms.eliteEncounters, rooms.eliteEncountersVisited, fresh.eliteEncounters);
-        Shuffle(rooms.events, rooms.eventsVisited, source);
+        var act = run.Act;
+        var rooms = ActRooms(act);
+        int weak = (int)WeakEncounters.GetValue(act)!;
+        Redraw(rooms.normalEncounters, rooms.normalEncountersVisited, i => i < weak ? act.AllWeakEncounters : act.AllRegularEncounters, i => i == 0 || i == weak, source);
+        Redraw(rooms.eliteEncounters, rooms.eliteEncountersVisited, _ => act.AllEliteEncounters, i => i == 0, source);
+        Permute(rooms.events, Enumerable.Range(0, rooms.events.Count)
+            .Where(i => i >= rooms.eventsVisited || !run.VisitedEventIds.Contains(rooms.events[i].Id)).ToList(), source);
         foreach (var bag in run.Players.Select(p => p.RelicGrabBag).Append(run.SharedRelicGrabBag))
         {
-            foreach (System.Collections.IList deque in ((System.Collections.IDictionary)DequesField.GetValue(bag)!).Values) Shuffle(deque, 0, source);
-            Shuffle((System.Collections.IList)FallbackField.GetValue(bag)!, 0, source);
+            foreach (System.Collections.IList deque in ((System.Collections.IDictionary)DequesField.GetValue(bag)!).Values) Permute(deque, source);
+            Permute((System.Collections.IList)FallbackField.GetValue(bag)!, source);
         }
-    }
-
-    private static void Splice<T>(List<T> list, int visited, List<T> fresh)
-    {
-        for (int i = visited; i < list.Count && i < fresh.Count; i++) list[i] = fresh[i];
-    }
-
-    private static void Shuffle(System.Collections.IList list, int from, Rng source)
-    {
-        for (int i = list.Count - 1; i > from; i--)
+        var claimed = run.Acts.Take(run.CurrentActIndex + 1).SelectMany(a => SharedAncients(a) ?? []).ToHashSet();
+        var shared = run.UnlockState.SharedAncients.Where(a => !claimed.Contains(a)).ToList();
+        Permute(shared, source);
+        for (int index = run.CurrentActIndex + 1; index < run.Acts.Count; index++)
         {
-            int j = from + source.NextInt(i - from + 1);
-            (list[i], list[j]) = (list[j], list[i]);
+            var future = run.Acts[index];
+            bool doubled = ActRooms(future).SecondBoss != null;
+            int count = source.NextInt(shared.Count + 1);
+            future.SetSharedAncientSubset(shared.Take(count).ToList());
+            shared = shared.Skip(count).ToList();
+            ActRooms(future) = new RoomSet();
+            var rng = new Rng(source.NextUnsignedLong());
+            future.GenerateRooms(rng, run.UnlockState);
+            if (doubled) future.SetSecondBossEncounter(rng.NextItem(future.AllBossEncounters.Where(e => e.Id != future.BossEncounter.Id))!);
         }
     }
+
+    private static void Redraw(List<EncounterModel> list, int visited, Func<int, IEnumerable<EncounterModel>> pool, Func<int, bool> starts, Rng source)
+    {
+        if (visited >= list.Count) return;
+        var rng = new Rng(source.NextUnsignedLong());
+        var drawn = list.Take(visited).ToList();
+        var bag = new GrabBag<EncounterModel>();
+        for (int i = 0; i < list.Count; i++)
+        {
+            if (starts(i)) bag = new GrabBag<EncounterModel>();
+            if (!bag.Any())
+                foreach (var encounter in pool(i)) bag.Add(encounter, 1.0);
+            if (i < visited) bag.GrabAndRemove(rng, e => e == list[i]);
+            else DrawEncounter.Invoke(null, [drawn, bag, rng]);
+        }
+        for (int i = visited; i < list.Count && i < drawn.Count; i++) list[i] = drawn[i];
+    }
+
+    private static void Permute(System.Collections.IList list, Rng source) => Permute(list, Enumerable.Range(0, list.Count).ToList(), source);
+
+    private static void Permute(System.Collections.IList list, List<int> slots, Rng source)
+    {
+        for (int k = slots.Count - 1; k > 0; k--)
+        {
+            int j = source.NextInt(k + 1);
+            (list[slots[k]], list[slots[j]]) = (list[slots[j]], list[slots[k]]);
+        }
+    }
+
+    internal static object Rooms() => Run!.Acts.Select(act =>
+    {
+        var rooms = ActRooms(act);
+        return new
+        {
+            normal = rooms.normalEncounters.Select(e => e.Id.Entry).ToArray(),
+            normal_visited = rooms.normalEncountersVisited,
+            elite = rooms.eliteEncounters.Select(e => e.Id.Entry).ToArray(),
+            elite_visited = rooms.eliteEncountersVisited,
+            events = rooms.events.Select(e => e.Id.Entry).ToArray(),
+            events_visited = rooms.eventsVisited,
+            seen = rooms.events.Select(e => Run.VisitedEventIds.Contains(e.Id)).ToArray(),
+            boss = rooms.Boss.Id.Entry,
+            second = rooms.SecondBoss?.Id.Entry,
+            ancient = rooms.HasAncient ? rooms.Ancient.Id.Entry : null
+        };
+    }).ToArray();
 
     internal static readonly bool Audited = System.Environment.GetEnvironmentVariable("AI4STS2_AUDIT") == "1";
     private static bool _auditing;

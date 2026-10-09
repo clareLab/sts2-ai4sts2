@@ -229,6 +229,62 @@ def test_resampling_covers_every_stream_drawn(monkeypatch):
     assert [audit["leaks"] for audit in audits if audit["leaks"]] == []
 
 
+def cycles(sequence, start, size):
+    return [sequence[i : i + size] for i in range(start, len(sequence), size)]
+
+
+def test_determinize_conditions_hidden_rooms_on_what_was_seen(kernel):
+    arguments = {"character": kernel.hello["characters"][2], "seed": "HIDDEN", "ascension": 10}
+    rng = random.Random(5)
+    decision = kernel.call("begin", invincible=True, **arguments)
+    while not (
+        decision["snapshot"] and decision["kind"] != "combat" and decision["state"]["floor"] >= 10
+    ):
+        decision = kernel.call("step", index=rng.randrange(len(decision["options"])))
+    root = kernel.call("snapshot")["id"]
+    before = kernel.call("rooms")
+    act = before["current"]
+    real = before["acts"][act]
+    assert real["normal_visited"] >= 3
+    weak = 3
+    regular = len(set(real["normal"][weak:]))
+    elites = len(set(real["elite"]))
+    futures = set()
+    for seed in range(12):
+        kernel.call("restore", id=root)
+        kernel.call("determinize", seed=seed)
+        acts = kernel.call("rooms")["acts"]
+        now = acts[act]
+        for key in ("normal", "elite"):
+            visited = real[f"{key}_visited"]
+            assert now[key][:visited] == real[key][:visited]
+            assert all(
+                a != b
+                for a, b in zip(
+                    now[key][max(visited, 1) - 1 :], now[key][max(visited, 1) :], strict=False
+                )
+            )
+        assert all(len(set(c)) == len(c) for c in cycles(now["normal"][:weak], 0, weak))
+        assert all(len(set(c)) == len(c) for c in cycles(now["normal"], weak, regular))
+        assert all(len(set(c)) == len(c) for c in cycles(now["elite"], 0, elites))
+        assert sorted(now["events"]) == sorted(real["events"])
+        assert all(
+            n == r
+            for n, r, seen in zip(now["events"], real["events"], real["seen"], strict=True)
+            if seen
+        )
+        assert (now["boss"], now["second"], now["ancient"]) == (
+            real["boss"],
+            real["second"],
+            real["ancient"],
+        )
+        assert acts[:act] == before["acts"][:act]
+        futures.add(tuple((a["boss"], a["second"], a["ancient"]) for a in acts[act + 1 :]))
+    assert len(futures) > 1
+    kernel.call("restore", id=root)
+    assert kernel.call("rooms") == before
+
+
 def test_determinize_resamples_the_next_room(kernel):
     columns = {table: {c: i for i, c in enumerate(cols)} for table, cols in kernel.schema.items()}
     arguments = {"character": kernel.hello["characters"][0], "seed": "ROOMS", "ascension": 10}
