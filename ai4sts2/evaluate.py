@@ -70,7 +70,7 @@ def play(index, args, executable, jobs, results):
                 count = len(decision["options"])
                 if net is None:
                     action = rng.randrange(count)
-                elif args.policy == "search" and decision["kind"] == "combat" and count > 1:
+                elif args.policy == "search" and decision["snapshot"] and count > 1:
                     mass = statistics.mass(character)
                     if mass is None:
                         raise ValueError(

@@ -214,7 +214,7 @@ internal static class Game
         return await Settle();
     }
 
-    private sealed record Saved(Snapshot Graph, object Turn, long WinTime);
+    private sealed record Saved(Snapshot Graph, object? Turn, long WinTime);
 
     private static readonly Dictionary<int, Saved> Saves = [];
     private static int _saves;
@@ -228,10 +228,13 @@ internal static class Game
     private static readonly MethodInfo SwitchMethod = AccessTools.Method(typeof(CombatManager), "AwaitTurnEndAndSwitchSides");
     private static readonly MethodInfo StartMethod = AccessTools.Method(typeof(CombatManager), "StartTurn");
 
+    internal static bool Branchable => Current is { Kind: not "end" } && Selector.Pending == null && Patches.PendingBundle == null
+        && Patches.PendingSphere == null && Tasks.All(t => t.IsCompleted) && PendingOptionTasks(Manager.EventSynchronizer).All(t => t.IsCompleted);
+
     internal static int Save()
     {
-        if (Current?.Kind != "combat") throw new InvalidOperationException("Snapshots require a stable combat decision.");
-        var turn = TurnField.GetValue(CombatManager.Instance)!;
+        if (!Branchable) throw new InvalidOperationException("Snapshots require a decision with no pending prompt or task.");
+        var turn = CombatManager.Instance.IsInProgress ? TurnField.GetValue(CombatManager.Instance) : null;
         var graph = new Snapshot(Run!, CombatManager.Instance, Book, Manager, Manager.ActionQueueSet, Manager.ActionQueueSynchronizer,
             Manager.PlayerChoiceSynchronizer, Manager.ActionExecutor, NetCombatCardDb.Instance, SaveManager.Instance.Progress);
         Saves[++_saves] = new Saved(graph, turn, Manager.WinTime);
@@ -244,25 +247,33 @@ internal static class Game
     {
         var saved = Saves[id];
         var manager = CombatManager.Instance;
-        if (!ReferenceEquals(TurnField.GetValue(manager), saved.Turn)) throw new InvalidOperationException("Snapshots restore only within their combat.");
-        if (Selector.Pending != null) throw new InvalidOperationException("Snapshots cannot restore over a pending selection.");
         var previous = (Task?)LoopField.GetValue(manager);
-        CancelMethod.Invoke(saved.Turn, null);
-        var timer = Stopwatch.StartNew();
-        while (previous is { IsCompleted: false })
+        if (previous is { IsCompleted: false })
         {
-            Dispatcher.SynchronizationContext.ExecutePendingContinuations();
-            if (previous.IsCompleted) break;
-            if (timer.Elapsed.TotalSeconds > 30) throw new TimeoutException("The previous turn loop did not stop.");
-            await Host.Frame();
+            CancelMethod.Invoke(TurnField.GetValue(manager), null);
+            var timer = Stopwatch.StartNew();
+            while (!previous.IsCompleted)
+            {
+                Dispatcher.SynchronizationContext.ExecutePendingContinuations();
+                if (previous.IsCompleted) break;
+                if (timer.Elapsed.TotalSeconds > 30) throw new TimeoutException("The previous turn loop did not stop.");
+                await Host.Frame();
+            }
+            if (previous.IsFaulted) throw new InvalidOperationException("The previous turn loop failed.", previous.Exception);
         }
-        if (previous is { IsFaulted: true }) throw new InvalidOperationException("The previous turn loop failed.", previous.Exception);
-        ((CancellationTokenSource)SourceField.GetValue(saved.Turn)!).Dispose();
+        Selector.Reset();
+        Patches.PendingBundle = null;
+        Patches.PendingSphere = null;
         saved.Graph.Restore();
         Manager.WinTime = saved.WinTime;
-        SourceField.SetValue(saved.Turn, new CancellationTokenSource());
-        foreach (var signal in Signals) signal.SetValue(saved.Turn, Activator.CreateInstance(signal.PropertyType));
-        LoopField.SetValue(manager, TaskHelper.RunSafely(Resume(saved.Turn)));
+        if (saved.Turn is { } turn)
+        {
+            var source = (CancellationTokenSource?)SourceField.GetValue(turn);
+            SourceField.SetValue(turn, new CancellationTokenSource());
+            source?.Dispose();
+            foreach (var signal in Signals) signal.SetValue(turn, Activator.CreateInstance(signal.PropertyType));
+            LoopField.SetValue(manager, TaskHelper.RunSafely(Resume(turn)));
+        }
         Current = null;
         _fault = null;
         return await Settle();
@@ -304,7 +315,7 @@ internal static class Game
         var decision = Current ?? throw new InvalidOperationException("No decision is pending.");
         var run = Run!;
         var source = new Rng(seed);
-        uint newest = Book.Combat?.Creatures.Max(c => c.CombatId ?? 0) ?? 0;
+        uint newest = Book.Combat?.Creatures.Select(c => c.CombatId ?? 0).DefaultIfEmpty().Max() ?? 0;
         if (!ReferenceEquals(_streams.Combat, Book.Combat) || _streams.Newest != newest || _streams.Streams == null)
             _streams = (Book.Combat, newest, Snapshot.Reachable(typeof(Rng), run, CombatManager.Instance, Manager).Select(r => (Rng)r.Value).ToArray());
         foreach (var rng in _streams.Streams) Reseed(rng, source);

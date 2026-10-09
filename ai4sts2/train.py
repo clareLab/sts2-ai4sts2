@@ -281,12 +281,7 @@ def actor(index, args, executable, weights_path, schedule, connection):
 
     def eligible(worker):
         decision = contexts[worker]
-        room = decision["state"]["room"]
-        return (
-            decision["kind"] == "combat"
-            and room in ("Elite", "Boss")
-            and len(decision["options"]) > 1
-        )
+        return decision["snapshot"] and len(decision["options"]) > 1
 
     def utility(character):
         offset = characters.index(character) * outcome.bins

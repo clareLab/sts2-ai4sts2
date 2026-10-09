@@ -142,6 +142,46 @@ def branch(kernel, decision, seed, steps=40):
     return trace
 
 
+def wander(kernel, decision, seed, steps=30):
+    rng = random.Random(seed)
+    trace = []
+    while decision["kind"] != "end" and len(trace) < steps:
+        decision = kernel.call("step", index=rng.randrange(len(decision["options"])))
+        trace.append(fingerprint(kernel, decision))
+    return trace
+
+
+@pytest.mark.parametrize("which", range(5))
+def test_snapshots_restore_every_kind_of_decision(kernel, which):
+    character = kernel.hello["characters"][which]
+    arguments = {"character": character, "seed": f"BRANCHES-{which}", "ascension": 10}
+    rng = random.Random(11 + which)
+    prefix, roots, refused = [], {}, set()
+    decision = kernel.call("begin", invincible=True, **arguments)
+    while decision["kind"] != "end" and len(prefix) < 900:
+        if not decision["snapshot"]:
+            refused.add(decision["kind"])
+        elif len(decision["options"]) > 1 and decision["kind"] not in roots:
+            snapshot = kernel.call("snapshot")["id"]
+            roots[decision["kind"]] = (list(prefix), fingerprint(kernel, decision), snapshot)
+        prefix.append(rng.randrange(len(decision["options"])))
+        decision = kernel.call("step", index=prefix[-1])
+    assert {"combat", "map", "rewards", "event"} <= set(roots)
+    assert "select" in refused
+    traces = {}
+    for kind, (path, root, snapshot) in reversed(roots.items()):
+        for _ in range(2):
+            restored = kernel.call("restore", id=snapshot)
+            assert fingerprint(kernel, restored) == root, kind
+            trace = wander(kernel, restored, len(path))
+            assert traces.setdefault(kind, trace) == trace, kind
+    for kind, (path, root, _) in roots.items():
+        kernel.call("begin", invincible=True, **arguments)
+        replayed = kernel.call("replay", actions=path)
+        assert fingerprint(kernel, replayed) == root, kind
+        assert wander(kernel, replayed, len(path)) == traces[kind], kind
+
+
 def test_snapshots_restore_in_place_and_match_replay(kernel):
     arguments = {"character": kernel.hello["characters"][1], "seed": "SNAPSHOT", "ascension": 10}
     rng = random.Random(7)

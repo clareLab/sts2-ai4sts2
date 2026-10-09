@@ -11,7 +11,7 @@ from ai4sts2.kernel import Kernel, engine, sweep
 from ai4sts2.model import Net
 from ai4sts2.search import Evaluator, search
 from ai4sts2.train import ACTS, COMBATS, IDLE, Outcome, Progress, chunks, vtrace, wilson
-from tests.test_kernel import branch, fingerprint
+from tests.test_kernel import fingerprint, wander
 
 
 def distributions(rng, count, bins):
@@ -154,8 +154,9 @@ def test_batched_forward_matches_single_observations():
 
 
 @pytest.mark.game
-def test_search_leaves_the_real_game_untouched():
-    arguments = {"seed": "SEARCH", "ascension": 10}
+@pytest.mark.parametrize("combat", [True, False])
+def test_search_leaves_the_real_game_untouched(combat):
+    arguments = {"seed": "SEARCH", "ascension": 10, "invincible": True}
     rng = random.Random(9)
     with Kernel(engine()) as kernel:
         arguments["character"] = kernel.hello["characters"][2]
@@ -167,7 +168,12 @@ def test_search_leaves_the_real_game_untouched():
         )
         prefix = []
         decision = kernel.call("begin", **arguments)
-        while decision["kind"] != "combat" or len(decision["options"]) < 3:
+        while (
+            not decision["snapshot"]
+            or (decision["kind"] == "combat") != combat
+            or len(decision["options"]) < 3
+            or decision["state"]["floor"] < 4
+        ):
             prefix.append(rng.randrange(len(decision["options"])))
             decision = kernel.call("step", index=prefix[-1])
         root = fingerprint(kernel, decision)
@@ -175,7 +181,7 @@ def test_search_leaves_the_real_game_untouched():
         assert improved.sum() == pytest.approx(1)
         restored = kernel.call("replay", actions=[])
         assert fingerprint(kernel, restored) == root
-        searched = branch(kernel, kernel.call("step", index=action), 3)
+        searched = wander(kernel, kernel.call("step", index=action), 3)
         kernel.call("begin", **arguments)
         kernel.call("replay", actions=prefix)
-        assert branch(kernel, kernel.call("step", index=action), 3) == searched
+        assert wander(kernel, kernel.call("step", index=action), 3) == searched

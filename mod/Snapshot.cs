@@ -15,6 +15,7 @@ internal sealed class Snapshot
     private static readonly Dictionary<Type, FieldInfo[]> Layouts = [];
     private static readonly Dictionary<Type, Kind> Kinds = [];
     private static readonly Dictionary<Type, FieldInfo[]> SelfFields = [];
+    private static readonly Dictionary<Type, FieldInfo[]> CompletionFields = [];
     private static readonly Dictionary<Type, Action<Snapshot, object>> Encoders = [];
     private static readonly Dictionary<Type, Action<object, ulong[], int, object?[]>> Decoders = [];
     private static readonly MethodInfo WordMethod = typeof(Snapshot).GetMethod(nameof(Word), BindingFlags.Instance | BindingFlags.NonPublic)!;
@@ -26,6 +27,7 @@ internal sealed class Snapshot
     private readonly HashSet<object> _roots = new(ReferenceEqualityComparer.Instance);
     private readonly List<object> _pending = [];
     private readonly List<int> _offsets = [];
+    private readonly List<(object Target, FieldInfo Field, object? Source, bool Done)> _completions = [];
     private readonly ulong[] _buffer;
     private readonly object?[] _table;
     private readonly object[] _targets;
@@ -59,6 +61,11 @@ internal sealed class Snapshot
             }
             if (!Encoders.TryGetValue(type, out var encoder)) Encoders[type] = encoder = CompileEncoder(type);
             encoder(this, target);
+            foreach (FieldInfo field in Completions(type))
+            {
+                object? source = field.GetValue(target);
+                _completions.Add((target, field, source, source != null && Completed(source)));
+            }
         }
         _buffer = _words.ToArray();
         _table = _references.ToArray();
@@ -99,6 +106,28 @@ internal sealed class Snapshot
                     else indices[dimension] = array.GetLowerBound(dimension);
             }
         }
+        foreach (var (target, field, source, done) in _completions)
+            field.SetValue(target, source == null || done || !Completed(source) ? source : Pending(source));
+    }
+
+    private static bool Completed(object source) => ((Task)source.GetType().GetProperty("Task")!.GetValue(source)!).IsCompleted;
+
+    private static object Pending(object source)
+    {
+        var options = ((Task)source.GetType().GetProperty("Task")!.GetValue(source)!).CreationOptions;
+        return Activator.CreateInstance(source.GetType(), options)!;
+    }
+
+    private static FieldInfo[] Completions(Type type)
+    {
+        if (CompletionFields.TryGetValue(type, out FieldInfo[]? fields)) return fields;
+        var result = new List<FieldInfo>();
+        for (Type? current = type; current != null; current = current.BaseType)
+            foreach (FieldInfo field in current.GetFields(Instance))
+                if (field.FieldType == typeof(TaskCompletionSource)
+                    || field.FieldType.IsGenericType && field.FieldType.GetGenericTypeDefinition() == typeof(TaskCompletionSource<>))
+                    result.Add(field);
+        return CompletionFields[type] = result.ToArray();
     }
 
     internal static List<(object Value, string Path)> Reachable(Type wanted, params object[] roots)

@@ -45,6 +45,7 @@ internal static class Kernel
         {
             kind = decision.Kind,
             victory = decision.Victory,
+            snapshot = Game.Branchable,
             state = Game.Summary(),
             options = decision.Options.Select(o => o.Kind).ToArray(),
             layout = encoder.Layout(),

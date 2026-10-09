@@ -7,6 +7,7 @@ from ai4sts2.features import Batch
 
 VISIT = 50
 SCALE = 0.1
+FLOOR = 0.05
 LINKS = ("card", "creature", "relic", "potion", "node", "cell")
 
 
@@ -34,8 +35,11 @@ class Evaluator:
         self.kernel.call("restore", id=root)
         self.kernel.call("determinize", seed=seed)
         decision = self.kernel.call("step", index=action)
-        while decision["kind"] != "end" and decision["state"]["combat"]:
-            if decision["kind"] == "combat" and decision["state"]["turn"] > turn:
+        while decision["kind"] != "end":
+            if decision["state"]["combat"]:
+                if decision["kind"] == "combat" and decision["state"]["turn"] > turn:
+                    break
+            elif decision["snapshot"]:
                 break
             logits, _ = self.forward(decision)
             weights = np.exp(logits - logits.max())
@@ -96,13 +100,14 @@ def search(evaluator, decision, simulations, width, rng, noise=True):
         return 0, np.ones(1)
     logits = np.array([np.logaddexp.reduce(raw[m]) for m in members])
     prior = np.exp(logits - logits.max())
-    prior /= prior.sum()
+    prior = (1 - FLOOR) * prior / prior.sum() + FLOOR / count
+    logits = np.log(prior)
     gumbel = rng.gumbel(size=count) if noise else np.zeros(count)
     considered = min(width, count)
     totals, visits = np.zeros(count), np.zeros(count)
     seeds = {}
     root = evaluator.kernel.call("snapshot")["id"]
-    turn = decision["state"]["turn"]
+    turn = decision["state"]["turn"] if decision["state"]["combat"] else 0
 
     def sigma():
         values = np.divide(totals, visits, out=np.zeros(count), where=visits > 0)
