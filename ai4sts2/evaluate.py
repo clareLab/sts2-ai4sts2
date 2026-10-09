@@ -68,6 +68,12 @@ def play(index, args, executable, jobs, results):
                 if decision["kind"] == "rewards" and state["room"] == "Elite":
                     record["elite"] = True
                 count = len(decision["options"])
+                if net is not None and start is None:
+                    observation = translator.canonical(decision["observation"], layout)
+                    with torch.no_grad():
+                        _, values = net(Batch([observation], layout))
+                    mass = torch.softmax(values[0], -1).numpy()
+                    start = float(mass[2 * COMBATS : -1].sum() + mass[-1])
                 if net is None:
                     action = rng.randrange(count)
                 elif args.policy == "search" and decision["snapshot"] and count > 1:
@@ -84,10 +90,7 @@ def play(index, args, executable, jobs, results):
                 else:
                     observation = translator.canonical(decision["observation"], layout)
                     with torch.no_grad():
-                        logits, values = net(Batch([observation], layout))
-                    if start is None:
-                        mass = torch.softmax(values[0], -1).numpy()
-                        start = float(mass[2 * COMBATS : -1].sum() + mass[-1])
+                        logits, _ = net(Batch([observation], layout))
                     if args.policy != "sample":
                         action = int(logits[0].argmax())
                     else:

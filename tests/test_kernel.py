@@ -207,19 +207,62 @@ def test_snapshots_restore_in_place_and_match_replay(kernel):
         assert branch(kernel, replayed, seed) == trace
 
 
-def test_resampling_covers_every_stream_drawn_in_combat(monkeypatch):
+def test_resampling_covers_every_stream_drawn(monkeypatch):
     monkeypatch.setenv("AI4STS2_AUDIT", "1")
     rng = random.Random(13)
-    audits = []
+    audits, kinds = [], set()
     with Kernel(engine()) as instance:
         for character in instance.hello["characters"]:
             arguments = {"character": character, "seed": f"AUDIT-{character}", "ascension": 10}
-            decision = instance.call("begin", **arguments)
-            found = 0
-            while decision["kind"] != "end" and found < 3:
-                if decision["kind"] == "combat" and rng.random() < 0.3:
+            decision = instance.call("begin", invincible=True, **arguments)
+            quota = {True: 2, False: 4}
+            while decision["kind"] != "end" and any(quota.values()):
+                combat = decision["kind"] == "combat"
+                later = combat or decision["state"]["floor"] >= 3
+                if decision["snapshot"] and later and quota[combat] and rng.random() < 0.5:
                     audits.append(instance.call("audit", seed=rng.getrandbits(62)))
-                    found += 1
+                    kinds.add(decision["kind"])
+                    quota[combat] -= 1
                 decision = instance.call("step", index=rng.randrange(len(decision["options"])))
-    assert audits and all(audit["drawn"] > 0 for audit in audits)
+    assert audits and sum(audit["drawn"] > 0 for audit in audits) > len(audits) // 2
+    assert {"combat", "map"} <= kinds and len(kinds) >= 4
     assert [audit["leaks"] for audit in audits if audit["leaks"]] == []
+
+
+def test_determinize_resamples_the_next_room(kernel):
+    columns = {table: {c: i for i, c in enumerate(cols)} for table, cols in kernel.schema.items()}
+    arguments = {"character": kernel.hello["characters"][0], "seed": "ROOMS", "ascension": 10}
+    rng = random.Random(3)
+    decision = kernel.call("begin", invincible=True, **arguments)
+    checked = 0
+    while decision["kind"] != "end" and checked < 2:
+        observation = decision["observation"]
+        nodes = [int(row[columns["option"]["node"]]) for row in observation["option"]]
+        kinds = [
+            kernel.vocab[int(observation["node"][n][columns["node"]["type"]])] if n >= 0 else None
+            for n in nodes
+        ]
+        if decision["kind"] == "map" and decision["snapshot"] and "MapPointType.Monster" in kinds:
+            root = kernel.call("snapshot")["id"]
+            rooms = set()
+            for seed in range(8):
+                kernel.call("restore", id=root)
+                kernel.call("determinize", seed=seed)
+                entered = kernel.call("step", index=kinds.index("MapPointType.Monster"))
+                assert entered["kind"] == "combat"
+                creatures = entered["observation"]["creature"]
+                rooms.add(
+                    tuple(
+                        sorted(
+                            kernel.vocab[int(row[columns["creature"]["model"]])]
+                            for row in creatures
+                            if kernel.vocab[int(row[columns["creature"]["side"]])]
+                            == "CombatSide.Enemy"
+                        )
+                    )
+                )
+            assert len(rooms) > 1
+            decision = kernel.call("restore", id=root)
+            checked += 1
+        decision = kernel.call("step", index=rng.randrange(len(decision["options"])))
+    assert checked == 2

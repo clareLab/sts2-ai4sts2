@@ -132,6 +132,7 @@ internal static class Game
         Book.Combat = null;
         Saves.Clear();
         _streams = default;
+        _restored = null;
         _fault = null;
         Book.ActChange = null;
         Run = null;
@@ -210,6 +211,7 @@ internal static class Game
         var decision = Current ?? throw new InvalidOperationException("No decision is pending.");
         if (index < 0 || index >= decision.Options.Length) throw new ArgumentOutOfRangeException(nameof(index));
         Current = null;
+        _restored = null;
         Track(decision.Options[index].Execute());
         return await Settle();
     }
@@ -238,6 +240,7 @@ internal static class Game
         var graph = new Snapshot(Run!, CombatManager.Instance, Book, Manager, Manager.ActionQueueSet, Manager.ActionQueueSynchronizer,
             Manager.PlayerChoiceSynchronizer, Manager.ActionExecutor, NetCombatCardDb.Instance, SaveManager.Instance.Progress);
         Saves[++_saves] = new Saved(graph, turn, Manager.WinTime);
+        _restored = Saves[_saves];
         return _saves;
     }
 
@@ -266,6 +269,7 @@ internal static class Game
         Patches.PendingSphere = null;
         saved.Graph.Restore();
         Manager.WinTime = saved.WinTime;
+        _restored = saved;
         if (saved.Turn is { } turn)
         {
             var source = (CancellationTokenSource?)SourceField.GetValue(turn);
@@ -307,7 +311,11 @@ internal static class Game
     }
 
     private static readonly AccessTools.FieldRef<RunRngSet, ulong> RunSeed = AccessTools.FieldRefAccess<RunRngSet, ulong>("<Seed>k__BackingField");
-    private static (object? Combat, uint Newest, Rng[] Streams) _streams;
+    private static (object? Anchor, uint Newest, Rng[] Streams) _streams;
+    private static object? _restored;
+    private static readonly AccessTools.FieldRef<ActModel, RoomSet> ActRooms = AccessTools.FieldRefAccess<ActModel, RoomSet>("_rooms");
+    private static readonly FieldInfo DequesField = AccessTools.Field(typeof(RelicGrabBag), "_deques");
+    private static readonly FieldInfo FallbackField = AccessTools.Field(typeof(RelicGrabBag), "_mpFallbackDequeue");
     private static readonly AccessTools.FieldRef<PlayerRngSet, ulong> PlayerSeed = AccessTools.FieldRefAccess<PlayerRngSet, ulong>("<Seed>k__BackingField");
 
     internal static Decision Determinize(ulong seed)
@@ -316,8 +324,9 @@ internal static class Game
         var run = Run!;
         var source = new Rng(seed);
         uint newest = Book.Combat?.Creatures.Select(c => c.CombatId ?? 0).DefaultIfEmpty().Max() ?? 0;
-        if (!ReferenceEquals(_streams.Combat, Book.Combat) || _streams.Newest != newest || _streams.Streams == null)
-            _streams = (Book.Combat, newest, Snapshot.Reachable(typeof(Rng), run, CombatManager.Instance, Manager).Select(r => (Rng)r.Value).ToArray());
+        object anchor = CombatManager.Instance.IsInProgress ? (object?)Book.Combat ?? run : _restored ?? new object();
+        if (!ReferenceEquals(_streams.Anchor, anchor) || _streams.Newest != newest || _streams.Streams == null)
+            _streams = (anchor, newest, Snapshot.Reachable(typeof(Rng), run, CombatManager.Instance, Manager).Select(r => (Rng)r.Value).ToArray());
         foreach (var rng in _streams.Streams) Reseed(rng, source);
         RunSeed(run.Rng) = source.NextUnsignedLong();
         foreach (var player in run.Players)
@@ -331,7 +340,39 @@ internal static class Game
                 (cards[i], cards[j]) = (cards[j], cards[i]);
             }
         }
+        Resample(run, source);
         return decision;
+    }
+
+    private static void Resample(RunState run, Rng source)
+    {
+        var rooms = ActRooms(run.Act);
+        var fresh = new RoomSet();
+        ActRooms(run.Act) = fresh;
+        try { run.Act.GenerateRooms(new Rng(source.NextUnsignedLong()), UnlockState.all); }
+        finally { ActRooms(run.Act) = rooms; }
+        Splice(rooms.normalEncounters, rooms.normalEncountersVisited, fresh.normalEncounters);
+        Splice(rooms.eliteEncounters, rooms.eliteEncountersVisited, fresh.eliteEncounters);
+        Shuffle(rooms.events, rooms.eventsVisited, source);
+        foreach (var bag in run.Players.Select(p => p.RelicGrabBag).Append(run.SharedRelicGrabBag))
+        {
+            foreach (System.Collections.IList deque in ((System.Collections.IDictionary)DequesField.GetValue(bag)!).Values) Shuffle(deque, 0, source);
+            Shuffle((System.Collections.IList)FallbackField.GetValue(bag)!, 0, source);
+        }
+    }
+
+    private static void Splice<T>(List<T> list, int visited, List<T> fresh)
+    {
+        for (int i = visited; i < list.Count && i < fresh.Count; i++) list[i] = fresh[i];
+    }
+
+    private static void Shuffle(System.Collections.IList list, int from, Rng source)
+    {
+        for (int i = list.Count - 1; i > from; i--)
+        {
+            int j = from + source.NextInt(i - from + 1);
+            (list[i], list[j]) = (list[j], list[i]);
+        }
     }
 
     internal static readonly bool Audited = System.Environment.GetEnvironmentVariable("AI4STS2_AUDIT") == "1";
@@ -378,8 +419,8 @@ internal static class Game
             Drawn.Clear();
             Traces.Clear();
             var decision = Current!;
-            while (decision.Kind != "end" && CombatManager.Instance.IsInProgress && steps++ < 300)
-                decision = await Step(random.Next(decision.Options.Length));
+            do decision = await Step(random.Next(decision.Options.Length));
+            while (decision.Kind != "end" && (CombatManager.Instance.IsInProgress || !Branchable) && ++steps < 300);
             _auditing = false;
             var leaks = Drawn.Where(r => !reseeded.Contains(r) && !Created.Contains(r) && !ReferenceEquals(r, Rng.Chaotic))
                 .Select(r => string.Join(" < ", Traces[r].Split('\n').Select(l => l.Trim()).Where(l => l.StartsWith("at MegaCrit") && !l.StartsWith("at MegaCrit.Sts2.Core.Random"))

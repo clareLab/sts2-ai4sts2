@@ -8,6 +8,7 @@ from ai4sts2.features import Batch
 VISIT = 50
 SCALE = 0.1
 FLOOR = 0.05
+DEPTH = 200
 LINKS = ("card", "creature", "relic", "potion", "node", "cell")
 
 
@@ -35,7 +36,9 @@ class Evaluator:
         self.kernel.call("restore", id=root)
         self.kernel.call("determinize", seed=seed)
         decision = self.kernel.call("step", index=action)
-        while decision["kind"] != "end":
+        for _ in range(DEPTH):
+            if decision["kind"] == "end":
+                break
             if decision["state"]["combat"]:
                 if decision["kind"] == "combat" and decision["state"]["turn"] > turn:
                     break
