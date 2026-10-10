@@ -45,9 +45,9 @@ def play(index, args, executable, jobs, results):
     kernel = Kernel(executable)
     layout = Layout.from_schema(kernel.schema)
     net, outcome, statistics = load(args.checkpoint, layout)
-    generator = np.random.default_rng(index)
     for character, seed in jobs:
         rng = random.Random(f"{args.policy}:{character}:{seed}")
+        generator = np.random.default_rng(random.Random(f"{character}:{seed}").getrandbits(64))
         translator = Translator()
         record = {"character": character, "seed": seed, "steps": 0, "elite": False}
         farming, available, start = 0, 0, None
@@ -129,7 +129,15 @@ def evaluate(args):
     executable = engine()
     with Kernel(executable) as kernel:
         characters = kernel.hello["characters"]
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    finished = set()
+    if args.resume and output.exists():
+        text = output.read_text()
+        output.write_text(text[: text.rfind("\n") + 1])
+        finished = {(r["character"], r["seed"]) for r in read(output)}
     jobs = [(c, f"{args.panel}-{c}-{i}") for i in range(args.runs) for c in characters]
+    jobs = [job for job in jobs if job not in finished]
     context = mp.get_context("spawn")
     results = context.Queue()
     workers = [
@@ -140,10 +148,8 @@ def evaluate(args):
     ]
     for process in workers:
         process.start()
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
     done, failures = 0, 0
-    with output.open("w") as stream:
+    with output.open("a" if args.resume else "w") as stream:
         while done < len(workers):
             try:
                 kind, *payload = results.get(timeout=60)
@@ -153,6 +159,7 @@ def evaluate(args):
                 raise RuntimeError("Evaluation workers exited early.") from None
             if kind == "run":
                 stream.write(json.dumps(payload[0]) + "\n")
+                stream.flush()
             elif kind == "failure":
                 failures += 1
                 print(json.dumps({"failure": payload}), flush=True)
@@ -262,6 +269,7 @@ def main():
     run.add_argument("--cap", type=int, default=STEPS)
     run.add_argument("--invincible", action="store_true")
     run.add_argument("--output", required=True)
+    run.add_argument("--resume", action="store_true")
     pair = commands.add_parser("compare")
     pair.add_argument("first")
     pair.add_argument("second")
