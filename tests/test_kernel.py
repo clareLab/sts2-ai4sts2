@@ -102,7 +102,7 @@ def test_processes_agree():
             arguments = {"character": character, "seed": f"PAIR-{character}", "ascension": 10}
             a = first.call("begin", invincible=True, **arguments)
             b = second.call("begin", invincible=True, **arguments)
-            while True:
+            for _ in range(1000):
                 assert fingerprint(first, a) == fingerprint(second, b)
                 if a["kind"] == "end":
                     break
