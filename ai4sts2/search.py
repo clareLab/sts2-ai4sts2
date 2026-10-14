@@ -7,7 +7,6 @@ from ai4sts2.features import Batch
 
 VISIT = 50
 SCALE = 0.1
-FLOOR = 0.05
 DEPTH = 200
 LINKS = ("card", "creature", "relic", "potion", "node", "cell")
 
@@ -103,7 +102,7 @@ def search(evaluator, decision, simulations, width, rng, noise=True):
         return 0, np.ones(1)
     logits = np.array([np.logaddexp.reduce(raw[m]) for m in members])
     prior = np.exp(logits - logits.max())
-    prior = (1 - FLOOR) * prior / prior.sum() + FLOOR / count
+    prior = prior / prior.sum()
     logits = np.log(prior)
     gumbel = rng.gumbel(size=count) if noise else np.zeros(count)
     considered = min(width, count)
