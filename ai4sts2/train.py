@@ -647,6 +647,8 @@ class Learner:
                     imitate = cross.sum() / self.args.minibatch
                     loss = loss + imitate
                     stats["imitation"].append(float(cross.mean()))
+                    agree = logp.argmax(-1) == goal.argmax(-1)
+                    stats["agreement"].append(float(agree.float().mean()))
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), 0.5)
