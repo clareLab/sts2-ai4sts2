@@ -65,7 +65,6 @@ internal static class Game
     internal static RunState? Run { get; private set; }
     internal static Decision? Current { get; private set; }
     internal static Selection? PendingSelection => Selector.Pending;
-    internal static Dictionary<string, int> Waits { get; } = new();
 
     static Game() => TaskHelper.UnobservedFault += error => _fault ??= error;
 
@@ -351,7 +350,7 @@ internal static class Game
         uint newest = Book.Combat?.Creatures.Select(c => c.CombatId ?? 0).DefaultIfEmpty().Max() ?? 0;
         object anchor = CombatManager.Instance.IsInProgress ? (object?)Book.Combat ?? run : _restored ?? new object();
         if (!ReferenceEquals(_streams.Anchor, anchor) || _streams.Newest != newest || _streams.Streams == null)
-            _streams = (anchor, newest, Snapshot.Reachable(typeof(Rng), run, CombatManager.Instance, Manager).Select(r => (Rng)r.Value).ToArray());
+            _streams = (anchor, newest, Snapshot.Reachable(typeof(Rng), run, CombatManager.Instance, Manager).Cast<Rng>().ToArray());
         foreach (var rng in _streams.Streams) Reseed(rng, source);
         RunSeed(run.Rng) = source.NextUnsignedLong();
         foreach (var player in run.Players)
@@ -387,7 +386,7 @@ internal static class Game
         {
             var future = run.Acts[index];
             bool doubled = ActRooms(future).SecondBoss != null;
-            if (subsets != null) future.SetSharedAncientSubset(subsets[index - 1]);
+            future.SetSharedAncientSubset(subsets[index - 1]);
             ActRooms(future) = new RoomSet();
             var rng = new Rng(source.NextUnsignedLong());
             future.GenerateRooms(rng, run.UnlockState);
@@ -395,7 +394,7 @@ internal static class Game
         }
     }
 
-    private static List<List<AncientEventModel>>? Subsets(RunState run, Rng source)
+    private static List<List<AncientEventModel>> Subsets(RunState run, Rng source)
     {
         var shared = run.UnlockState.SharedAncients.ToList();
         for (int attempt = 0; attempt < 1000; attempt++)
@@ -420,12 +419,18 @@ internal static class Game
             }
             if (source.NextDouble() < accept) return subsets;
         }
-        return null;
+        throw new InvalidOperationException("No shared-ancient split explains the ancients seen.");
     }
 
     private static void RedrawEvents(RoomSet rooms, Rng source)
     {
-        var pulls = Book.Pulls.Where(p => ReferenceEquals(p.Rooms, rooms)).ToList();
+        var pulls = new List<(RoomSet Rooms, HashSet<ModelId>? Fits, ModelId? Seen, bool Replaced, bool Consumed)>();
+        foreach (var pull in Book.Pulls.Where(p => ReferenceEquals(p.Rooms, rooms)))
+        {
+            if (pulls.Count > 0 && pulls[^1] is { Fits: not null, Consumed: false, Replaced: false } held && pull is { Fits: not null, Replaced: false } && pull.Seen == held.Seen)
+                pulls[^1] = held with { Consumed = pull.Consumed };
+            else pulls.Add(pull);
+        }
         var remaining = rooms.events.ToList();
         var drawn = new List<EventModel>();
         int pointer = 0;
@@ -436,19 +441,25 @@ internal static class Game
             var free = remaining.Where(e => !later.Contains(e.Id)).ToList();
             if (pull.Fits == null)
             {
-                if (free.Count == 0) return;
+                if (free.Count == 0) throw new InvalidOperationException("No event left for a silently consumed slot.");
                 drawn.Add(Take(remaining, free[source.NextInt(free.Count)]));
                 pointer = drawn.Count;
                 continue;
             }
             var fitting = free.Where(e => pull.Fits.Contains(e.Id)).ToList();
-            int skipped = 0;
-            while (skipped < fitting.Count && source.NextDouble() * (free.Count - skipped) < fitting.Count - skipped) skipped++;
+            int ahead = remaining.Count(e => later.Contains(e.Id));
+            int skipped, attempts = 0;
+            do
+            {
+                if (++attempts > 1000) throw new InvalidOperationException("No skip count is consistent with the events seen later.");
+                skipped = 0;
+                while (skipped < fitting.Count && source.NextDouble() * (free.Count - skipped) < fitting.Count - skipped) skipped++;
+            } while (source.NextDouble() >= Clear(remaining.Count, ahead, skipped));
             Permute(fitting, source);
             foreach (var skip in fitting.Take(skipped)) drawn.Add(Take(remaining, skip));
             var open = free.Where(e => !pull.Fits.Contains(e.Id)).ToList();
             var stop = pull.Replaced ? open.Count > 0 ? open[source.NextInt(open.Count)] : null : open.FirstOrDefault(e => e.Id == pull.Seen);
-            if (stop == null) return;
+            if (stop == null) throw new InvalidOperationException("No event matches a pull the player saw.");
             drawn.Add(Take(remaining, stop));
             pointer = pull.Consumed ? drawn.Count : drawn.Count - 1;
         }
@@ -457,6 +468,13 @@ internal static class Game
         rooms.events.Clear();
         rooms.events.AddRange(drawn);
         rooms.eventsVisited = pointer;
+    }
+
+    private static double Clear(int count, int ahead, int skipped)
+    {
+        double chance = 1;
+        for (int i = 0; i < ahead; i++) chance *= Math.Max(0, count - skipped - 1 - i) / (double)(count - 1 - i);
+        return chance;
     }
 
     private static T Take<T>(List<T> list, T item)
@@ -579,8 +597,10 @@ internal static class Game
     private static async Task<Decision> Settle()
     {
         var timer = Stopwatch.StartNew();
+        var total = Stopwatch.StartNew();
         while (true)
         {
+            if (total.Elapsed.TotalSeconds > 300) throw new TimeoutException($"No decision within 300 s in {Run?.CurrentRoom?.GetType().Name} at floor {Run?.TotalFloor}.");
             Dispatcher.SynchronizationContext.ExecutePendingContinuations();
             if (_fault != null) throw new InvalidOperationException("Official game logic failed.", _fault);
             var failed = Tasks.FirstOrDefault(t => t.IsFaulted);
@@ -597,8 +617,6 @@ internal static class Game
             }
             if (_progress) continue;
             if (timer.Elapsed.TotalSeconds > 30) throw new TimeoutException($"No decision in {Run?.CurrentRoom?.GetType().Name} at floor {Run?.TotalFloor}.");
-            string reason = $"{Run?.CurrentRoom?.GetType().Name}|loading={Manager.NetService.IsGameLoading}|exec={Manager.ActionExecutor.IsRunning}|queues={QueuesEmpty}|tasks={Tasks.Count(t => !t.IsCompleted)}|frames={Frames.Count}|act={Book.ActChange}|combat={CombatManager.Instance.IsInProgress}";
-            Waits[reason] = Waits.GetValueOrDefault(reason) + 1;
             await Host.Frame();
         }
     }
@@ -672,7 +690,7 @@ internal static class Game
                 if (restOptions.Count == 0 || Marked(rest, "left")) return Map(run);
                 var restChoices = restOptions.Select((o, i) => (Option: o, Index: i)).Where(x => x.Option.IsEnabled)
                     .Select(x => new Option("rest", e => e.Option("rest", key: "rest." + x.Option.OptionId), () => Manager.RestSiteSynchronizer.ChooseLocalOption(x.Index))).ToList();
-                if (Marked(rest, "rested")) restChoices.Add(new Option("leave", e => e.Option("leave"), () => Leave(rest)));
+                if (Marked(rest, "rested") || restChoices.Count == 0) restChoices.Add(new Option("leave", e => e.Option("leave"), () => Leave(rest)));
                 return new Decision("rest", [.. restChoices, .. Potions(false)]);
             case MerchantRoom shop:
                 return Marked(shop, "left") ? Map(run) : Shop(run, shop);

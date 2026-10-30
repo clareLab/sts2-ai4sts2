@@ -33,8 +33,6 @@ internal sealed class Snapshot
     private readonly object[] _targets;
     private readonly Action<object, ulong[], int, object?[]>?[] _decoders;
 
-    internal int Objects => _targets.Length;
-    internal int Words => _buffer.Length;
 
     private Snapshot()
     {
@@ -130,50 +128,50 @@ internal sealed class Snapshot
         return CompletionFields[type] = result.ToArray();
     }
 
-    internal static List<(object Value, string Path)> Reachable(Type wanted, params object[] roots)
+    internal static List<object> Reachable(Type wanted, params object[] roots)
     {
         var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
-        var found = new List<(object, string)>();
-        var queue = new Queue<(object Value, string Path)>(roots.Select(r => (r, r.GetType().Name)));
+        var found = new List<object>();
+        var queue = new Queue<object>(roots);
         var probe = new Snapshot();
         foreach (object root in roots) probe._roots.Add(root);
         while (queue.Count > 0)
         {
-            var (value, path) = queue.Dequeue();
+            var value = queue.Dequeue();
             if (!seen.Add(value)) continue;
-            if (wanted.IsInstanceOfType(value)) found.Add((value, path));
+            if (wanted.IsInstanceOfType(value)) found.Add(value);
             if (value is Delegate callback)
             {
                 foreach (Delegate part in callback.GetInvocationList())
-                    if (part.Target != null) queue.Enqueue((part.Target, path + "->" + part.Method.Name));
+                    if (part.Target != null) queue.Enqueue(part.Target);
                 continue;
             }
             if (!probe.Owned(value)) continue;
             if (value is Array array)
             {
                 Type element = array.GetType().GetElementType()!;
-                foreach (object? item in array) Visit(queue, element, item, path + "[]");
+                foreach (object? item in array) Visit(queue, element, item);
                 continue;
             }
-            foreach (FieldInfo field in Layout(value.GetType())) Visit(queue, field.FieldType, field.GetValue(value), path + "." + field.Name);
+            foreach (FieldInfo field in Layout(value.GetType())) Visit(queue, field.FieldType, field.GetValue(value));
         }
         return found;
     }
 
-    private static void Visit(Queue<(object, string)> queue, Type type, object? value, string path)
+    private static void Visit(Queue<object> queue, Type type, object? value)
     {
         if (value == null || type.IsPrimitive || type.IsEnum) return;
         if (!type.IsValueType)
         {
-            queue.Enqueue((value, path));
+            queue.Enqueue(value);
             return;
         }
         if (Nullable.GetUnderlyingType(type) is { } underlying)
         {
-            Visit(queue, underlying, value, path);
+            Visit(queue, underlying, value);
             return;
         }
-        foreach (FieldInfo field in Layout(type)) Visit(queue, field.FieldType, field.GetValue(value), path + "." + field.Name);
+        foreach (FieldInfo field in Layout(type)) Visit(queue, field.FieldType, field.GetValue(value));
     }
 
     private void Word(ulong value) => _words.Add(value);

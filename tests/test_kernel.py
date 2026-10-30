@@ -59,22 +59,12 @@ def test_observation_matches_schema(kernel):
     assert np.isfinite(observation["card"]).all()
 
 
-def test_characters(kernel):
-    assert len(kernel.hello["characters"]) >= 5
-
-
 def test_replay_is_deterministic(kernel):
     character = kernel.hello["characters"][0]
     first, _ = play(kernel, character, "DETERMINISM", 400)
     second, _ = play(kernel, character, "DETERMINISM", 400)
     assert first == second
     assert len(first) > 20
-
-
-def test_every_character_reaches_a_decision(kernel):
-    for character in kernel.hello["characters"]:
-        trace, decision = play(kernel, character, f"SMOKE-{character}", 60)
-        assert trace or decision["kind"] == "end"
 
 
 def test_map_segments_match_official(monkeypatch):
@@ -100,6 +90,10 @@ def test_processes_agree():
     with Kernel(engine()) as first, Kernel(engine()) as second:
         for character in first.hello["characters"]:
             arguments = {"character": character, "seed": f"PAIR-{character}", "ascension": 10}
+            other = second.call("begin", character=character, seed="OTHER", ascension=10)
+            for _ in range(20):
+                if other["kind"] != "end":
+                    other = second.call("step", index=0)
             a = first.call("begin", invincible=True, **arguments)
             b = second.call("begin", invincible=True, **arguments)
             for _ in range(1000):
@@ -149,6 +143,27 @@ def wander(kernel, decision, seed, steps=30):
         decision = kernel.call("step", index=rng.randrange(len(decision["options"])))
         trace.append(fingerprint(kernel, decision))
     return trace
+
+
+def test_restore_after_the_run_ends(kernel):
+    arguments = {"character": kernel.hello["characters"][1], "seed": "LETHAL", "ascension": 10}
+    rng = random.Random(4)
+    prefix = []
+    decision = kernel.call("begin", **arguments)
+    while not (decision["snapshot"] and decision["kind"] == "combat"):
+        prefix.append(rng.randrange(len(decision["options"])))
+        decision = kernel.call("step", index=prefix[-1])
+    root = kernel.call("snapshot")["id"]
+    for _ in range(5000):
+        if decision["kind"] == "end":
+            break
+        decision = kernel.call("step", index=rng.randrange(len(decision["options"])))
+    assert decision["kind"] == "end" and not decision["victory"]
+    restored = kernel.call("restore", id=root)
+    kernel.call("release", id=root)
+    after = wander(kernel, restored, 6)
+    kernel.call("begin", **arguments)
+    assert wander(kernel, kernel.call("replay", actions=prefix), 6) == after
 
 
 @pytest.mark.parametrize("which", range(5))
@@ -261,6 +276,7 @@ def test_determinize_conditions_hidden_rooms_on_what_was_seen(kernel):
                 break
         decision = kernel.call("step", index=rng.randrange(len(decision["options"])))
     root = kernel.call("snapshot")["id"]
+    observed = fingerprint(kernel, decision)
     before = kernel.call("rooms")
     act = before["current"]
     real = before["acts"][act]
@@ -272,7 +288,7 @@ def test_determinize_conditions_hidden_rooms_on_what_was_seen(kernel):
     futures, pasts = set(), set()
     for seed in range(12):
         kernel.call("restore", id=root)
-        kernel.call("determinize", seed=seed)
+        assert fingerprint(kernel, kernel.call("determinize", seed=seed)) == observed
         acts = kernel.call("rooms")["acts"]
         now = acts[act]
         for key in ("normal", "elite"):

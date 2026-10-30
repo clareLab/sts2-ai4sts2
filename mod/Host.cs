@@ -28,7 +28,6 @@ internal static class Host
         System.Runtime.CompilerServices.RuntimeHelpers.RunClassConstructor(typeof(MegaCrit.Sts2.Core.AutoSlay.AutoSlayer).TypeHandle);
         Headless.Install();
         Patches.Install();
-        if (System.Environment.GetEnvironmentVariable("AI4STS2_PROBE") == "1") Probe.Install();
         GameLogger.GlobalLogLevel = LogLevel.Warn;
         foreach (var type in GameLogger.logLevelTypeMap.Keys.ToArray()) GameLogger.logLevelTypeMap[type] = LogLevel.Warn;
         NGame.Instance!.StartOnMainMenu = false;
