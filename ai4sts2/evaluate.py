@@ -1,6 +1,7 @@
 import argparse
 import collections
 import json
+import math
 import multiprocessing as mp
 import queue
 import random
@@ -11,7 +12,7 @@ import torch
 from scipy import stats
 
 from ai4sts2.features import Batch, Layout, Translator
-from ai4sts2.kernel import Kernel, KernelError, die_with_parent, engine
+from ai4sts2.kernel import Kernel, KernelError, die_with_parent, digest, engine
 from ai4sts2.search import Evaluator, search
 from ai4sts2.train import (
     ACTS,
@@ -22,7 +23,6 @@ from ai4sts2.train import (
     Progress,
     Statistics,
     make_net,
-    wilson,
 )
 
 COMBAT_NODES = {"MapPointType.Monster", "MapPointType.Elite", "MapPointType.Boss"}
@@ -50,7 +50,7 @@ def play(index, args, executable, jobs, results):
         generator = np.random.default_rng(random.Random(f"{character}:{seed}").getrandbits(64))
         translator = Translator()
         record = {"character": character, "seed": seed, "steps": 0, "elite": False}
-        farming, available, start = 0, 0, None
+        farming, available, start, stalled, bosses = 0, 0, None, False, set()
         progress = Progress()
         try:
             decision = kernel.call(
@@ -63,7 +63,10 @@ def play(index, args, executable, jobs, results):
             while decision["kind"] != "end" and record["steps"] < args.cap:
                 translator.sync(kernel.vocab)
                 state = decision["state"]
+                if state["room"] == "Boss":
+                    bosses.add(state["floor"])
                 if progress.stalled(state):
+                    stalled = True
                     break
                 if decision["kind"] == "rewards" and state["room"] == "Elite":
                     record["elite"] = True
@@ -85,7 +88,7 @@ def play(index, args, executable, jobs, results):
                     utility = outcome.utility(mass)
                     evaluator = Evaluator(kernel, net, layout, translator, outcome, utility)
                     action, _ = search(
-                        evaluator, decision, args.simulations, args.width, generator, False
+                        evaluator, decision, args.simulations, args.candidates, generator, False
                     )
                 else:
                     observation = translator.canonical(decision["observation"], layout)
@@ -109,10 +112,15 @@ def play(index, args, executable, jobs, results):
             kernel = Kernel(executable)
             continue
         state = decision["state"]
+        if state["room"] == "Boss":
+            bosses.add(state["floor"])
         record |= {k: state[k] for k in ("act", "floor", "won", "foe", "hp", "deck", "relics")}
         record["victory"] = bool(decision.get("victory")) and decision["kind"] == "end"
-        record["capped"] = decision["kind"] != "end"
+        record["stalled"] = stalled
+        record["capped"] = decision["kind"] != "end" and not stalled
+        record["bosses"] = len(bosses)
         record["farming"], record["available"], record["start"] = farming, available, start
+        record |= args.provenance
         results.put(("run", record))
     kernel.close()
     results.put(("done", index))
@@ -129,22 +137,36 @@ def evaluate(args):
     executable = engine()
     with Kernel(executable) as kernel:
         characters = kernel.hello["characters"]
+    args.provenance = {
+        "policy": args.policy,
+        "simulations": args.simulations,
+        "candidates": args.candidates,
+        "ascension": args.ascension,
+        "invincible": args.invincible,
+        "checkpoint": args.checkpoint and digest(Path(args.checkpoint)),
+        "cap": args.cap,
+        "engine": executable.parent.name,
+    }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     finished = set()
     if args.resume and output.exists():
         text = output.read_text()
         output.write_text(text[: text.rfind("\n") + 1])
-        finished = {(r["character"], r["seed"]) for r in read(output)}
+        existing = read(output)
+        if any({k: r.get(k) for k in args.provenance} != args.provenance for r in existing):
+            raise SystemExit(f"{output} holds runs from another configuration.")
+        finished = {(r["character"], r["seed"]) for r in existing}
     jobs = [(c, f"{args.panel}-{c}-{i}") for i in range(args.runs) for c in characters]
     jobs = [job for job in jobs if job not in finished]
+    count = max(1, min(args.workers, len(jobs)))
     context = mp.get_context("spawn")
     results = context.Queue()
     workers = [
         context.Process(
-            target=play, args=(i, args, executable, jobs[i :: args.workers], results), daemon=True
+            target=play, args=(i, args, executable, jobs[i::count], results), daemon=True
         )
-        for i in range(args.workers)
+        for i in range(count)
     ]
     for process in workers:
         process.start()
@@ -177,6 +199,16 @@ def read(path):
     return [json.loads(line) for line in Path(path).read_text().splitlines()]
 
 
+def wilson(successes, trials, z=1.959964):
+    if trials == 0:
+        return 0.0, 1.0
+    p = successes / trials
+    centre = p + z * z / (2 * trials)
+    margin = z * math.sqrt(p * (1 - p) / trials + z * z / (4 * trials * trials))
+    scale = 1 + z * z / trials
+    return (centre - margin) / scale, (centre + margin) / scale
+
+
 def interval(successes, trials):
     low, high = wilson(successes, trials)
     return [successes, trials, round(low, 4), round(high, 4)]
@@ -187,6 +219,7 @@ def summarize(records):
     groups = collections.defaultdict(list)
     for record in records:
         groups[record["character"]].append(record)
+        groups["all"].append(record)
     for character, runs in sorted(groups.items()):
         entry = {"runs": len(runs), "win": interval(sum(r["victory"] for r in runs), len(runs))}
         for k in range(ACTS):
@@ -201,6 +234,9 @@ def summarize(records):
         entry["farming"] = round(farming / available, 4) if available else None
         entry["floor"] = round(float(np.mean([r["floor"] for r in runs])), 2)
         entry["capped"] = sum(r["capped"] for r in runs)
+        entry["stalled"] = sum(r.get("stalled", False) for r in runs)
+        if all("bosses" in r for r in runs):
+            entry["bosses"] = [sum(r["bosses"] >= k for r in runs) for k in range(1, 5)]
         predicted = [
             (r["start"], r["act"] >= 1 or r["victory"]) for r in runs if r["start"] is not None
         ]
@@ -233,7 +269,7 @@ def compare(first, second):
     a = {(r["character"], r["seed"]): r for r in read(first)}
     b = {(r["character"], r["seed"]): r for r in read(second)}
     keys = sorted(a.keys() & b.keys())
-    result = {"pairs": len(keys)}
+    result = {"pairs": len(keys), "unpaired": [len(a) - len(keys), len(b) - len(keys)]}
     for name, metric in (
         ("act1", lambda r: r["act"] >= 1 or r["victory"]),
         ("win", lambda r: r["victory"]),
@@ -261,7 +297,7 @@ def main():
     run.add_argument("--checkpoint")
     run.add_argument("--policy", choices=("argmax", "sample", "random", "search"), default="argmax")
     run.add_argument("--simulations", type=int, default=32)
-    run.add_argument("--width", type=int, default=8)
+    run.add_argument("--candidates", type=int, default=8)
     run.add_argument("--panel", default="EVAL")
     run.add_argument("--runs", type=int, default=200)
     run.add_argument("--ascension", type=int, default=TARGET)

@@ -3,12 +3,12 @@ import math
 import numpy as np
 import torch
 
-from ai4sts2.features import Batch
+from ai4sts2.features import REFERENCES, Batch
 
 VISIT = 50
 SCALE = 0.1
 DEPTH = 200
-LINKS = ("card", "creature", "relic", "potion", "node", "cell")
+LINKS = tuple(REFERENCES["option"])
 
 
 class Evaluator:
@@ -31,7 +31,8 @@ class Evaluator:
             return float(self.utility @ self.outcome.target(decision["state"], decision["victory"]))
         return self.forward(decision)[1]
 
-    def simulate(self, root, action, seed, turn, rng):
+    def simulate(self, root, action, seed, turn):
+        rng = np.random.default_rng(seed)
         self.kernel.call("restore", id=root)
         self.kernel.call("determinize", seed=seed)
         decision = self.kernel.call("step", index=action)
@@ -126,7 +127,7 @@ def search(evaluator, decision, simulations, width, rng, noise=True):
             if visit not in seeds:
                 seeds[visit] = int(rng.integers(1 << 62))
             real = members[action][0]
-            totals[action] += evaluator.simulate(root, real, seeds[visit], turn, rng)
+            totals[action] += evaluator.simulate(root, real, seeds[visit], turn)
             visits[action] += 1
         evaluator.kernel.call("restore", id=root)
     finally:

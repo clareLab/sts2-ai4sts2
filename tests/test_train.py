@@ -1,3 +1,4 @@
+import json
 import os
 import random
 from types import SimpleNamespace
@@ -6,11 +7,12 @@ import numpy as np
 import pytest
 import torch
 
+from ai4sts2.evaluate import compare, summarize, wilson
 from ai4sts2.features import Batch, Layout, Translator
 from ai4sts2.kernel import Kernel, engine, sweep
 from ai4sts2.model import Net
 from ai4sts2.search import Evaluator, search
-from ai4sts2.train import ACTS, COMBATS, IDLE, Outcome, Progress, chunks, vtrace, wilson
+from ai4sts2.train import ACTS, COMBATS, IDLE, Outcome, Progress, chunks, vtrace
 from tests.test_kernel import fingerprint, wander
 
 
@@ -32,13 +34,16 @@ def test_vtrace_matches_td_lambda_on_policy():
     values = distributions(rng, 12, 7)
     after = distributions(rng, 1, 7)[0]
     lam = 0.9
-    targets, _ = vtrace(values, after, np.ones(12), lam, np.arange(7.0))
+    targets, advantages = vtrace(values, after, np.ones(12), lam, np.arange(7.0))
     following, expected = after, np.empty_like(values)
     for t in range(11, -1, -1):
         proposed = values[t + 1] if t < 11 else after
         following = (1 - lam) * proposed + lam * following
         expected[t] = following
     assert np.allclose(targets, expected, atol=1e-6)
+    nexts = [*expected[1:], after]
+    reference = [np.arange(7.0) @ (n - v) for n, v in zip(nexts, values, strict=True)]
+    assert np.allclose(advantages, reference, atol=1e-5)
 
 
 def test_vtrace_targets_stay_distributions():
@@ -101,6 +106,31 @@ def test_progress_tolerates_damaging_loops_and_flags_idle_ones():
     assert not progress.stalled({"floor": 2, "foe": None})
     flags = [progress.stalled({"floor": 2, "foe": 0.5}) for _ in range(IDLE)]
     assert flags[-1] and not any(flags[:-1])
+
+
+def test_summaries_and_paired_comparisons_count_runs_exactly(tmp_path):
+    base = {"character": "A", "won": 0, "foe": 0.5, "elite": False, "farming": 0, "available": 1}
+    base |= {"capped": False, "stalled": False, "start": 0.5}
+    runs = [
+        base | {"seed": "1", "act": 2, "floor": 49, "victory": True, "bosses": 4},
+        base | {"seed": "2", "act": 0, "floor": 10, "victory": False, "bosses": 0},
+        base | {"seed": "3", "act": 1, "floor": 25, "victory": False, "bosses": 1},
+        base | {"seed": "4", "act": 2, "floor": 48, "victory": False, "bosses": 3},
+        base | {"seed": "5", "act": 0, "floor": 2, "victory": False, "bosses": 0, "stalled": True},
+    ]
+    summary = summarize(runs)
+    entry = summary["all"]
+    assert summary["A"] == entry
+    assert [entry[f"act{k}"][:2] for k in (1, 2, 3)] == [[3, 5], [2, 3], [1, 2]]
+    assert entry["win"][:2] == [1, 5] and entry["bosses"] == [3, 2, 2, 1]
+    assert (entry["stalled"], entry["capped"]) == (1, 0)
+    first, second = tmp_path / "first.jsonl", tmp_path / "second.jsonl"
+    first.write_text("".join(json.dumps(r) + "\n" for r in runs))
+    better = [r | {"act": 1, "floor": 20} if r["seed"] == "2" else r for r in runs[:4]]
+    second.write_text("".join(json.dumps(r) + "\n" for r in better))
+    result = compare(first, second)
+    assert result["pairs"] == 4 and result["unpaired"] == [1, 0]
+    assert (result["act1"]["second_better"], result["act1"]["first_better"]) == (1, 0)
 
 
 def test_wilson_interval_brackets_the_estimate():

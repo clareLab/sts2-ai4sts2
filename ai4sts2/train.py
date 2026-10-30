@@ -1,7 +1,6 @@
 import argparse
 import collections
 import json
-import math
 import multiprocessing as mp
 import multiprocessing.connection
 import os
@@ -90,16 +89,6 @@ class Statistics:
         ]
 
 
-def wilson(successes, trials, z=1.959964):
-    if trials == 0:
-        return 0.0, 1.0
-    p = successes / trials
-    centre = p + z * z / (2 * trials)
-    margin = z * math.sqrt(p * (1 - p) / trials + z * z / (4 * trials * trials))
-    scale = 1 + z * z / trials
-    return (centre - margin) / scale, (centre + margin) / scale
-
-
 def vtrace(values, after, rho, lam, utility):
     targets = np.empty_like(values)
     advantages = np.empty(len(values), np.float32)
@@ -148,7 +137,7 @@ def actor(index, args, executable, weights_path, schedule, connection):
     die_with_parent()
     channel = Outbox(connection, max(1, 2 * args.rollout // args.segment // args.actors))
     torch.set_num_threads(1)
-    rng = random.Random(f"{args.seed}:{index}:{time.time_ns()}")
+    rng = random.Random(f"{index}:{time.time_ns()}")
     outcome = Outcome()
     searcher = index < args.searchers
     pool = Pool(1 if searcher else args.kernels, executable)
@@ -163,7 +152,7 @@ def actor(index, args, executable, weights_path, schedule, connection):
     contexts = [None] * len(pool)
     weights, utilities = schedule
     archive = collections.deque(maxlen=args.archive)
-    generator = np.random.default_rng([args.seed, index, time.time_ns()])
+    generator = np.random.default_rng([index, time.time_ns()])
 
     def begin(worker):
         if archive and rng.random() < args.restarts:
@@ -362,7 +351,6 @@ class Learner:
         self.directory = Path(args.output)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.device = torch.device("xpu" if torch.xpu.is_available() else "cpu")
-        torch.manual_seed(args.seed)
         self.outcome = Outcome()
         self.executable = engine()
         with Kernel(self.executable) as kernel:
@@ -382,7 +370,7 @@ class Learner:
         self.net = make_net(self.layout, self.outcome, args).to(self.device)
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=args.lr)
         self.updates = self.samples = self.episodes = self.failures = self.stalls = 0
-        statistics = ()
+        statistics, self.history = (), []
         path = self.directory / "model.pt"
         if path.exists():
             state = torch.load(path, map_location="cpu", weights_only=True)
@@ -390,11 +378,23 @@ class Learner:
             self.optimizer.load_state_dict(state["optimizer"])
             self.updates, self.samples = state["updates"], state["samples"]
             self.episodes, statistics = state["episodes"], state["statistics"]
+            self.failures, self.stalls = state.get("failures", 0), state.get("stalls", 0)
+            self.history = state.get("history", [])
         self.statistics = Statistics(args.reference, statistics)
+        self.schedule()
         self.publish()
         self.commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True
+            ["git", "describe", "--always", "--dirty"], cwd=ROOT, capture_output=True, text=True
         ).stdout.strip()
+        self.history.append(
+            {
+                "update": self.updates,
+                "samples": self.samples,
+                "commit": self.commit,
+                "engine": self.executable.parent.name,
+                "args": vars(args),
+            }
+        )
         self.readers = {}
         self.actors = [self.spawn(i) for i in range(args.actors)]
         self.pending, self.size, self.respawns = [], 0, 0
@@ -417,6 +417,14 @@ class Learner:
             if not process.is_alive() or index not in self.readers:
                 process.kill()
                 process.join()
+                reader = self.readers.pop(index, None)
+                try:
+                    while reader is not None and reader.poll():
+                        self.handle(*reader.recv())
+                except (EOFError, OSError):
+                    pass
+                if reader is not None:
+                    reader.close()
                 self.respawns += 1
                 print(json.dumps({"respawn": index, "exitcode": process.exitcode}), flush=True)
                 self.actors[index] = self.spawn(index)
@@ -431,10 +439,12 @@ class Learner:
         ready = multiprocessing.connection.wait(list(self.readers.values()), 5 if block else 0)
         for reader in ready:
             try:
-                self.handle(*reader.recv())
+                message = reader.recv()
             except (EOFError, OSError):
                 index = next(i for i, r in self.readers.items() if r is reader)
                 self.readers.pop(index).close()
+                continue
+            self.handle(*message)
         if not ready or len(self.readers) < len(self.actors):
             self.supervise()
         return bool(ready)
@@ -584,7 +594,7 @@ class Learner:
                 current[chunk] = logp.cpu().numpy()
         clock.append(time.perf_counter())
         searched = np.array([target is not None for target in imitation])
-        rho = np.where(searched, 1.0, np.minimum(1.0, np.exp(current - behaviour)))
+        rho = np.where(searched, 0.0, np.minimum(1.0, np.exp(current - behaviour)))
         targets = np.zeros((count + len(tails), bins), np.float32)
         advantages = np.zeros(count + len(tails), np.float32)
         characters = {segment["character"] for segment in segments}
@@ -610,7 +620,7 @@ class Learner:
         clock.append(time.perf_counter())
         stats = collections.defaultdict(list)
         passes = 0
-        while passes < self.args.passes and (passes == 0 or self.size < self.args.rollout):
+        while passes < self.args.passes:
             passes += 1
             for k in np.random.permutation(len(prepared)):
                 while self.size < self.args.rollout and self.receive(block=False):
@@ -667,7 +677,9 @@ class Learner:
         result = {key: round(float(np.mean(value)), 5) for key, value in stats.items()}
         result["passes"] = passes
         result["searched"] = sum(target is not None for target in imitation)
-        result["rho"] = round(float(rho[:count].mean()), 4)
+        result["rho"] = (
+            round(float(rho[:count][policy_rows].mean()), 4) if policy_rows.any() else 1.0
+        )
         result["time"] = [round(b - a, 2) for a, b in zip(clock, clock[1:], strict=False)]
         return result
 
@@ -698,7 +710,11 @@ class Learner:
             "statistics": self.statistics.state(),
             "game": self.hello.get("game"),
             "commit": self.commit,
+            "engine": self.executable.parent.name,
             "args": vars(self.args),
+            "history": self.history,
+            "failures": self.failures,
+            "stalls": self.stalls,
         }
         path = path or self.directory / "model.pt"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -713,7 +729,6 @@ def main():
     parser.add_argument("--actors", type=int, default=4)
     parser.add_argument("--kernels", type=int, default=4)
     parser.add_argument("--minutes", type=float, default=60)
-    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -721,7 +736,7 @@ def main():
     parser.add_argument("--segment", type=int, default=64)
     parser.add_argument("--minibatch", type=int, default=512)
     parser.add_argument("--cells", type=int, default=1 << 23)
-    parser.add_argument("--passes", type=int, default=4)
+    parser.add_argument("--passes", type=int, default=1)
     parser.add_argument("--clip", type=float, default=0.2)
     parser.add_argument("--entropy", type=float, default=0.01)
     parser.add_argument("--lam", type=float, default=0.95)

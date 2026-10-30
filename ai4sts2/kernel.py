@@ -38,6 +38,7 @@ def sweep(parent):
 
 
 REQUEST = struct.Struct("<i")
+BOOT = 120
 
 
 class KernelError(RuntimeError):
@@ -59,8 +60,10 @@ def engine():
     package = ROOT / "artifacts/dist/ai4sts2"
     if not binary.is_file() or not (package / "ai4sts2.dll").is_file():
         raise FileNotFoundError("Install STS2 and run scripts/build.sh first.")
+    pack = binary.with_suffix(".pck").stat()
     game = digest(source / "data_sts2_linuxbsd_x86_64/sts2.dll")
-    target = ROOT / "artifacts/engine" / f"{game}-{digest(package / 'ai4sts2.dll')}"
+    stamp = hashlib.sha256(f"{pack.st_size}:{pack.st_mtime_ns}".encode()).hexdigest()[:6]
+    target = ROOT / "artifacts/engine" / f"{game}{stamp}-{digest(package / 'ai4sts2.dll')}"
     if not (target / binary.name).exists():
         staging = target.with_name(f"{target.name}.{os.getpid()}")
         ignore = shutil.ignore_patterns("mods", "steam_appid.txt", "libsentry*")
@@ -74,7 +77,7 @@ def engine():
 
 
 class Kernel:
-    def __init__(self, executable, boot_timeout=120, connect=True):
+    def __init__(self, executable, connect=True):
         parent = ROOT / "artifacts/kernels"
         parent.mkdir(parents=True, exist_ok=True)
         sweep(parent)
@@ -83,7 +86,6 @@ class Kernel:
         self.process = None
         self.listener = None
         self.failed = False
-        self.boot_timeout = boot_timeout
         try:
             self._spawn(executable)
             if connect:
@@ -151,10 +153,7 @@ class Kernel:
     def connect(self):
         try:
             while self.socket is None:
-                if (
-                    self.process.poll() is not None
-                    or time.monotonic() > self.started + self.boot_timeout
-                ):
+                if self.process.poll() is not None or time.monotonic() > self.started + BOOT:
                     raise KernelError(f"Kernel did not connect. {self.tail()}")
                 try:
                     self.socket, _ = self.listener.accept()

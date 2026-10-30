@@ -1,13 +1,15 @@
 import selectors
 import time
 
-from ai4sts2.kernel import Kernel, KernelError, engine
+from ai4sts2.kernel import Kernel, KernelError
+
+PATIENCE = 120
 
 
 class Pool:
-    def __init__(self, count, executable=None, patience=120):
-        self.patience = patience
-        self.executable = executable or engine()
+    def __init__(self, count, executable):
+        self.patience = PATIENCE
+        self.executable = executable
         self.kernels = []
         try:
             for _ in range(count):
@@ -61,9 +63,3 @@ class Pool:
         for kernel in self.kernels:
             kernel.close()
         self.kernels = []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        self.close()
